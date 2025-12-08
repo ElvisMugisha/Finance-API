@@ -132,7 +132,9 @@ class Profile(models.Model):
     bio = models.TextField(null=True, blank=True)
     phone_number = models.CharField(max_length=20, null=True, blank=True)
     dob = models.DateField(null=True, blank=True)
-    profile_picture = models.ImageField(upload_to="profiles/", null=True, blank=True)
+    profile_picture = models.ImageField(
+        upload_to="profiles/%Y/%m/%d/", null=True, blank=True
+    )
     gender = models.CharField(
         max_length=20,
         choices=choices.Gender.choices,

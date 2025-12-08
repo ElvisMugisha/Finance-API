@@ -57,9 +57,5 @@ class IsSuperAdminOrSuperUser(permissions.BasePermission):
         if request.user.is_superuser:
             return True
 
-        # Check if user has the Super_Admin role
-        if request.user.role == choices.UserRole.SUPER_ADMIN:
-            return True
-
         self.message = "You do not have permission to perform this action. Requires Super Admin privileges."
         return False

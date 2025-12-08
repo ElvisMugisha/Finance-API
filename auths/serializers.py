@@ -404,7 +404,6 @@ class UserListSerializer(serializers.ModelSerializer):
             "username",
             "first_name",
             "last_name",
-            "role",
             "is_verified",
             "last_activity",
             "created_at",
