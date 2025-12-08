@@ -32,7 +32,9 @@ urlpatterns = [
 ]
 
 # Application URLs
-urlpatterns += []
+urlpatterns += [
+    path("auths/", include("auths.urls")),
+]
 
 # API URLs
 urlpatterns += [

@@ -43,7 +43,7 @@ THIRD_PARTY_APPS = [
 ]
 
 # Local apps
-LOCAL_APPS = []
+LOCAL_APPS = ["auths"]
 
 # Installed apps
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -150,7 +150,7 @@ if not DEBUG:
     DATABASES["default"]["OPTIONS"]["server_side_binding"] = False
 
 # Authentication
-# AUTH_USER_MODEL = "authentication.User"
+AUTH_USER_MODEL = "auths.User"
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
