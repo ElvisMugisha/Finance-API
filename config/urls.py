@@ -24,6 +24,11 @@ from drf_spectacular.views import (
     SpectacularSwaggerView,
     SpectacularRedocView,
 )
+from rest_framework_simplejwt.views import (
+    TokenObtainPairView,
+    TokenRefreshView,
+    TokenVerifyView,
+)
 
 
 # Admin URLs
@@ -39,6 +44,13 @@ urlpatterns += [
 # API URLs
 urlpatterns += [
     path("api/", include("rest_framework.urls")),
+]
+
+# JWT URLs
+urlpatterns += [
+    path("api/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
+    path("api/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
+    path("api/token/verify/", TokenVerifyView.as_view(), name="token_verify"),
 ]
 
 # Static and Media URLs

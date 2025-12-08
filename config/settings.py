@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 
 from pathlib import Path
 from decouple import config, Csv
+from datetime import timedelta
 import dj_database_url
 
 
@@ -20,8 +21,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Security
 SECRET_KEY = config("SECRET_KEY")
-DEBUG = config("DEBUG", default=True, cast=bool)
-ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="*", cast=Csv())
+DEBUG = config("DEBUG", cast=bool)
+ALLOWED_HOSTS = config("ALLOWED_HOSTS", cast=Csv())
 
 
 # Application definition
@@ -37,6 +38,9 @@ DJANGO_APPS = [
 # Third party apps
 THIRD_PARTY_APPS = [
     "rest_framework",
+    "rest_framework.authtoken",
+    "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "drf_spectacular",
     "corsheaders",
     "django_filters",
@@ -101,25 +105,22 @@ else:
     # Production: Use PostgreSQL with optimizations
     DATABASES = {
         "default": dj_database_url.config(
-            default=config(
-                "DATABASE_URL",
-                default="postgresql://postgres:postgres@db:5432/finance_API_db",
-            ),
+            default=config("DATABASE_URL"),
             conn_max_age=600,  # Connection pooling: reuse connections for 10 minutes
             conn_health_checks=True,  # Verify connection health before reuse
         )
     }
 
 # Override for Docker environment (always use PostgreSQL in Docker)
-if config("USE_DOCKER", default=False, cast=bool):
+if config("USE_DOCKER", cast=bool):
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
-            "NAME": config("POSTGRES_DB", default="finance_API_db"),
-            "USER": config("POSTGRES_USER", default="postgres"),
-            "PASSWORD": config("POSTGRES_PASSWORD", default="postgres"),
-            "HOST": config("POSTGRES_HOST", default="db"),
-            "PORT": config("POSTGRES_PORT", default="5432"),
+            "NAME": config("POSTGRES_DB"),
+            "USER": config("POSTGRES_USER"),
+            "PASSWORD": config("POSTGRES_PASSWORD"),
+            "HOST": config("POSTGRES_HOST"),
+            "PORT": config("POSTGRES_PORT"),
             # Connection pooling: Keep connections alive for 10 minutes
             "CONN_MAX_AGE": 600,
             # Production-grade PostgreSQL options
@@ -129,7 +130,7 @@ if config("USE_DOCKER", default=False, cast=bool):
                 # Statement timeout (milliseconds) - prevent long-running queries
                 "options": "-c statement_timeout=30000",
                 # SSL mode for production (disable for local Docker)
-                "sslmode": config("POSTGRES_SSL_MODE", default="prefer"),
+                "sslmode": config("POSTGRES_SSL_MODE"),
                 # Connection pooling settings
                 "keepalives": 1,
                 "keepalives_idle": 30,
@@ -184,8 +185,9 @@ MEDIA_ROOT = BASE_DIR / "media"
 # REST Framework
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
         "rest_framework.authentication.TokenAuthentication",
-        # "rest_framework.authentication.SessionAuthentication",
+        "rest_framework.authentication.SessionAuthentication",
         "rest_framework.authentication.BasicAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": ["utils.permissions.IsActiveAndVerified"],
@@ -273,3 +275,33 @@ CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
+
+# Simple JWT Configuration
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=180),  # Access token lifetime
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=2),  # Refresh token lifetime
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "UPDATE_LAST_LOGIN": True,
+    "ALLOWED_TOKEN_TYPES": ("access", "refresh"),
+    "ALGORITHM": "HS256",
+    "SIGNING_KEY": config("SIGNING_KEY"),
+    "VERIFYING_KEY": "",
+    "AUDIENCE": None,
+    "ISSUER": None,
+    "JSON_ENCODER": None,
+    "JWK_URL": None,
+    "LEEWAY": 0,
+    "AUTH_HEADER_TYPES": ("JWT",),
+    "AUTH_HEADER_NAME": "HTTP_AUTHORIZATION",
+    "USER_ID_FIELD": "id",
+    "USER_ID_CLAIM": "user_id",
+    "USER_AUTHENTICATION_RULE": "rest_framework_simplejwt.authentication.default_user_authentication_rule",
+    "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),
+    "TOKEN_TYPE_CLAIM": "token_type",
+    "TOKEN_USER_CLASS": "rest_framework_simplejwt.models.TokenUser",
+    "JTI_CLAIM": "jti",
+    "SLIDING_TOKEN_REFRESH_EXP_CLAIM": "refresh_exp",
+    "SLIDING_TOKEN_LIFETIME": timedelta(minutes=180),
+    "SLIDING_TOKEN_REFRESH_LIFETIME": timedelta(days=2),
+}
