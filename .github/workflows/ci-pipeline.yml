@@ -138,6 +138,11 @@ jobs:
           # Check if PR already exists
           EXISTING_PR=$(gh pr list --base staging --head dev --state open --json number --jq '.[0].number')
 
+          # Ensure labels exist (ignore error if they already exist)
+          gh label create "automated" --color "0e8a16" --description "Automated PR" || true
+          gh label create "staging" --color "fbca04" --description "Staging environment" || true
+          gh label create "promotion" --color "1d76db" --description "Promotion workflow" || true
+
           if [ -n "$EXISTING_PR" ]; then
             echo "PR #${EXISTING_PR} already exists from dev to staging"
             # Update the existing PR
