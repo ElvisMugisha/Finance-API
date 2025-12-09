@@ -145,9 +145,14 @@ jobs:
 
           if [ -n "$EXISTING_PR" ]; then
             echo "PR #${EXISTING_PR} already exists from dev to staging"
-            # Update the existing PR
-            gh pr edit "$EXISTING_PR" --body "$PR_BODY"
-            echo "Updated existing PR #${EXISTING_PR}"
+            # Try to update the existing PR body
+            if gh pr edit "$EXISTING_PR" --body "$PR_BODY"; then
+              echo "Updated existing PR #${EXISTING_PR} body"
+            else
+              echo "Could not edit PR body (likely permission issue). Posting comment instead."
+              gh pr comment "$EXISTING_PR" --body "$PR_BODY"
+              echo "Commented on existing PR #${EXISTING_PR}"
+            fi
           else
             # Create new PR
             gh pr create \
