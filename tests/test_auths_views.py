@@ -5,11 +5,12 @@ This module contains integration tests for all view endpoints in the auths app,
 testing the complete request-response cycle with Basic Authentication.
 """
 
-import pytest
 from datetime import timedelta
+
+import pytest
 from django.contrib.auth import get_user_model
-from django.utils import timezone
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -66,7 +67,7 @@ def authenticated_client(api_client, create_user):
     """Provide an authenticated API client with Basic Auth."""
     user = create_user()
     api_client.credentials(
-        HTTP_AUTHORIZATION=f"Basic dGVzdEBleGFtcGxlLmNvbTpTZWN1cmVQYXNzMTIzIQ=="
+        HTTP_AUTHORIZATION="Basic dGVzdEBleGFtcGxlLmNvbTpTZWN1cmVQYXNzMTIzIQ=="
     )
     return api_client, user
 
@@ -235,7 +236,7 @@ class TestEmailVerificationView:
     def test_successful_verification(self, api_client, create_user):
         """Test successful email verification."""
         user = create_user(is_verified=False)
-        passcode = Passcode.objects.create(
+        Passcode.objects.create(
             user=user,
             code="12345678",
             code_type=choices.CodeType.VERIFICATION,
@@ -265,7 +266,7 @@ class TestEmailVerificationView:
     def test_verification_expired_otp(self, api_client, create_user):
         """Test verification with expired OTP."""
         user = create_user(is_verified=False)
-        passcode = Passcode.objects.create(
+        Passcode.objects.create(
             user=user,
             code="12345678",
             code_type=choices.CodeType.VERIFICATION,
@@ -489,7 +490,7 @@ class TestPasswordResetFlow:
     def test_password_reset_verify(self, api_client, create_user):
         """Test password reset OTP verification."""
         user = create_user()
-        passcode = Passcode.objects.create(
+        Passcode.objects.create(
             user=user,
             code="12345678",
             code_type=choices.CodeType.PASSWORD_RESET,
@@ -507,7 +508,7 @@ class TestPasswordResetFlow:
         """Test password reset confirmation."""
         mocker.patch("utils.utils.send_normal_email")
         user = create_user()
-        passcode = Passcode.objects.create(
+        Passcode.objects.create(
             user=user,
             code="12345678",
             code_type=choices.CodeType.PASSWORD_RESET,

@@ -50,7 +50,7 @@ jobs:
           DEBUG: "True"
           USE_DOCKER: "False"
         run: |
-          python manage.py test --exclude-tag=integration
+          pytest
 
   # 3. Docker Build & Integration Tests
   # This builds the container and runs full integration tests inside it.
@@ -83,4 +83,4 @@ jobs:
             -e SECRET_KEY=build-secret \
             -e USE_DOCKER=False \
             finance-api:${{ github.sha }} \
-            python manage.py test
+            pytest

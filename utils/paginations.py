@@ -1,9 +1,10 @@
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
+
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
-from rest_framework.exceptions import ValidationError, NotFound
 
 from utils.loggings import setup_logging
 
@@ -118,7 +119,7 @@ class CustomPageNumberPagination(PageNumberPagination):
             )
             return final_link
 
-        except Exception as e:
+        except Exception:
             logger.exception(
                 "Unhandled error building pagination link for page=%s", page_number
             )
@@ -134,8 +135,8 @@ class CustomPageNumberPagination(PageNumberPagination):
                 if self.page.has_next()
                 else None
             )
-        except Exception as e:
-            logger.error("Error generating next link: %s", str(e))
+        except Exception:
+            logger.error("Error generating next link")
             return None
 
     def get_previous_link(self):

@@ -1,26 +1,27 @@
+from drf_spectacular.utils import OpenApiResponse, extend_schema
 from rest_framework import status
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.permissions import AllowAny
-from drf_spectacular.utils import extend_schema, OpenApiResponse
 
-from .serializers import (
-    UserRegistrationSerializer,
-    LoginSerializer,
-    UserListSerializer,
-    EmailVerificationSerializer,
-    ResendOTPSerializer,
-    ProfileSerializer,
-    PasswordChangeSerializer,
-    PasswordResetRequestSerializer,
-    PasswordResetVerifySerializer,
-    PasswordResetConfirmSerializer,
-)
-from .models import User
-from utils import loggings, choices
+from utils import choices, loggings
+from utils.paginations import CustomPageNumberPagination
 from utils.permissions import IsActiveAndVerified, IsSuperAdminOrSuperUser
 from utils.utils import create_and_send_otp
-from utils.paginations import CustomPageNumberPagination
+
+from .models import User
+from .serializers import (
+    EmailVerificationSerializer,
+    LoginSerializer,
+    PasswordChangeSerializer,
+    PasswordResetConfirmSerializer,
+    PasswordResetRequestSerializer,
+    PasswordResetVerifySerializer,
+    ProfileSerializer,
+    ResendOTPSerializer,
+    UserListSerializer,
+    UserRegistrationSerializer,
+)
 
 # Initialize logger
 logger = loggings.setup_logging()
@@ -87,7 +88,8 @@ class UserRegistrationView(APIView):
                 )
                 return Response(
                     {
-                        "message": "Your account has been created successfully. Please check your email for the verification code.",
+                        "message": "Your account has been created successfully.\n\n"
+                        "Please check your email for the verification code.",
                         "data": serializer.data,
                     },
                     status=status.HTTP_201_CREATED,
@@ -561,7 +563,8 @@ class UserListView(APIView):
 
     @extend_schema(
         summary="List all users",
-        description="Retrieve a paginated list of all users with their profile information. Only accessible by Super Admins and Superusers.",
+        description="Retrieve a paginated list of all users with their profile \
+        information. Only accessible by Super Admins and Superusers.",
         responses={
             200: UserListSerializer(many=True),
             403: OpenApiResponse(description="Forbidden - Insufficient permissions"),
@@ -834,7 +837,8 @@ class ResendOTPView(APIView):
 
     @extend_schema(
         summary="Resend verification OTP",
-        description="Resend a verification OTP to the user's email address. A new OTP will only be sent if the previous one has expired or been used.",
+        description="Resend a verification OTP to the user's email address.\n\n"
+        "A new OTP will only be sent if the previous one has expired or been used.",
         request=ResendOTPSerializer,
         responses={
             200: OpenApiResponse(description="OTP resent successfully"),
@@ -887,6 +891,7 @@ class ResendOTPView(APIView):
 
                 # Check for existing OTP for this user and code_type
                 from django.utils import timezone
+
                 from auths.models import Passcode
 
                 try:
@@ -1218,6 +1223,7 @@ class PasswordResetRequestView(APIView):
 
                     # Check for existing password reset OTP
                     from django.utils import timezone
+
                     from auths.models import Passcode
 
                     try:
@@ -1242,8 +1248,8 @@ class PasswordResetRequestView(APIView):
                             # Resend the existing OTP via email
                             try:
                                 from utils.utils import (
-                                    send_code_to_user,
                                     format_expiry_time,
+                                    send_code_to_user,
                                 )
 
                                 expiry_text = format_expiry_time(

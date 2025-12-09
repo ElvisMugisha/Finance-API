@@ -1,4 +1,3 @@
-import logging
 from typing import Any, Dict, Optional
 
 from django.contrib.auth import authenticate
@@ -7,8 +6,8 @@ from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
-from utils import choices
-from utils import loggings
+from utils import choices, loggings
+
 from .models import Passcode, Profile, User
 
 # Initialize logger

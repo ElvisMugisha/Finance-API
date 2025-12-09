@@ -1,5 +1,4 @@
 from rest_framework import permissions
-from utils import choices
 
 
 class IsActiveAndVerified(permissions.BasePermission):

@@ -1,8 +1,9 @@
 import re
+
+from decouple import config
 from django.utils.translation import gettext_lazy as _
 from rest_framework.exceptions import Throttled
 from rest_framework.throttling import UserRateThrottle
-from decouple import config
 
 
 class CustomScopedRateThrottle(UserRateThrottle):
@@ -53,7 +54,7 @@ class CustomScopedRateThrottle(UserRateThrottle):
             duration = multiplier * self.TIME_UNITS[unit]
             return num_requests, duration
 
-        except Exception as e:
+        except Exception:
             return None, None
 
     def get_rate_tuple(self, request):
@@ -81,7 +82,7 @@ class CustomScopedRateThrottle(UserRateThrottle):
             request._cached_throttle_rate = parsed
             return parsed
 
-        except Exception as e:
+        except Exception:
             return None, None
 
     def get_cache_key(self, request, view):
@@ -98,8 +99,8 @@ class CustomScopedRateThrottle(UserRateThrottle):
             key = self.cache_format % {"scope": self.scope, "ident": ident}
             return key
 
-        except Exception as e:
-            raise Throttled(detail=_("Error determining request rate limit.")) from e
+        except Exception:
+            raise Throttled(detail=_("Error determining request rate limit."))
 
     def allow_request(self, request, view):
         """
@@ -126,7 +127,7 @@ class CustomScopedRateThrottle(UserRateThrottle):
             try:
                 self.num_requests, self.duration = self.get_rate_tuple(self.request)
 
-            except Exception as e:
+            except Exception:
                 return 60  # Reasonable default fallback
 
         wait_time = super().wait()

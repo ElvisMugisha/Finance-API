@@ -10,11 +10,11 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
-from pathlib import Path
-from decouple import config, Csv
 from datetime import timedelta
-import dj_database_url
+from pathlib import Path
 
+import dj_database_url
+from decouple import Csv, config
 
 # Base directory
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -179,7 +179,7 @@ USE_TZ = True
 
 # Static files (CSS, JavaScript, Images)
 STATIC_URL = "static/"
-STATIC_ROOT = BASE_DIR / "staticfiles"
+STATIC_ROOT = BASE_DIR / "static"
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 MEDIA_URL = "/media/"

@@ -1,8 +1,8 @@
 from django.contrib.auth.models import BaseUserManager
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
-from django.utils.translation import gettext_lazy as _
 from django.utils.text import slugify
+from django.utils.translation import gettext_lazy as _
 
 from utils import loggings
 
