@@ -10,9 +10,6 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    needs:
-      [] # In a real scenario, you might want 'needs: [ci-pipeline]', but workflows are independent.
-      # We can trigger this only if CI passes by relying on branch protection rules requiring status checks.
 
     steps:
       - uses: actions/checkout@v4
