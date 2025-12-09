@@ -1,0 +1,56 @@
+name: Promote to Staging
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types:
+      - completed
+    branches:
+      - dev
+
+jobs:
+  create-staging-pr:
+    runs-on: ubuntu-latest
+    # Only run if the CI pipeline succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history for all branches
+
+      - name: Create Pull Request to Staging
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: staging
+          base: staging
+          title: "🚀 Auto-promote: dev → staging"
+          body: |
+            ## Automated Promotion from Dev to Staging
+
+            This PR was automatically created after successful CI pipeline run on the `dev` branch.
+
+            ### CI Pipeline Status
+            - ✅ All tests passed
+            - ✅ Linting checks passed
+            - ✅ Docker integration tests passed
+
+            ### Commit Details
+            - **Triggered by**: ${{ github.event.workflow_run.head_commit.author.name }}
+            - **Commit**: ${{ github.event.workflow_run.head_sha }}
+            - **Message**: ${{ github.event.workflow_run.head_commit.message }}
+            - **Workflow Run**: ${{ github.event.workflow_run.html_url }}
+
+            ### Review Checklist
+            - [ ] Code changes reviewed
+            - [ ] No breaking changes
+            - [ ] Ready for staging deployment
+
+            **Note**: This PR can be merged automatically or after manual review depending on your team's policy.
+          labels: |
+            automated
+            staging
+            promotion
+          draft: false
