@@ -18,7 +18,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Fetch all history for all branches
+          fetch-depth: 0 # Fetch all history for all branches
 
       - name: Create Pull Request to Production
         env:
@@ -33,45 +33,45 @@ jobs:
           # Create PR body
           PR_BODY="## 🚨 Production Release Candidate
 
-This PR was automatically created after successful CI pipeline run on the \`staging\` branch.
+          This PR was automatically created after successful CI pipeline run on the \`staging\` branch.
 
-### ✅ Pre-Production Validation
-- ✅ All tests passed on staging
-- ✅ Linting checks passed
-- ✅ Docker integration tests passed
-- ✅ Staging environment validated
+          ### ✅ Pre-Production Validation
+          - ✅ All tests passed on staging
+          - ✅ Linting checks passed
+          - ✅ Docker integration tests passed
+          - ✅ Staging environment validated
 
-### 📋 Release Information
-- **Triggered by**: ${AUTHOR}
-- **Staging Commit**: ${COMMIT_SHA}
-- **Message**: ${COMMIT_MSG}
-- **Workflow Run**: ${WORKFLOW_URL}
+          ### 📋 Release Information
+          - **Triggered by**: ${AUTHOR}
+          - **Staging Commit**: ${COMMIT_SHA}
+          - **Message**: ${COMMIT_MSG}
+          - **Workflow Run**: ${WORKFLOW_URL}
 
-### 🔍 Production Release Checklist
-- [ ] **CRITICAL**: All staging tests verified
-- [ ] Database migrations reviewed and tested
-- [ ] Environment variables configured in production
-- [ ] Rollback plan documented
-- [ ] Monitoring and alerts configured
-- [ ] Team notified of deployment window
-- [ ] Breaking changes documented (if any)
-- [ ] API documentation updated
+          ### 🔍 Production Release Checklist
+          - [ ] **CRITICAL**: All staging tests verified
+          - [ ] Database migrations reviewed and tested
+          - [ ] Environment variables configured in production
+          - [ ] Rollback plan documented
+          - [ ] Monitoring and alerts configured
+          - [ ] Team notified of deployment window
+          - [ ] Breaking changes documented (if any)
+          - [ ] API documentation updated
 
-### 🎯 Deployment Strategy
-This merge will trigger:
-1. Docker image build and push to registry
-2. Production deployment (manual or automated based on your setup)
-3. Post-deployment health checks
+          ### 🎯 Deployment Strategy
+          This merge will trigger:
+          1. Docker image build and push to registry
+          2. Production deployment (manual or automated based on your setup)
+          3. Post-deployment health checks
 
-### ⚠️ Important Notes
-- **This is a PRODUCTION release** - requires careful review
-- Merging this PR will trigger production deployment
-- Ensure all stakeholders are aware
-- Have rollback procedures ready
+          ### ⚠️ Important Notes
+          - **This is a PRODUCTION release** - requires careful review
+          - Merging this PR will trigger production deployment
+          - Ensure all stakeholders are aware
+          - Have rollback procedures ready
 
----
+          ---
 
-**Reviewers**: Please verify all checklist items before approving."
+          **Reviewers**: Please verify all checklist items before approving."
 
           # Check if PR already exists
           EXISTING_PR=$(gh pr list --base prod --head staging --state open --json number --jq '.[0].number')
@@ -84,11 +84,11 @@ This merge will trigger:
           else
             # Create new PR as DRAFT for extra safety
             gh pr create \
-              --base prod \
-              --head staging \
-              --title "🚀 Production Release: staging → prod" \
-              --body "$PR_BODY" \
-              --label "production,release,critical,automated" \
-              --draft
+                --base prod \
+                --head staging \
+                --title "🚀 Production Release: staging → prod" \
+                --body "$PR_BODY" \
+                --label "production,release,critical,automated" \
+                --draft
             echo "Created new DRAFT PR from staging to prod"
           fi
