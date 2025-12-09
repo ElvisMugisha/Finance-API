@@ -84,3 +84,72 @@ jobs:
             -e USE_DOCKER=False \
             finance-api:${{ github.sha }} \
             pytest
+
+  # 4. Promote to Staging
+  # Automatically creates a PR to staging if all tests pass
+  promote-to-staging:
+    needs: docker-validation
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev' && success()
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create Pull Request to Staging
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get commit details
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          AUTHOR="${{ github.actor }}"
+          WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Create PR body
+          PR_BODY=$(cat <<'EOF'
+          ## Automated Promotion from Dev to Staging
+
+          This PR was automatically created after successful CI pipeline run on the \`dev\` branch.
+
+          ### CI Pipeline Status
+          - ✅ All tests passed
+          - ✅ Linting checks passed
+          - ✅ Docker integration tests passed
+
+          ### Commit Details
+          - **Triggered by**: ${AUTHOR}
+          - **Commit**: ${COMMIT_SHA}
+          - **Workflow Run**: ${WORKFLOW_URL}
+
+          ### Review Checklist
+          - [ ] Code changes reviewed
+          - [ ] No breaking changes
+          - [ ] Ready for staging deployment
+
+          **Note**: This PR can be merged automatically or after manual review depending on your team's policy.
+          EOF
+          )
+
+          # Check if PR already exists
+          EXISTING_PR=$(gh pr list --base staging --head dev --state open --json number --jq '.[0].number')
+
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #${EXISTING_PR} already exists from dev to staging"
+            # Update the existing PR
+            gh pr edit "$EXISTING_PR" --body "$PR_BODY"
+            echo "Updated existing PR #${EXISTING_PR}"
+          else
+            # Create new PR
+            gh pr create \
+              --base staging \
+              --head dev \
+              --title "🚀 Auto-promote: dev → staging" \
+              --body "$PR_BODY" \
+              --label "automated,staging,promotion"
+            echo "Created new PR from dev to staging"
+          fi
