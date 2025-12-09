@@ -2,7 +2,7 @@ name: Promote to Production
 
 on:
   workflow_run:
-    workflows: ["CI Pipeline"]
+    workflows: ["CI Pipeline for Staging"]
     types:
       - completed
     branches:
@@ -18,63 +18,77 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetch all history for all branches
+          fetch-depth: 0  # Fetch all history for all branches
 
       - name: Create Pull Request to Production
-        uses: peter-evans/create-pull-request@v6
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          branch: prod
-          base: prod
-          title: "🚀 Production Release: staging → prod"
-          body: |
-            ## 🚨 Production Release Candidate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get commit details
+          COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
+          COMMIT_MSG="${{ github.event.workflow_run.head_commit.message }}"
+          AUTHOR="${{ github.event.workflow_run.head_commit.author.name }}"
+          WORKFLOW_URL="${{ github.event.workflow_run.html_url }}"
 
-            This PR was automatically created after successful CI pipeline run on the `staging` branch.
+          # Create PR body
+          PR_BODY="## 🚨 Production Release Candidate
 
-            ### ✅ Pre-Production Validation
-            - ✅ All tests passed on staging
-            - ✅ Linting checks passed
-            - ✅ Docker integration tests passed
-            - ✅ Staging environment validated
+This PR was automatically created after successful CI pipeline run on the \`staging\` branch.
 
-            ### 📋 Release Information
-            - **Triggered by**: ${{ github.event.workflow_run.head_commit.author.name }}
-            - **Staging Commit**: ${{ github.event.workflow_run.head_sha }}
-            - **Message**: ${{ github.event.workflow_run.head_commit.message }}
-            - **Workflow Run**: ${{ github.event.workflow_run.html_url }}
+### ✅ Pre-Production Validation
+- ✅ All tests passed on staging
+- ✅ Linting checks passed
+- ✅ Docker integration tests passed
+- ✅ Staging environment validated
 
-            ### 🔍 Production Release Checklist
-            - [ ] **CRITICAL**: All staging tests verified
-            - [ ] Database migrations reviewed and tested
-            - [ ] Environment variables configured in production
-            - [ ] Rollback plan documented
-            - [ ] Monitoring and alerts configured
-            - [ ] Team notified of deployment window
-            - [ ] Breaking changes documented (if any)
-            - [ ] API documentation updated
+### 📋 Release Information
+- **Triggered by**: ${AUTHOR}
+- **Staging Commit**: ${COMMIT_SHA}
+- **Message**: ${COMMIT_MSG}
+- **Workflow Run**: ${WORKFLOW_URL}
 
-            ### 🎯 Deployment Strategy
-            This merge will trigger:
-            1. Docker image build and push to registry
-            2. Production deployment (manual or automated based on your setup)
-            3. Post-deployment health checks
+### 🔍 Production Release Checklist
+- [ ] **CRITICAL**: All staging tests verified
+- [ ] Database migrations reviewed and tested
+- [ ] Environment variables configured in production
+- [ ] Rollback plan documented
+- [ ] Monitoring and alerts configured
+- [ ] Team notified of deployment window
+- [ ] Breaking changes documented (if any)
+- [ ] API documentation updated
 
-            ### ⚠️ Important Notes
-            - **This is a PRODUCTION release** - requires careful review
-            - Merging this PR will trigger production deployment
-            - Ensure all stakeholders are aware
-            - Have rollback procedures ready
+### 🎯 Deployment Strategy
+This merge will trigger:
+1. Docker image build and push to registry
+2. Production deployment (manual or automated based on your setup)
+3. Post-deployment health checks
 
-            ---
+### ⚠️ Important Notes
+- **This is a PRODUCTION release** - requires careful review
+- Merging this PR will trigger production deployment
+- Ensure all stakeholders are aware
+- Have rollback procedures ready
 
-            **Reviewers**: Please verify all checklist items before approving.
-          labels: |
-            production
-            release
-            critical
-            automated
-          draft: true # Create as draft PR for extra safety
-          reviewers: |
-            # Add your team members who should review production releases
-            # Example: username1, username2
+---
+
+**Reviewers**: Please verify all checklist items before approving."
+
+          # Check if PR already exists
+          EXISTING_PR=$(gh pr list --base prod --head staging --state open --json number --jq '.[0].number')
+
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #${EXISTING_PR} already exists from staging to prod"
+            # Update the existing PR
+            gh pr edit "$EXISTING_PR" --body "$PR_BODY"
+            echo "Updated existing PR #${EXISTING_PR}"
+          else
+            # Create new PR as DRAFT for extra safety
+            gh pr create \
+              --base prod \
+              --head staging \
+              --title "🚀 Production Release: staging → prod" \
+              --body "$PR_BODY" \
+              --label "production,release,critical,automated" \
+              --draft
+            echo "Created new DRAFT PR from staging to prod"
+          fi
