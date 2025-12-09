@@ -1,5 +1,5 @@
 # Builder
-FROM python:3.12-slim as builder
+FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
@@ -40,8 +40,8 @@ RUN pip install --no-cache-dir /wheels/*
 # Copy entrypoint
 COPY entrypoint.sh .
 # Fix line endings ensuring script is executable
-RUN sed -i 's/\r$//g' /app/entrypoint.sh && \
-    chmod +x /app/entrypoint.sh
+RUN sed -i 's/\r$//g' /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Copy project
 COPY . .
