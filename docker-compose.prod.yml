@@ -2,16 +2,14 @@ services:
   # PostgreSQL Database
   db:
     image: postgres:16-alpine
-    container_name: finance_api_db
+    container_name: finance_api_db_prod
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-finance_api_db}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    restart: unless-stopped
+      - postgres_data_prod:/var/lib/postgresql/data
+    restart: always
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -21,10 +19,8 @@ services:
   # Redis for Celery message broker
   redis:
     image: redis:7-alpine
-    container_name: finance_api_redis
-    ports:
-      - "6379:6379"
-    restart: unless-stopped
+    container_name: finance_api_redis_prod
+    restart: always
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -34,14 +30,18 @@ services:
   # Django API
   api:
     build: .
-    container_name: finance_api
+    container_name: finance_api_prod
+    # Uses default CMD from Dockerfile (Gunicorn)
+    # Entrypoint script handles migrations if customized, but usually migrations run separately or via a release phase.
+    # For simplicity in Compose, we can chain them or assume entrypoint handles waiting.
+    # To run migrations automatically on startup in prod (common pattern for simple setups):
     command: >
-      sh -c "python manage.py migrate &&
-             python manage.py runserver 0.0.0.0:8000"
+      sh -c "python manage.py collectstatic --noinput &&
+             python manage.py migrate &&
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000"
     volumes:
-      - .:/app
-      - media_files:/app/media
-      - static_files:/app/static
+      - media_files_prod:/app/media
+      - static_files_prod:/app/static
     ports:
       - "8000:8000"
     env_file:
@@ -54,16 +54,15 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
+    restart: always
 
-  # Celery Worker for async tasks
+  # Celery Worker
   celery:
     build: .
-    container_name: finance_api_celery
+    container_name: finance_api_celery_prod
     command: celery -A config worker --loglevel=info
     volumes:
-      - .:/app
-      - media_files:/app/media
+      - media_files_prod:/app/media
     env_file:
       - .env
     environment:
@@ -76,9 +75,9 @@ services:
         condition: service_healthy
       api:
         condition: service_started
-    restart: unless-stopped
+    restart: always
 
 volumes:
-  postgres_data:
-  media_files:
-  static_files:
+  postgres_data_prod:
+  media_files_prod:
+  static_files_prod:

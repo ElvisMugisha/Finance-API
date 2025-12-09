@@ -1,0 +1,165 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: ["dev"]
+  pull_request:
+    branches: ["dev"]
+
+jobs:
+  # 1. Linting and Static Analysis
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Linting dependencies
+        run: |
+          pip install flake8 isort black
+      - name: Auto-format import sorting with isort
+        run: isort . --check-only --diff
+      - name: Check code formatting with Black
+        run: black . --check --diff
+      - name: Lint with flake8
+        # Stop the build if there are Python syntax errors or undefined names
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+  # 2. Test Suite (Fast Unit Tests)
+  # This runs strictly on the Codebase using standard Python, to catch logic errors early.
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      - name: Run Unit Tests
+        env:
+          SECRET_KEY: test_secret_key
+          DEBUG: "True"
+          USE_DOCKER: "False"
+        run: |
+          pytest
+
+  # 3. Docker Build & Integration Tests
+  # This builds the container and runs full integration tests inside it.
+  docker-validation:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    # Only run this if we are pushing to a branch, or if unit tests passed.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          load: true
+          tags: finance-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Integration Tests in Docker
+        # Spins up the container and runs the full test suite
+        run: |
+          docker run --rm \
+            -e DEBUG=True \
+            -e SECRET_KEY=build-secret \
+            -e USE_DOCKER=False \
+            finance-api:${{ github.sha }} \
+            pytest
+
+  # 4. Promote to Staging
+  # Automatically creates a PR to staging if all tests pass
+  promote-to-staging:
+    needs: docker-validation
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev' && success()
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create Pull Request to Staging
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get commit details
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          AUTHOR="${{ github.actor }}"
+          WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Create PR body
+          PR_BODY=$(cat <<'EOF'
+          ## Automated Promotion from Dev to Staging
+
+          This PR was automatically created after successful CI pipeline run on the \`dev\` branch.
+
+          ### CI Pipeline Status
+          - ✅ All tests passed
+          - ✅ Linting checks passed
+          - ✅ Docker integration tests passed
+
+          ### Commit Details
+          - **Triggered by**: ${AUTHOR}
+          - **Commit**: ${COMMIT_SHA}
+          - **Workflow Run**: ${WORKFLOW_URL}
+
+          ### Review Checklist
+          - [ ] Code changes reviewed
+          - [ ] No breaking changes
+          - [ ] Ready for staging deployment
+
+          **Note**: This PR can be merged automatically or after manual review depending on your team's policy.
+          EOF
+          )
+
+          # Check if PR already exists
+          EXISTING_PR=$(gh pr list --base staging --head dev --state open --json number --jq '.[0].number')
+
+          # Ensure labels exist (ignore error if they already exist)
+          gh label create "automated" --color "0e8a16" --description "Automated PR" || true
+          gh label create "staging" --color "fbca04" --description "Staging environment" || true
+          gh label create "promotion" --color "1d76db" --description "Promotion workflow" || true
+
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #${EXISTING_PR} already exists from dev to staging"
+            # Try to update the existing PR body
+            if gh pr edit "$EXISTING_PR" --body "$PR_BODY"; then
+              echo "Updated existing PR #${EXISTING_PR} body"
+            else
+              echo "Could not edit PR body (likely permission issue). Posting comment instead."
+              gh pr comment "$EXISTING_PR" --body "$PR_BODY"
+              echo "Commented on existing PR #${EXISTING_PR}"
+            fi
+          else
+            # Create new PR
+            gh pr create \
+              --base staging \
+              --head dev \
+              --title "🚀 Auto-promote: dev → staging" \
+              --body "$PR_BODY" \
+              --label "automated,staging,promotion"
+            echo "Created new PR from dev to staging"
+          fi

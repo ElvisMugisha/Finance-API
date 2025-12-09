@@ -10,17 +10,18 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+from datetime import timedelta
 from pathlib import Path
-from decouple import config, Csv
-import dj_database_url
 
+import dj_database_url
+from decouple import Csv, config
 
 # Base directory
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Security
-SECRET_KEY = config("SECRET_KEY")
-DEBUG = config("DEBUG", default=True, cast=bool)
+SECRET_KEY = config("SECRET_KEY", default="django-insecure-default-key-for-build")
+DEBUG = config("DEBUG", default=False, cast=bool)
 ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="*", cast=Csv())
 
 
@@ -37,13 +38,16 @@ DJANGO_APPS = [
 # Third party apps
 THIRD_PARTY_APPS = [
     "rest_framework",
+    "rest_framework.authtoken",
+    "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "drf_spectacular",
     "corsheaders",
     "django_filters",
 ]
 
 # Local apps
-LOCAL_APPS = []
+LOCAL_APPS = ["auths"]
 
 # Installed apps
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -51,6 +55,7 @@ INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 # Middleware
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",  # WhiteNoise Middleware
     "django.contrib.sessions.middleware.SessionMiddleware",
     "corsheaders.middleware.CorsMiddleware",  # CORS Middleware
     "django.middleware.common.CommonMiddleware",
@@ -101,25 +106,22 @@ else:
     # Production: Use PostgreSQL with optimizations
     DATABASES = {
         "default": dj_database_url.config(
-            default=config(
-                "DATABASE_URL",
-                default="postgresql://postgres:postgres@db:5432/finance_API_db",
-            ),
+            default=config("DATABASE_URL"),
             conn_max_age=600,  # Connection pooling: reuse connections for 10 minutes
             conn_health_checks=True,  # Verify connection health before reuse
         )
     }
 
 # Override for Docker environment (always use PostgreSQL in Docker)
-if config("USE_DOCKER", default=False, cast=bool):
+if config("USE_DOCKER", cast=bool):
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
-            "NAME": config("POSTGRES_DB", default="finance_API_db"),
-            "USER": config("POSTGRES_USER", default="postgres"),
-            "PASSWORD": config("POSTGRES_PASSWORD", default="postgres"),
-            "HOST": config("POSTGRES_HOST", default="db"),
-            "PORT": config("POSTGRES_PORT", default="5432"),
+            "NAME": config("POSTGRES_DB"),
+            "USER": config("POSTGRES_USER"),
+            "PASSWORD": config("POSTGRES_PASSWORD"),
+            "HOST": config("POSTGRES_HOST"),
+            "PORT": config("POSTGRES_PORT"),
             # Connection pooling: Keep connections alive for 10 minutes
             "CONN_MAX_AGE": 600,
             # Production-grade PostgreSQL options
@@ -129,7 +131,7 @@ if config("USE_DOCKER", default=False, cast=bool):
                 # Statement timeout (milliseconds) - prevent long-running queries
                 "options": "-c statement_timeout=30000",
                 # SSL mode for production (disable for local Docker)
-                "sslmode": config("POSTGRES_SSL_MODE", default="prefer"),
+                "sslmode": config("POSTGRES_SSL_MODE"),
                 # Connection pooling settings
                 "keepalives": 1,
                 "keepalives_idle": 30,
@@ -150,7 +152,7 @@ if not DEBUG:
     DATABASES["default"]["OPTIONS"]["server_side_binding"] = False
 
 # Authentication
-# AUTH_USER_MODEL = "authentication.User"
+AUTH_USER_MODEL = "auths.User"
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -177,6 +179,8 @@ USE_TZ = True
 
 # Static files (CSS, JavaScript, Images)
 STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "static"
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
@@ -184,7 +188,8 @@ MEDIA_ROOT = BASE_DIR / "media"
 # REST Framework
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.TokenAuthentication",
+        # "rest_framework_simplejwt.authentication.JWTAuthentication",
+        # "rest_framework.authentication.TokenAuthentication",
         # "rest_framework.authentication.SessionAuthentication",
         "rest_framework.authentication.BasicAuthentication",
     ],
@@ -221,6 +226,7 @@ REST_FRAMEWORK = {
 CORS_ALLOW_ALL_ORIGINS = DEBUG  # Allow all only in development
 CORS_ALLOWED_ORIGINS = config(
     "CORS_ALLOWED_ORIGINS",
+    default="http://localhost:3000,http://127.0.0.1:3000",
     cast=lambda v: [s.strip() for s in v.split(",")],
 )
 CORS_ALLOW_CREDENTIALS = True
@@ -257,19 +263,53 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB
 
 # Email Settings
 # EMAIL_BACKEND = config("EMAIL_BACKEND", default="django.core.mail.backends.console.EmailBackend")
-EMAIL_HOST = config("EMAIL_HOST")
-EMAIL_PORT = config("EMAIL_PORT", cast=int)
-EMAIL_USE_TLS = config("EMAIL_USE_TLS", cast=bool)
-EMAIL_HOST_USER = config("EMAIL_HOST_USER")
-EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD")
-EMAIL_FROM = config("EMAIL_FROM")
+EMAIL_HOST = config("EMAIL_HOST", default="smtp.gmail.com")
+EMAIL_PORT = config("EMAIL_PORT", default=587, cast=int)
+EMAIL_USE_TLS = config("EMAIL_USE_TLS", default=True, cast=bool)
+EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="test@example.com")
+EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="p@ssword")
+EMAIL_FROM = config("EMAIL_FROM", default="test@example.com")
 
 # Celery Configuration
-CELERY_BROKER_URL = config("CELERY_BROKER_URL")
-CELERY_RESULT_BACKEND = config("CELERY_RESULT_BACKEND")
+CELERY_BROKER_URL = config("CELERY_BROKER_URL", default="redis://localhost:6379/1")
+CELERY_RESULT_BACKEND = config(
+    "CELERY_RESULT_BACKEND", default="redis://localhost:6379/1"
+)
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
+
+# Simple JWT Configuration
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=180),  # Access token lifetime
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=2),  # Refresh token lifetime
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "UPDATE_LAST_LOGIN": True,
+    "ALLOWED_TOKEN_TYPES": ("access", "refresh"),
+    "ALGORITHM": "HS256",
+    "SIGNING_KEY": config(
+        "SIGNING_KEY", default="django-insecure-default-key-for-build"
+    ),
+    "VERIFYING_KEY": "",
+    "AUDIENCE": None,
+    "ISSUER": None,
+    "JSON_ENCODER": None,
+    "JWK_URL": None,
+    "LEEWAY": 0,
+    "AUTH_HEADER_TYPES": ("JWT",),
+    "AUTH_HEADER_NAME": "HTTP_AUTHORIZATION",
+    "USER_ID_FIELD": "id",
+    "USER_ID_CLAIM": "user_id",
+    "USER_AUTHENTICATION_RULE": "rest_framework_simplejwt.authentication.default_user_authentication_rule",
+    "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),
+    "TOKEN_TYPE_CLAIM": "token_type",
+    "TOKEN_USER_CLASS": "rest_framework_simplejwt.models.TokenUser",
+    "JTI_CLAIM": "jti",
+    "SLIDING_TOKEN_REFRESH_EXP_CLAIM": "refresh_exp",
+    "SLIDING_TOKEN_LIFETIME": timedelta(minutes=180),
+    "SLIDING_TOKEN_REFRESH_LIFETIME": timedelta(days=2),
+}

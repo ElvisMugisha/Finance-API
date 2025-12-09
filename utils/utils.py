@@ -1,16 +1,16 @@
 import random
-import re
 from datetime import timedelta
-from django.utils import timezone
+
 from django.conf import settings
-from django.core.mail import EmailMessage
 from django.core.exceptions import ObjectDoesNotExist
+from django.core.mail import EmailMessage
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from rest_framework import status
 from rest_framework.response import Response
 
-from authentication.models import User, Passcode
-from utils import loggings, choices
+from auths.models import Passcode, User
+from utils import choices, loggings
 
 # Initialize logger
 logger = loggings.setup_logging()

@@ -1,5 +1,4 @@
 from rest_framework import permissions
-from utils import choices
 
 
 class IsActiveAndVerified(permissions.BasePermission):
@@ -55,10 +54,6 @@ class IsSuperAdminOrSuperUser(permissions.BasePermission):
 
         # Check if user is a superuser
         if request.user.is_superuser:
-            return True
-
-        # Check if user has the Super_Admin role
-        if request.user.role == choices.UserRole.SUPER_ADMIN:
             return True
 
         self.message = "You do not have permission to perform this action. Requires Super Admin privileges."
