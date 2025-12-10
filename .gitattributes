@@ -1,0 +1,9 @@
+# Ensure shell scripts always use LF line endings, even on Windows
+*.sh text eol=lf
+entrypoint.sh text eol=lf
+
+# Python files should use LF
+*.py text eol=lf
+
+# Default behavior: let Git handle line endings automatically
+* text=auto

@@ -41,7 +41,7 @@ RUN pip install --no-cache-dir /wheels/*
 COPY . .
 
 # Fix entrypoint permissions (must be after COPY to avoid being overwritten)
-RUN sed -i 's/\r$//g' /app/entrypoint.sh && \
+RUN sed -i 's/\r$//' /app/entrypoint.sh && \
     chmod +x /app/entrypoint.sh
 
 # Chown all the files to the app user

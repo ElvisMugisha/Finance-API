@@ -3,6 +3,7 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.views import TokenRefreshView
 
 from utils import choices, loggings
 from utils.paginations import CustomPageNumberPagination
@@ -547,6 +548,36 @@ class LogoutView(APIView):
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+
+class CustomTokenRefreshView(TokenRefreshView):
+    """
+    API View for Refreshing JWT Tokens.
+
+    Takes a valid refresh token and returns a new access token.
+    If 'ROTATE_REFRESH_TOKENS' is True in settings, also returns a new refresh token.
+    """
+
+    @extend_schema(
+        summary="Refresh JWT Access Token",
+        description="Get a new access token using a valid refresh token.",
+        responses={
+            200: OpenApiResponse(description="Token refreshed successfully"),
+            401: OpenApiResponse(description="Unauthorized - Invalid or expired token"),
+        },
+    )
+    def post(self, request, *args, **kwargs):
+        """
+        Handle POST request to refresh token.
+        """
+        logger.info("Token refresh requested")
+        try:
+            response = super().post(request, *args, **kwargs)
+            logger.info("Token refreshed successfully")
+            return response
+        except Exception as e:
+            logger.warning(f"Token refresh failed: {str(e)}")
+            raise e
 
 
 class UserListView(APIView):
