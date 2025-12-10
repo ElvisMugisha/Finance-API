@@ -37,15 +37,12 @@ COPY --from=builder /app/requirements.txt .
 # Install dependencies
 RUN pip install --no-cache-dir /wheels/*
 
-# Copy entrypoint script first and fix it
-COPY entrypoint.sh /app/entrypoint.sh
+# Copy project
+COPY . .
 
-# Fix line endings and set permissions for entrypoint
+# Fix entrypoint permissions (must be after COPY to avoid being overwritten)
 RUN sed -i 's/\r$//' /app/entrypoint.sh && \
     chmod +x /app/entrypoint.sh
-
-# Copy rest of project
-COPY . .
 
 # Chown all the files to the app user
 RUN chown -R app:app /app
