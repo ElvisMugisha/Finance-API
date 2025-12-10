@@ -1,5 +1,7 @@
-import pytest
 from decimal import Decimal
+
+import pytest
+
 from accounts.models import Account
 from core.models import Currency
 from utils import choices

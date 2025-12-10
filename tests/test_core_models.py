@@ -1,4 +1,5 @@
 import pytest
+
 from core.models import Currency
 
 

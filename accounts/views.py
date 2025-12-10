@@ -1,12 +1,13 @@
+from django.db.models import ProtectedError
+from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import OpenApiResponse, extend_schema
-from rest_framework import status, permissions, filters
+from rest_framework import filters, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from django.shortcuts import get_object_or_404
-from django.db.models import ProtectedError
 
 from utils import loggings
 from utils.paginations import CustomPageNumberPagination
+
 from .models import Account
 from .serializers import AccountSerializer
 
