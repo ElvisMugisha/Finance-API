@@ -17,7 +17,10 @@ class TestAccountAPI:
     @pytest.fixture
     def user(self, django_user_model):
         return django_user_model.objects.create_user(
-            email="test@example.com", password="password"
+            email="test@example.com",
+            password="password",
+            first_name="Test",
+            last_name="User",
         )
 
     @pytest.fixture
@@ -30,7 +33,7 @@ class TestAccountAPI:
         """Test creating an account via API."""
         client.force_authenticate(user=user)
 
-        url = "/api/v1/accounts/"
+        url = "/accounts/"
         data = {
             "name": "My Savings",
             "account_type": "Savings",  # Case sensitive matching choices? TextChoices are usually title case 'Savings'
@@ -50,18 +53,18 @@ class TestAccountAPI:
         Account.objects.create(user=user, currency=currency, name="Test Acc")
         client.force_authenticate(user=user)
 
-        url = "/api/v1/accounts/"
+        url = "/accounts/"
         response = client.get(url)
 
         assert response.status_code == status.HTTP_200_OK
-        assert len(response.data["results"]) == 1
+        assert len(response.data) == 1
 
     def test_update_account(self, client, user, currency):
         """Test partial update of account."""
         account = Account.objects.create(user=user, currency=currency, name="Old Name")
         client.force_authenticate(user=user)
 
-        url = f"/api/v1/accounts/{account.id}/"
+        url = f"/accounts/{account.id}/"
         data = {"name": "New Name"}
         response = client.patch(url, data)
 
@@ -76,7 +79,7 @@ class TestAccountAPI:
         account = Account.objects.create(user=user, currency=currency, name="To Delete")
         client.force_authenticate(user=user)
 
-        url = f"/api/v1/accounts/{account.id}/"
+        url = f"/accounts/{account.id}/"
         response = client.delete(url)
 
         assert response.status_code == status.HTTP_204_NO_CONTENT

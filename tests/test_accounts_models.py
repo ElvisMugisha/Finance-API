@@ -14,7 +14,10 @@ class TestAccountModel:
     @pytest.fixture
     def user(self, django_user_model):
         return django_user_model.objects.create_user(
-            email="test@example.com", password="password"
+            email="test@example.com",
+            password="password",
+            first_name="Test",
+            last_name="User",
         )
 
     @pytest.fixture

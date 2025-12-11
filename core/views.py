@@ -1,23 +1,13 @@
-from django.shortcuts import get_object_or_404
-from django.db import models
-from django.core.exceptions import ValidationError
-from drf_spectacular.utils import (
-    OpenApiResponse,
-    extend_schema,
-    OpenApiTypes,
-    OpenApiParameter,
-)
-from rest_framework import filters, status, viewsets
+from drf_spectacular.utils import OpenApiResponse, extend_schema
+from rest_framework import status, viewsets
 from rest_framework.response import Response
-from rest_framework.decorators import action
-from rest_framework.views import APIView
 
 from utils import loggings
 from utils.paginations import CustomPageNumberPagination
-from utils.permissions import CategoryPermission, IsAdminUser, IsActiveAndVerified
+from utils.permissions import CategoryPermission, IsActiveAndVerified, IsAdminUser
 
-from .models import Currency, Category
-from .serializers import CurrencySerializer, CategorySerializer
+from .models import Category, Currency
+from .serializers import CategorySerializer, CurrencySerializer
 
 # Initialize logger
 logger = loggings.setup_logging()
@@ -37,6 +27,7 @@ class CurrencyViewSet(viewsets.ModelViewSet):
 
     queryset = Currency.objects.all()
     serializer_class = CurrencySerializer
+    pagination_class = CustomPageNumberPagination
     lookup_field = "pk"
 
     def get_permissions(self):
@@ -151,6 +142,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
 
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
+    pagination_class = CustomPageNumberPagination
     permission_classes = [CategoryPermission]
     lookup_field = "pk"  # UUID primary key
 

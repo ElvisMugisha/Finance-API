@@ -3,11 +3,10 @@ from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError, models
-from django.utils.timezone import now
+from django.db import models
 from django.utils.translation import gettext_lazy as _
 
-from utils import loggings, choices
+from utils import choices, loggings
 
 # Initialize logger
 logger = loggings.setup_logging()
@@ -33,7 +32,7 @@ class Currency(models.Model):
 
     def __str__(self):
         """Human readable representation."""
-        return f"{self.code} | {self.name} ({self.symbol or ''})".strip()
+        return f"{self.code} ({self.symbol})" if self.symbol else f"{self.code}"
 
     def clean(self):
         """

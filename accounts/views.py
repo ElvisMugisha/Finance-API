@@ -1,7 +1,7 @@
 from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import OpenApiResponse, extend_schema
-from rest_framework import filters, permissions, status
+from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -192,7 +192,10 @@ class AccountDetailView(APIView):
             )
             return Response(
                 {
-                    "error": "Cannot delete this account because it has related records (e.g. transactions). Archive it instead."
+                    "error": """
+                    Cannot delete this account because it has related
+                    records (e.g. transactions). Archive it instead.
+                    """
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
