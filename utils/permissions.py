@@ -60,6 +60,47 @@ class IsAdminUser(permissions.BasePermission):
         return False
 
 
+class IsOwnerOrAdmin(permissions.BasePermission):
+    """
+    Object-level permission:
+    - Admins (superuser or staff) have full access.
+    - Regular users can only access objects they own.
+    """
+
+    message = "You do not have permission to access or modify this resource."
+
+    def has_permission(self, request, view):
+        # Basic auth check
+        if not request.user or not request.user.is_authenticated:
+            self.message = "Authentication credentials were not provided."
+            return False
+
+        if not request.user.is_active:
+            self.message = "User account is not active."
+            return False
+
+        if not request.user.is_verified:
+            self.message = "User account is not verified."
+            return False
+
+        return True
+
+    def has_object_permission(self, request, view, obj):
+        user = request.user
+
+        # Admins always allowed
+        if user.is_superuser or user.is_staff:
+            return True
+
+        # Must have a "user" attribute
+        if not hasattr(obj, "user"):
+            self.message = "This object does not have an owner field."
+            return False
+
+        # Regular users can access only their own objects
+        return obj.user == user
+
+
 class CategoryPermission(permissions.BasePermission):
     """
     Enforces strict access control for Category CRUD operations.

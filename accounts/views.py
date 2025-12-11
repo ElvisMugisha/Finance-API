@@ -1,63 +1,63 @@
 from django.db.models import ProtectedError
+from django.db import transaction as db_transaction
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import OpenApiResponse, extend_schema
-from rest_framework import permissions, status
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import status, viewsets, filters
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from utils import loggings
 from utils.paginations import CustomPageNumberPagination
+from utils.permissions import IsActiveAndVerified, IsOwnerOrAdmin
 
-from .models import Account
-from .serializers import AccountSerializer
+from .models import Account, Transaction
+from .serializers import AccountSerializer, TransactionSerializer
 
 logger = loggings.setup_logging()
 
 
-class AccountListCreateView(APIView):
+class AccountViewSet(viewsets.ModelViewSet):
     """
-    API View for listing and creating user accounts.
+    Account ViewSet for CRUD operations.
+
+    Supports:
+    - List / Retrieve / Patch / Soft-delete
+    - Pagination, filtering, and ordering
+    - Only account owner or admin can access
     """
 
-    permission_classes = [permissions.IsAuthenticated]
+    queryset = Account.objects.all()
     serializer_class = AccountSerializer
+    permission_classes = [IsOwnerOrAdmin]
     pagination_class = CustomPageNumberPagination
+    lookup_field = "id"  # UUID primary key
+
+    def get_queryset(self):
+        """Filter accounts based on user permissions."""
+        user = self.request.user
+        queryset = Account.objects.select_related("currency")
+        if user.is_superuser or user.is_staff:
+            return queryset
+        return queryset.filter(user=user)
 
     @extend_schema(
-        summary="List user accounts",
-        description="Retrieve a paginated list of accounts belonging to the authenticated user.",
-        responses={
-            200: AccountSerializer(many=True),
-            500: OpenApiResponse(description="Internal Server Error"),
-        },
+        summary="List accounts",
+        description="Retrieve paginated accounts for the authenticated user.",
     )
-    def get(self, request):
-        """
-        List all accounts for the current user.
-        """
-        logger.info(f"Account list requested by {request.user.email}")
-
+    def list(self, request, *args, **kwargs):
+        """List accounts with optional filtering by active status."""
         try:
-            queryset = Account.objects.filter(user=request.user).select_related(
-                "currency"
-            )
+            queryset = self.get_queryset()
+            queryset = queryset.order_by("-is_primary", "-created_at")
 
-            # Filtering and Ordering (manual implementation as APIView doesn't auto-use FilterBackends)
-            is_active = request.query_params.get("is_active")
-            if is_active is not None:
-                active_bool = is_active.lower() == "true"
-                queryset = queryset.filter(is_active=active_bool)
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
 
-            # Pagination
-            paginator = self.pagination_class()
-            paginated_queryset = paginator.paginate_queryset(
-                queryset, request, view=self
-            )
-
-            serializer = self.serializer_class(paginated_queryset, many=True)
-
-            logger.info(f"Retrieved {len(serializer.data)} accounts")
-            return paginator.get_paginated_response(serializer.data)
+            serializer = self.get_serializer(queryset, many=True)
+            return Response(serializer.data)
 
         except Exception as e:
             logger.exception(f"Error listing accounts: {e}")
@@ -67,141 +67,193 @@ class AccountListCreateView(APIView):
             )
 
     @extend_schema(
-        summary="Create new account",
+        summary="Create account",
         description="Create a new financial account for the authenticated user.",
         request=AccountSerializer,
         responses={
             201: AccountSerializer,
             400: OpenApiResponse(description="Validation Error"),
-            500: OpenApiResponse(description="Internal Server Error"),
         },
     )
-    def post(self, request):
-        """
-        Create a new account.
-        """
-        logger.info(f"Account creation requested by {request.user.email}")
-
-        serializer = self.serializer_class(
-            data=request.data, context={"request": request}
-        )
-
-        if serializer.is_valid():
-            try:
-                serializer.save()
-                logger.info(f"Account created successfully for {request.user.email}")
-                return Response(serializer.data, status=status.HTTP_201_CREATED)
-            except Exception as e:
-                logger.exception(f"Error creation account: {e}")
-                return Response(
-                    {"error": "Failed to create account. Please try again."},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
-
-        logger.warning(f"Account creation validation failed: {serializer.errors}")
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-class AccountDetailView(APIView):
-    """
-    API View for retrieving, updating, and deleting a specific account.
-    """
-
-    permission_classes = [permissions.IsAuthenticated]
-    serializer_class = AccountSerializer
-
-    def get_object(self, user, pk):
-        """
-        Helper to get object safely ensuring ownership.
-        """
-        obj = get_object_or_404(
-            Account.objects.select_related("currency"), id=pk, user=user
-        )
-        return obj
+    def create(self, request, *args, **kwargs):
+        """Create a new account."""
+        try:
+            serializer = self.get_serializer(
+                data=request.data, context={"request": request}
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save(user=request.user)
+            logger.info(f"Account created successfully: {serializer.data}")
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            logger.exception(f"Error creating account: {e}")
+            return Response(
+                {"error": "Failed to create account."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     @extend_schema(
-        summary="Get account details",
-        description="Retrieve details of a specific account.",
-        responses={
-            200: AccountSerializer,
-            404: OpenApiResponse(description="Not Found"),
-        },
+        summary="Partial update account",
+        description="Update mutable fields of an account using PATCH.",
+        request=AccountSerializer,
     )
-    def get(self, request, pk):
-        logger.info(f"Account detail requested: {pk} by {request.user.email}")
-        account = self.get_object(request.user, pk)
-        serializer = self.serializer_class(account)
+    def partial_update(self, request, *args, **kwargs):
+        """PATCH update account."""
+        instance = self.get_object()
+        serializer = self.get_serializer(
+            instance, data=request.data, partial=True, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        logger.info(
+            f"Account '{instance.name}' ({instance.id}) updated by user {request.user.id}."
+        )
         return Response(serializer.data)
 
     @extend_schema(
-        summary="Update account",
-        description="Update account details (e.g. name, type, initial_balance). Support partial updates.",
-        request=AccountSerializer,
-        responses={
-            200: AccountSerializer,
-            400: OpenApiResponse(description="Validation Error"),
-            404: OpenApiResponse(description="Not Found"),
-        },
+        summary="Soft-delete account",
+        description="Soft-delete (deactivate) an account.",
     )
-    def patch(self, request, pk):
-        """
-        Partial update of an account.
-        """
-        logger.info(f"Account update requested: {pk} by {request.user.email}")
-        account = self.get_object(request.user, pk)
-
-        serializer = self.serializer_class(
-            account, data=request.data, partial=True, context={"request": request}
-        )
-
-        if serializer.is_valid():
-            try:
-                serializer.save()
-                return Response(serializer.data)
-            except Exception as e:
-                logger.exception(f"Error updating account: {e}")
-                return Response(
-                    {"error": "Failed to update account."},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
-
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    @extend_schema(
-        summary="Delete account",
-        description="Delete an account. Fails if account has dependent data (transactions) preventing deletion.",
-        responses={
-            204: OpenApiResponse(description="No Content"),
-            400: OpenApiResponse(
-                description="Cannot delete account with existing transactions"
-            ),
-            404: OpenApiResponse(description="Not Found"),
-        },
-    )
-    def delete(self, request, pk):
-        logger.info(f"Account deletion requested: {pk} by {request.user.email}")
-        account = self.get_object(request.user, pk)
-
+    def destroy(self, request, *args, **kwargs):
+        """Soft-delete (deactivate) an account."""
+        instance = self.get_object()
         try:
-            account.delete()
-            logger.info(f"Account {pk} deleted successfully")
+            instance.is_active = False
+            instance.save()
+            logger.info(
+                f"Account '{instance.name}' ({instance.id}) soft-deleted by user {request.user.id}."
+            )
             return Response(status=status.HTTP_204_NO_CONTENT)
-        except ProtectedError:
-            logger.warning(
-                f"Cannot delete account {pk} due to protected references (transactions?)"
-            )
-            return Response(
-                {
-                    "error": """
-                    Cannot delete this account because it has related
-                    records (e.g. transactions). Archive it instead.
-                    """
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         except Exception as e:
             logger.exception(f"Error deleting account: {e}")
             return Response(
                 {"error": "Failed to delete account."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+
+class TransactionViewSet(viewsets.ModelViewSet):
+    """
+    Transaction ViewSet for CRUD operations.
+
+    Supports:
+    - List / Retrieve / Create / Patch (update-only) / Soft-delete
+    - Owner-only access (admins override)
+    - Filtering, searching, ordering, pagination
+
+    PUT is DISABLED → only PATCH updates are allowed.
+    """
+
+    queryset = Transaction.objects.select_related("user", "account", "category").all()
+
+    serializer_class = TransactionSerializer
+    pagination_class = CustomPageNumberPagination
+    permission_classes = [IsOwnerOrAdmin]
+    lookup_field = "pk"  # UUID
+
+    filter_backends = [
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    ]
+
+    filterset_fields = [
+        "transaction_type",
+        "category",
+        "account",
+        "status",
+        "currency",
+        "is_recurring",
+        "is_transfer",
+    ]
+
+    search_fields = ["name", "description", "notes", "tags"]
+    ordering_fields = ["transaction_date", "amount", "created_at"]
+
+    def get_queryset(self):
+        """Return transactions based on user permissions."""
+        user = self.request.user
+        if user.is_staff or user.is_superuser:
+            return Transaction.objects.all()
+        return Transaction.objects.filter(user=user)
+
+    @extend_schema(
+        summary="List transactions",
+        description="List all transactions accessible to the authenticated user.",
+    )
+    def list(self, request, *args, **kwargs):
+        queryset = self.get_queryset().order_by("-transaction_date")
+        page = self.paginate_queryset(queryset)
+
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="Create transaction",
+        description="Create a new transaction for the authenticated user.",
+        request=TransactionSerializer,
+    )
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(
+            data=request.data,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        transaction_obj = serializer.save(user=request.user)
+
+        logger.info(
+            "Transaction created: '%s' (%s) by user '%s'.",
+            transaction_obj.name,
+            transaction_obj.id,
+            request.user.id,
+        )
+
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        summary="Partial update transaction (PATCH)",
+        description="Update mutable transaction fields. Owner-only except admin.",
+    )
+    def partial_update(self, request, *args, **kwargs):
+        instance = self.get_object()
+
+        serializer = self.get_serializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        logger.info(
+            "Transaction '%s' (%s) updated by user '%s'.",
+            instance.name,
+            instance.id,
+            request.user.id,
+        )
+
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="Delete transaction",
+        description="Delete a transaction. Owner-only except admin.",
+    )
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        user = request.user
+
+        instance.delete()
+
+        logger.info(
+            "Transaction '%s' (%s) deleted by user '%s'.",
+            instance.name,
+            instance.id,
+            user.id,
+        )
+
+        return Response(status=status.HTTP_204_NO_CONTENT)

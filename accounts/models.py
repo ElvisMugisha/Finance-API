@@ -1,11 +1,11 @@
 import uuid
 from decimal import Decimal, InvalidOperation
+from datetime import date
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.utils.translation import gettext_lazy as _
-from django.utils.timezone import now
 
 from core.models import Currency, Category
 from utils import choices, loggings
@@ -218,14 +218,14 @@ class Transaction(models.Model):
     status = models.CharField(
         max_length=50,
         choices=choices.TransactionStatus.choices,
-        default=choices.TransactionStatus.COMPLETED,
+        default=choices.TransactionStatus.PENDING,
         db_index=True,
     )
     tags = models.JSONField(default=list, blank=True)
     attachments = models.JSONField(default=list, blank=True)
     is_recurring = models.BooleanField(default=False)
     is_transfer = models.BooleanField(default=False)
-    transaction_date = models.DateField(default=now, db_index=True)
+    transaction_date = models.DateField(default=date.today, db_index=True)
 
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)

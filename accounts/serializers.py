@@ -1,5 +1,8 @@
 from rest_framework import serializers
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
+from datetime import date
+
+from drf_spectacular.utils import extend_schema_field
 
 from core.models import Currency, Category
 from core.serializers import CurrencySerializer
@@ -104,23 +107,33 @@ class AccountSerializer(serializers.ModelSerializer):
 
 class TransactionSerializer(serializers.ModelSerializer):
     """
-    Serializer for the Transaction model.
+    Serializer for Transaction model.
 
-    Handles:
-    - Nested representation of account and category for read operations.
-    - Validates amount, exchange_rate, and currency conversion logic.
-    - Supports creation and updates of transactions.
+    Features:
+    - Validates all monetary and currency conversion logic.
+    - Ensures category/account belong to the user (unless staff).
+    - Provides computed read-only fields for convenience in UI.
+    - Full model-level validation + serializer-level validation.
     """
 
-    # Nested read-only representations
+    # Write fields
     account = serializers.PrimaryKeyRelatedField(
-        queryset=Account.objects.all(), required=False, allow_null=True
+        queryset=Account.objects.all(),
+        required=False,
+        allow_null=True,
     )
     category = serializers.PrimaryKeyRelatedField(
-        queryset=Category.objects.all(), required=True
+        queryset=Category.objects.all(),
+        required=True,
     )
 
+    # Automatically use request.user
     user = serializers.HiddenField(default=serializers.CurrentUserDefault())
+
+    # Computed Read-Only Fields
+    currency_converted_amount = serializers.SerializerMethodField(read_only=True)
+    is_future_transaction = serializers.SerializerMethodField(read_only=True)
+    display_name = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Transaction
@@ -144,11 +157,48 @@ class TransactionSerializer(serializers.ModelSerializer):
             "is_recurring",
             "is_transfer",
             "transaction_date",
+            # Computed
+            "currency_converted_amount",
+            "is_future_transaction",
+            "display_name",
+            # Metadata
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = [
+            "id",
+            "created_at",
+            "updated_at",
+            "currency_converted_amount",
+            "is_future_transaction",
+            "display_name",
+        ]
 
+    # Computed Field Helpers
+    @extend_schema_field(serializers.DecimalField(max_digits=18, decimal_places=2))
+    def get_currency_converted_amount(self, obj) -> float:
+        """Return the calculated amount based on original_amount * exchange_rate."""
+        try:
+            if obj.original_amount and obj.exchange_rate:
+                return round(obj.original_amount * obj.exchange_rate, 2)
+            return obj.amount
+        except Exception:
+            return None
+
+    @extend_schema_field(serializers.BooleanField())
+    def get_is_future_transaction(self, obj) -> bool:
+        """True if transaction_date is in the future."""
+        return obj.transaction_date > date.today()
+
+    @extend_schema_field(serializers.CharField())
+    def get_display_name(self, obj) -> str:
+        """
+        Useful display label used in UIs.
+        Example: 'Groceries - 45 USD (expense)'
+        """
+        return f"{obj.name} - {obj.amount} {obj.currency} ({obj.transaction_type})"
+
+    # Field-level Validation
     def validate_amount(self, value):
         """Ensure transaction amount is positive."""
         if value <= 0:
@@ -163,10 +213,39 @@ class TransactionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Exchange rate must be positive.")
         return value
 
+    # Object-level Validation
     def validate(self, data):
         """
-        Validate the combination of amount, exchange_rate, original_amount, and original_currency.
+        Complex validation:
+        - Currency conversion fields must be consistent.
+        - Category must be owned by the user if not system category.
+        - Account must belong to the user.
         """
+        request = self.context["request"]
+        user = request.user
+
+        account = data.get("account")
+        category = data.get("category")
+
+        # Validate account belongs to user
+        if account and account.user != user and not user.is_staff:
+            logger.warning(
+                f"User {user.id} attempted to use another user's account {account.id}"
+            )
+            raise serializers.ValidationError(
+                {"account": "You cannot use another user's account."}
+            )
+
+        # Validate category belongs to user (unless system category)
+        if not category.is_system_category and category.user != user:
+            logger.warning(
+                f"User {user.id} attempted to use another user's category {category.id}"
+            )
+            raise serializers.ValidationError(
+                {"category": "You cannot use another user's category."}
+            )
+
+        # Currency conversion validation
         exchange_rate = data.get("exchange_rate", Decimal("1"))
         original_amount = data.get("original_amount")
         original_currency = data.get("original_currency")
@@ -174,13 +253,17 @@ class TransactionSerializer(serializers.ModelSerializer):
         if exchange_rate != 1:
             if not original_amount or not original_currency:
                 logger.warning(
-                    "Validation failed: original_amount or original_currency missing for non-1 exchange_rate"
+                    "Missing original_amount/original_currency for currency conversion"
                 )
                 raise serializers.ValidationError(
                     {
-                        "original_amount": "Original amount and original currency must be set if exchange rate != 1."
+                        "original_amount": (
+                            "original_amount & original_currency are required "
+                            "when exchange_rate is not 1."
+                        )
                     }
                 )
+
         return data
 
     def create(self, validated_data):

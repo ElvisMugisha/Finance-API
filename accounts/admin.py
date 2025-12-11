@@ -6,6 +6,7 @@ from .models import Account
 @admin.register(Account)
 class AccountAdmin(admin.ModelAdmin):
     list_display = (
+        "id",
         "name",
         "user_email",
         "account_type",
@@ -14,6 +15,7 @@ class AccountAdmin(admin.ModelAdmin):
         "is_primary",
         "is_active",
     )
+    list_display_links = ("id", "name")
     list_filter = ("account_type", "is_active", "is_primary", "currency")
     search_fields = ("name", "user__email", "user__username", "account_number")
     ordering = ("-created_at",)
