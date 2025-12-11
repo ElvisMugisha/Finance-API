@@ -1,3 +1,4 @@
+import uuid
 from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
@@ -6,7 +7,7 @@ from django.db import IntegrityError, models
 from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
 
-from utils import loggings
+from utils import loggings, choices
 
 # Initialize logger
 logger = loggings.setup_logging()
@@ -79,3 +80,96 @@ class Currency(models.Model):
             models.Index(fields=["name"]),
             models.Index(fields=["is_active"]),
         ]
+
+
+class Category(models.Model):
+    """
+    Represents an income or expense category used for financial classification.
+
+    Supports:
+    - System-level predefined categories (shared across all users)
+    - User-defined personal categories
+    - Optional hierarchical nesting (parent → subcategories)
+
+    Key Behaviors:
+    - Category names are unique *per user* and per category type.
+    - System categories have `user=None` and `is_system_category=True`.
+    - Subcategories inherit logic but are fully independent objects.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Null user means the category is globally available (system-created)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="categories",
+        db_index=True,  # improves filtering by user in multi-tenant APIs
+        help_text=_("Owner of this category. Null indicates a system-wide category."),
+    )
+
+    # Optional hierarchical relationship
+    parent = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="subcategories",
+        db_index=True,
+        help_text=_("Optional parent category for hierarchical grouping."),
+    )
+
+    name = models.CharField(
+        max_length=255,
+        db_index=True,  # Improves searches and dropdown displays
+        help_text=_("Category name. Must be unique per user and type."),
+    )
+    description = models.TextField(null=True, blank=True)
+    category_type = models.CharField(
+        max_length=20,
+        choices=choices.TransactionType.choices,
+        default=choices.TransactionType.EXPENSE,
+        db_index=True,  # Filtering by type is extremely common
+        help_text=_("Indicates whether this category is for income or expenses."),
+    )
+
+    is_system_category = models.BooleanField(default=False)
+    is_active = models.BooleanField(
+        default=True,
+        db_index=True,
+        help_text=_("Whether this category is currently active."),
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Category"
+        verbose_name_plural = "Categories"
+
+        # Unique category name per (user, type)
+        # System categories also satisfy this since user = NULL
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "name", "category_type"],
+                name="uq_category_user_name_type",
+            )
+        ]
+
+        # Database indexes for common filtering patterns
+        indexes = [
+            models.Index(fields=["user", "is_active"], name="idx_user_active"),
+            models.Index(fields=["category_type", "is_active"], name="idx_type_active"),
+            models.Index(fields=["parent"], name="idx_parent_category"),
+        ]
+
+    def __str__(self):
+        parent = f" → {self.parent.name}" if self.parent else ""
+        return f"{self.name}{parent} [{self.category_type}]"
+
+    def clean(self):
+        # Prevent system categories from accidentally having a user assigned
+        if self.is_system_category and self.user is not None:
+            raise ValidationError("System categories must have user = NULL.")

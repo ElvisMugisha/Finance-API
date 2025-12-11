@@ -23,3 +23,8 @@ class AccountType(models.TextChoices):
     INVESTMENT = "Investment", _("Investment")
     LOAN = "Loan", _("Loan")
     OTHER = "Other", _("Other")
+
+
+class TransactionType(models.TextChoices):
+    INCOME = "Income", _("Income")
+    EXPENSE = "Expense", _("Expense")

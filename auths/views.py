@@ -7,7 +7,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 
 from utils import choices, loggings
 from utils.paginations import CustomPageNumberPagination
-from utils.permissions import IsActiveAndVerified, IsSuperAdminOrSuperUser
+from utils.permissions import IsActiveAndVerified, IsAdminUser
 from utils.utils import create_and_send_otp
 
 from .models import User
@@ -588,7 +588,7 @@ class UserListView(APIView):
     Returns paginated list of users with their profile information.
     """
 
-    permission_classes = [IsSuperAdminOrSuperUser]
+    permission_classes = [IsAdminUser]
     serializer_class = UserListSerializer
     pagination_class = CustomPageNumberPagination
 
