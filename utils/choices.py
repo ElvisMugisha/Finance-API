@@ -28,3 +28,9 @@ class AccountType(models.TextChoices):
 class TransactionType(models.TextChoices):
     INCOME = "Income", _("Income")
     EXPENSE = "Expense", _("Expense")
+
+
+class TransactionStatus(models.TextChoices):
+    COMPLETED = "Completed", _("Completed")
+    PENDING = "Pending", _("Pending")
+    CANCELED = "Canceled", _("Canceled")
