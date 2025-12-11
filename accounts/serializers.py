@@ -1,10 +1,11 @@
 from rest_framework import serializers
+from decimal import Decimal, InvalidOperation
 
-from core.models import Currency
+from core.models import Currency, Category
 from core.serializers import CurrencySerializer
 from utils import loggings
 
-from .models import Account
+from .models import Account, Transaction
 
 logger = loggings.setup_logging()
 
@@ -99,3 +100,120 @@ class AccountSerializer(serializers.ModelSerializer):
             )
 
         return super().update(instance, validated_data)
+
+
+class TransactionSerializer(serializers.ModelSerializer):
+    """
+    Serializer for the Transaction model.
+
+    Handles:
+    - Nested representation of account and category for read operations.
+    - Validates amount, exchange_rate, and currency conversion logic.
+    - Supports creation and updates of transactions.
+    """
+
+    # Nested read-only representations
+    account = serializers.PrimaryKeyRelatedField(
+        queryset=Account.objects.all(), required=False, allow_null=True
+    )
+    category = serializers.PrimaryKeyRelatedField(
+        queryset=Category.objects.all(), required=True
+    )
+
+    user = serializers.HiddenField(default=serializers.CurrentUserDefault())
+
+    class Meta:
+        model = Transaction
+        fields = [
+            "id",
+            "user",
+            "account",
+            "category",
+            "name",
+            "transaction_type",
+            "amount",
+            "original_amount",
+            "original_currency",
+            "exchange_rate",
+            "currency",
+            "description",
+            "notes",
+            "status",
+            "tags",
+            "attachments",
+            "is_recurring",
+            "is_transfer",
+            "transaction_date",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate_amount(self, value):
+        """Ensure transaction amount is positive."""
+        if value <= 0:
+            logger.warning("Validation failed: amount <= 0")
+            raise serializers.ValidationError("Amount must be a positive value.")
+        return value
+
+    def validate_exchange_rate(self, value):
+        """Ensure exchange rate is positive."""
+        if value <= 0:
+            logger.warning("Validation failed: exchange_rate <= 0")
+            raise serializers.ValidationError("Exchange rate must be positive.")
+        return value
+
+    def validate(self, data):
+        """
+        Validate the combination of amount, exchange_rate, original_amount, and original_currency.
+        """
+        exchange_rate = data.get("exchange_rate", Decimal("1"))
+        original_amount = data.get("original_amount")
+        original_currency = data.get("original_currency")
+
+        if exchange_rate != 1:
+            if not original_amount or not original_currency:
+                logger.warning(
+                    "Validation failed: original_amount or original_currency missing for non-1 exchange_rate"
+                )
+                raise serializers.ValidationError(
+                    {
+                        "original_amount": "Original amount and original currency must be set if exchange rate != 1."
+                    }
+                )
+        return data
+
+    def create(self, validated_data):
+        """
+        Create a new transaction instance.
+        """
+        try:
+            transaction = Transaction.objects.create(**validated_data)
+            logger.info(
+                f"Transaction created: {transaction.id} by user {transaction.user_id}"
+            )
+            return transaction
+        except Exception as e:
+            logger.exception(f"Failed to create transaction: {e}")
+            raise serializers.ValidationError(
+                {"error": "Failed to create transaction. Please try again."}
+            )
+
+    def update(self, instance, validated_data):
+        """
+        Update an existing transaction instance.
+        """
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        try:
+            instance.full_clean()  # enforce model-level validations
+            instance.save()
+            logger.info(
+                f"Transaction updated: {instance.id} by user {instance.user_id}"
+            )
+            return instance
+        except Exception as e:
+            logger.exception(f"Failed to update transaction: {e}")
+            raise serializers.ValidationError(
+                {"error": "Failed to update transaction. Please try again."}
+            )
