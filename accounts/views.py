@@ -1,9 +1,9 @@
-from django.db.models import ProtectedError
 from django.db import transaction as db_transaction
+from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
-from drf_spectacular.utils import OpenApiResponse, extend_schema
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import status, viewsets, filters
+from drf_spectacular.utils import OpenApiResponse, extend_schema
+from rest_framework import filters, status, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -43,10 +43,9 @@ class AccountViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="List accounts",
-        description="Retrieve paginated accounts for the authenticated user.",
+        description="Lists all accounts accessible for the authenticated user.",
     )
     def list(self, request, *args, **kwargs):
-        """List accounts with optional filtering by active status."""
         try:
             queryset = self.get_queryset()
             queryset = queryset.order_by("-is_primary", "-created_at")
@@ -77,20 +76,13 @@ class AccountViewSet(viewsets.ModelViewSet):
     )
     def create(self, request, *args, **kwargs):
         """Create a new account."""
-        try:
-            serializer = self.get_serializer(
-                data=request.data, context={"request": request}
-            )
-            serializer.is_valid(raise_exception=True)
-            serializer.save(user=request.user)
-            logger.info(f"Account created successfully: {serializer.data}")
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        except Exception as e:
-            logger.exception(f"Error creating account: {e}")
-            return Response(
-                {"error": "Failed to create account."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+        serializer = self.get_serializer(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        logger.info(f"Account created successfully: {serializer.data}")
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @extend_schema(
         summary="Partial update account",
@@ -144,75 +136,68 @@ class TransactionViewSet(viewsets.ModelViewSet):
     PUT is DISABLED → only PATCH updates are allowed.
     """
 
-    queryset = Transaction.objects.select_related("user", "account", "category").all()
-
+    queryset = Transaction.objects.all()
     serializer_class = TransactionSerializer
     pagination_class = CustomPageNumberPagination
     permission_classes = [IsOwnerOrAdmin]
-    lookup_field = "pk"  # UUID
-
-    filter_backends = [
-        DjangoFilterBackend,
-        filters.SearchFilter,
-        filters.OrderingFilter,
-    ]
-
-    filterset_fields = [
-        "transaction_type",
-        "category",
-        "account",
-        "status",
-        "currency",
-        "is_recurring",
-        "is_transfer",
-    ]
-
-    search_fields = ["name", "description", "notes", "tags"]
-    ordering_fields = ["transaction_date", "amount", "created_at"]
+    lookup_field = "id"
 
     def get_queryset(self):
         """Return transactions based on user permissions."""
         user = self.request.user
+        queryset = Transaction.objects.select_related("user", "account", "category")
         if user.is_staff or user.is_superuser:
-            return Transaction.objects.all()
-        return Transaction.objects.filter(user=user)
+            return queryset
+        return queryset.filter(user=user)
 
     @extend_schema(
         summary="List transactions",
-        description="List all transactions accessible to the authenticated user.",
+        description="Lists all transactions accessible to the authenticated user.",
     )
     def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset().order_by("-transaction_date")
-        page = self.paginate_queryset(queryset)
+        try:
+            queryset = self.get_queryset().order_by("-transaction_date")
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
 
-        if page is not None:
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+            serializer = self.get_serializer(queryset, many=True)
+            return Response(serializer.data)
 
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
+        except Exception as e:
+            logger.exception(f"Error listing transactions: {e}")
+            return Response(
+                {"error": "Failed to retrieve transactions."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     @extend_schema(
         summary="Create transaction",
         description="Create a new transaction for the authenticated user.",
         request=TransactionSerializer,
+        responses={
+            201: TransactionSerializer,
+            400: OpenApiResponse(description="Validation Error"),
+        },
     )
     def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(
-            data=request.data,
-            context={"request": request},
-        )
-        serializer.is_valid(raise_exception=True)
-        transaction_obj = serializer.save(user=request.user)
+        try:
+            serializer = self.get_serializer(
+                data=request.data,
+                context={"request": request},
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            logger.info("Transaction created successfully: %s", serializer.data)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-        logger.info(
-            "Transaction created: '%s' (%s) by user '%s'.",
-            transaction_obj.name,
-            transaction_obj.id,
-            request.user.id,
-        )
-
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            logger.exception(f"Error creating transaction: {e}")
+            return Response(
+                {"error": "Failed to create transaction."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     @extend_schema(
         summary="Partial update transaction (PATCH)",

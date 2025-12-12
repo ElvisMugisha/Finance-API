@@ -99,7 +99,7 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
 
         if password != confirm_password:
             logger.warning("Registration failed: Passwords do not match.")
-            raise ValidationError({"password": "Passwords do not match."})
+            raise serializers.ValidationError({"password": "Passwords do not match."})
 
         try:
             if password:

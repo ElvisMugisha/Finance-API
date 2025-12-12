@@ -1,13 +1,13 @@
 import uuid
-from decimal import Decimal, InvalidOperation
 from datetime import date
+from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.utils.translation import gettext_lazy as _
 
-from core.models import Currency, Category
+from core.models import Category, Currency
 from utils import choices, loggings
 
 # Initialize logger
@@ -242,7 +242,7 @@ class Transaction(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.name} ({self.transaction_type}) - {self.amount} {self.currency}"
+        return f"{self.name} ({self.get_transaction_type_display()}) - {self.amount} {self.currency}"
 
     def clean(self):
         """

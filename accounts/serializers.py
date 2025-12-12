@@ -1,12 +1,12 @@
-from rest_framework import serializers
-from decimal import Decimal
 from datetime import date
+from decimal import Decimal
 
 from drf_spectacular.utils import extend_schema_field
+from rest_framework import serializers
 
-from core.models import Currency, Category
+from core.models import Category, Currency
 from core.serializers import CurrencySerializer
-from utils import loggings
+from utils import choices, loggings
 
 from .models import Account, Transaction
 
@@ -29,6 +29,11 @@ class AccountSerializer(serializers.ModelSerializer):
 
     # Use CurrencySerialize for reading (nesting details)
     currency = CurrencySerializer(read_only=True)
+
+    account_type = serializers.ChoiceField(
+        choices=choices.AccountType.choices,
+        required=True,
+    )
 
     class Meta:
         model = Account
@@ -225,7 +230,9 @@ class TransactionSerializer(serializers.ModelSerializer):
         user = request.user
 
         account = data.get("account")
-        category = data.get("category")
+        # On updates (PATCH), category might not be present in `data`.
+        # We should get it from the data or from the existing instance.
+        category = data.get("category") or getattr(self.instance, "category", None)
 
         # Validate account belongs to user
         if account and account.user != user and not user.is_staff:
@@ -237,7 +244,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             )
 
         # Validate category belongs to user (unless system category)
-        if not category.is_system_category and category.user != user:
+        if category and not category.is_system_category and category.user != user:
             logger.warning(
                 f"User {user.id} attempted to use another user's category {category.id}"
             )

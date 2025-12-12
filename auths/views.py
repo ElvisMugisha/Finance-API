@@ -420,7 +420,7 @@ class LogoutView(APIView):
             Even if some logout actions fail, the endpoint returns success
             as long as at least one method succeeds.
         """
-        logger.info(f"Logout requested by user: {request.user.email}")
+        logger.info(f"Logout requested by user: {request.user}")
 
         logout_actions = []
         logout_errors = []
@@ -438,17 +438,17 @@ class LogoutView(APIView):
                     token.blacklist()
                     logout_actions.append("JWT refresh token blacklisted")
                     logger.info(
-                        f"JWT refresh token blacklisted successfully for {request.user.email}"
+                        f"JWT refresh token blacklisted successfully for {request.user}"
                     )
                 except Exception as jwt_error:
                     error_msg = f"JWT token blacklisting failed: {str(jwt_error)}"
                     logout_errors.append(error_msg)
                     logger.warning(
-                        f"Failed to blacklist JWT token for {request.user.email}: {str(jwt_error)}"
+                        f"Failed to blacklist JWT token for {request.user}: {str(jwt_error)}"
                     )
             else:
                 logger.debug(
-                    f"No JWT refresh token provided for logout by {request.user.email}"
+                    f"No JWT refresh token provided for logout by {request.user}"
                 )
                 logout_actions.append(
                     "JWT refresh token not provided (access token will expire naturally)"
@@ -461,17 +461,15 @@ class LogoutView(APIView):
                 if hasattr(request.user, "auth_token"):
                     request.user.auth_token.delete()
                     logout_actions.append("DRF authentication token deleted")
-                    logger.info(
-                        f"DRF Token deleted successfully for {request.user.email}"
-                    )
+                    logger.info(f"DRF Token deleted successfully for {request.user}")
                 else:
-                    logger.debug(f"No DRF Token found for user: {request.user.email}")
+                    logger.debug(f"No DRF Token found for user: {request.user}")
                     logout_actions.append("No DRF token found")
             except Exception as token_error:
                 error_msg = f"DRF token deletion failed: {str(token_error)}"
                 logout_errors.append(error_msg)
                 logger.error(
-                    f"Failed to delete DRF token for {request.user.email}: {str(token_error)}"
+                    f"Failed to delete DRF token for {request.user}: {str(token_error)}"
                 )
 
             # ============================================================
@@ -483,19 +481,15 @@ class LogoutView(APIView):
 
                     django_logout(request)
                     logout_actions.append("Django session cleared")
-                    logger.info(
-                        f"Session cleared successfully for {request.user.email}"
-                    )
+                    logger.info(f"Session cleared successfully for {request.user}")
                 else:
-                    logger.debug(
-                        f"No active session found for user: {request.user.email}"
-                    )
+                    logger.debug(f"No active session found for user: {request.user}")
                     logout_actions.append("No active session found")
             except Exception as session_error:
                 error_msg = f"Session clearing failed: {str(session_error)}"
                 logout_errors.append(error_msg)
                 logger.error(
-                    f"Failed to clear session for {request.user.email}: {str(session_error)}"
+                    f"Failed to clear session for {request.user}: {str(session_error)}"
                 )
 
             # ============================================================
@@ -506,7 +500,7 @@ class LogoutView(APIView):
             # Prepare response
             if logout_actions:
                 logger.info(
-                    f"User logged out successfully: {request.user.email}. "
+                    f"User logged out successfully: {request.user}. "
                     f"Actions: {', '.join(logout_actions)}"
                 )
 
@@ -519,14 +513,14 @@ class LogoutView(APIView):
                 if logout_errors:
                     response_data["warnings"] = logout_errors
                     logger.warning(
-                        f"Logout completed with warnings for {request.user.email}: {logout_errors}"
+                        f"Logout completed with warnings for {request.user}: {logout_errors}"
                     )
 
                 return Response(response_data, status=status.HTTP_200_OK)
             else:
                 # No actions performed (unlikely but handle gracefully)
                 logger.warning(
-                    f"Logout called but no actions performed for {request.user.email}"
+                    f"Logout called but no actions performed for {request.user}"
                 )
                 return Response(
                     {
@@ -539,7 +533,7 @@ class LogoutView(APIView):
 
         except Exception as e:
             logger.exception(
-                f"Unexpected error during logout for {request.user.email}: {str(e)}"
+                f"Unexpected error during logout for {request.user}: {str(e)}"
             )
             return Response(
                 {
@@ -609,7 +603,7 @@ class UserListView(APIView):
         Returns:
             Paginated list of users with profile data.
         """
-        logger.info(f"User list requested by: {request.user.email}")
+        logger.info(f"User list requested by: {request.user}")
 
         try:
             # Get all users and prefetch related profile data for optimization
@@ -630,7 +624,7 @@ class UserListView(APIView):
             serializer = self.serializer_class(paginated_queryset, many=True)
 
             logger.info(
-                f"Successfully retrieved {len(serializer.data)} users for {request.user.email}"
+                f"Successfully retrieved {len(serializer.data)} users for {request.user}"
             )
 
             # Return paginated response
@@ -671,14 +665,14 @@ class UserProfileView(APIView):
         Returns:
             User data with profile information.
         """
-        logger.info(f"User profile requested by: {request.user.email}")
+        logger.info(f"User profile requested by: {request.user}")
 
         try:
             # The user is already available in request.user
             # We use the serializer to format the response
             serializer = self.serializer_class(request.user)
 
-            logger.info(f"Successfully retrieved profile for {request.user.email}")
+            logger.info(f"Successfully retrieved profile for {request.user}")
             return Response(serializer.data, status=status.HTTP_200_OK)
 
         except Exception as e:
@@ -1055,14 +1049,14 @@ class UserProfileManageView(APIView):
         Returns:
             Response: Profile data and status code (200 or 201).
         """
-        logger.info(f"Profile manage request by user: {request.user.email}")
+        logger.info(f"Profile manage request by user: {request.user}")
 
         try:
             # Check if profile exists
             if hasattr(request.user, "user_profile"):
                 # Update existing profile
                 profile = request.user.user_profile
-                logger.info(f"Updating existing profile for user: {request.user.email}")
+                logger.info(f"Updating existing profile for user: {request.user}")
 
                 serializer = self.serializer_class(
                     instance=profile, data=request.data, partial=True
@@ -1071,19 +1065,19 @@ class UserProfileManageView(APIView):
                 if serializer.is_valid():
                     serializer.save()
                     logger.info(
-                        f"Profile updated successfully for user: {request.user.email}"
+                        f"Profile updated successfully for user: {request.user}"
                     )
                     return Response(serializer.data, status=status.HTTP_200_OK)
             else:
                 # Create new profile
-                logger.info(f"Creating new profile for user: {request.user.email}")
+                logger.info(f"Creating new profile for user: {request.user}")
 
                 serializer = self.serializer_class(data=request.data)
 
                 if serializer.is_valid():
                     serializer.save(user=request.user)
                     logger.info(
-                        f"Profile created successfully for user: {request.user.email}"
+                        f"Profile created successfully for user: {request.user}"
                     )
                     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -1093,7 +1087,7 @@ class UserProfileManageView(APIView):
 
         except Exception as e:
             logger.exception(
-                f"Error managing profile for user {request.user.email}: {str(e)}"
+                f"Error managing profile for user {request.user}: {str(e)}"
             )
             return Response(
                 {"error": "An unexpected error occurred. Please try again later."},
@@ -1142,7 +1136,7 @@ class PasswordChangeView(APIView):
         Returns:
             Response: Success message or error details.
         """
-        logger.info(f"Password change requested by user: {request.user.email}")
+        logger.info(f"Password change requested by user: {request.user}")
 
         # Pass request context to serializer for old password validation
         serializer = self.serializer_class(
@@ -1158,9 +1152,7 @@ class PasswordChangeView(APIView):
                 request.user.set_password(new_password)
                 request.user.save(update_fields=["password"])
 
-                logger.info(
-                    f"Password changed successfully for user: {request.user.email}"
-                )
+                logger.info(f"Password changed successfully for user: {request.user}")
 
                 return Response(
                     {
@@ -1175,7 +1167,7 @@ class PasswordChangeView(APIView):
 
             except Exception as e:
                 logger.exception(
-                    f"Error changing password for user {request.user.email}: {str(e)}"
+                    f"Error changing password for user {request.user}: {str(e)}"
                 )
                 return Response(
                     {
@@ -1186,7 +1178,7 @@ class PasswordChangeView(APIView):
 
         # Validation failed
         logger.warning(
-            f"Password change validation failed for {request.user.email}: {serializer.errors}"
+            f"Password change validation failed for {request.user}: {serializer.errors}"
         )
 
         # Check for specific error types
