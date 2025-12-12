@@ -103,25 +103,28 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup GitHub CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh auth setup-git
+          echo "Setting up GitHub CLI authentication"
+          # Authenticate GitHub CLI with the token
+          echo "$GH_TOKEN" | gh auth login --with-token
           gh auth status
 
       - name: Ensure labels exist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          echo "Creating/updating labels..."
           # Use --force flag to update existing labels or create new ones
-          gh label create "automated" --color "0e8a16" --description "Automated PR" --force || true
-          gh label create "staging" --color "fbca04" --description "Staging environment" --force || true
-          gh label create "promotion" --color "1d76db" --description "Promotion workflow" --force || true
-
-          echo "Labels ensured/updated"
+          gh label create "automated" --color "0e8a16" --description "Automated PR" --force || echo "Label 'automated' already exists or created"
+          gh label create "staging" --color "fbca04" --description "Staging environment" --force || echo "Label 'staging' already exists or created"
+          gh label create "promotion" --color "1d76db" --description "Promotion workflow" --force || echo "Label 'promotion' already exists or created"
+          echo "Labels ensured"
 
       - name: Create or Update Pull Request
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Get commit details
           COMMIT_SHA="${{ github.sha }}"
@@ -129,10 +132,14 @@ jobs:
           AUTHOR="${{ github.actor }}"
           WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+          # Extract repository owner and name
+          REPO_OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+
           # Create PR body
           PR_BODY=$(cat <<EOF
-          ## Automated Promotion from Dev to Staging
 
+          ## Automated Promotion from Dev to Staging
           This PR was automatically created after successful CI pipeline run on the \`dev\` branch.
 
           ### CI Pipeline Status
@@ -154,31 +161,31 @@ jobs:
           EOF
           )
 
-          # Check if PR already exists using direct API call for better reliability
-          EXISTING_PR=$(gh api graphql -f query='
-            query($owner:String!, $repo:String!, $base:String!, $head:String!) {
-              repository(owner:$owner, name:$repo) {
-                pullRequests(baseRefName:$base, headRefName:$head, states:OPEN, first:1) {
-                  nodes {
-                    number
-                  }
-                }
-              }
-            }' -f owner="${GITHUB_REPOSITORY%/*}" -f repo="${GITHUB_REPOSITORY#*/}" -f base="staging" -f head="dev" --jq '.data.repository.pullRequests.nodes[0].number')
+          echo "Checking for existing PRs from dev to staging..."
+
+          # Try to find existing PR using REST API (more reliable in CI)
+          EXISTING_PR=$(gh api "repos/${REPO_OWNER}/${REPO_NAME}/pulls?base=staging&head=${REPO_OWNER}:dev&state=open" \
+            --jq '.[0].number' 2>/dev/null || echo "")
 
           if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
-            echo "PR #${EXISTING_PR} already exists from dev to staging"
+            echo "Found existing PR #${EXISTING_PR} from dev to staging"
 
-            # Update existing PR with proper permissions
-            gh pr edit "$EXISTING_PR" \
+            # Try to update the existing PR
+            echo "Attempting to update PR #${EXISTING_PR}..."
+            if gh pr edit "$EXISTING_PR" \
               --title "🚀 Auto-promote: dev → staging (Updated)" \
               --body "$PR_BODY" \
-              --add-label "automated,staging,promotion" || {
-                echo "Warning: Could not update PR #${EXISTING_PR}, posting comment instead"
-                gh pr comment "$EXISTING_PR" --body "**Pipeline Update**: CI passed successfully. Workflow run: ${WORKFLOW_URL}"
-              }
+              --add-label "automated,staging,promotion" 2>/dev/null; then
+              echo "Successfully updated PR #${EXISTING_PR}"
+            else
+              echo "Could not fully update PR #${EXISTING_PR} (permissions may be limited)"
+              echo "Posting comment instead..."
+              COMMENT_BODY="**Pipeline Update**: CI passed successfully. New workflow run: ${WORKFLOW_URL}"
+              gh pr comment "$EXISTING_PR" --body "$COMMENT_BODY" || \
+                echo "Could not comment on PR. The GitHub token may not have sufficient permissions."
+            fi
           else
-            echo "Creating new PR from dev to staging"
+            echo "No existing PR found. Creating new PR..."
 
             # Create new PR
             gh pr create \
@@ -187,4 +194,6 @@ jobs:
               --title "🚀 Auto-promote: dev → staging" \
               --body "$PR_BODY" \
               --label "automated,staging,promotion"
+
+            echo "New PR created successfully"
           fi
