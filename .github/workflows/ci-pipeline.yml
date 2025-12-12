@@ -94,15 +94,34 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      issues: write # Added for label management
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create Pull Request to Staging
+      - name: Setup GitHub CLI
+        run: |
+          gh auth setup-git
+          gh auth status
+
+      - name: Ensure labels exist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Use --force flag to update existing labels or create new ones
+          gh label create "automated" --color "0e8a16" --description "Automated PR" --force || true
+          gh label create "staging" --color "fbca04" --description "Staging environment" --force || true
+          gh label create "promotion" --color "1d76db" --description "Promotion workflow" --force || true
+
+          echo "Labels ensured/updated"
+
+      - name: Create or Update Pull Request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Get commit details
           COMMIT_SHA="${{ github.sha }}"
@@ -111,7 +130,7 @@ jobs:
           WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Create PR body
-          PR_BODY=$(cat <<'EOF'
+          PR_BODY=$(cat <<EOF
           ## Automated Promotion from Dev to Staging
 
           This PR was automatically created after successful CI pipeline run on the \`dev\` branch.
@@ -135,25 +154,32 @@ jobs:
           EOF
           )
 
-          # Check if PR already exists
-          EXISTING_PR=$(gh pr list --base staging --head dev --state open --json number --jq '.[0].number')
+          # Check if PR already exists using direct API call for better reliability
+          EXISTING_PR=$(gh api graphql -f query='
+            query($owner:String!, $repo:String!, $base:String!, $head:String!) {
+              repository(owner:$owner, name:$repo) {
+                pullRequests(baseRefName:$base, headRefName:$head, states:OPEN, first:1) {
+                  nodes {
+                    number
+                  }
+                }
+              }
+            }' -f owner="${GITHUB_REPOSITORY%/*}" -f repo="${GITHUB_REPOSITORY#*/}" -f base="staging" -f head="dev" --jq '.data.repository.pullRequests.nodes[0].number')
 
-          # Ensure labels exist (ignore error if they already exist)
-          gh label create "automated" --color "0e8a16" --description "Automated PR" || true
-          gh label create "staging" --color "fbca04" --description "Staging environment" || true
-          gh label create "promotion" --color "1d76db" --description "Promotion workflow" || true
-
-          if [ -n "$EXISTING_PR" ]; then
+          if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
             echo "PR #${EXISTING_PR} already exists from dev to staging"
-            # Try to update the existing PR body
-            if gh pr edit "$EXISTING_PR" --body "$PR_BODY"; then
-              echo "Updated existing PR #${EXISTING_PR} body"
-            else
-              echo "Could not edit PR body (likely permission issue). Posting comment instead."
-              gh pr comment "$EXISTING_PR" --body "$PR_BODY"
-              echo "Commented on existing PR #${EXISTING_PR}"
-            fi
+
+            # Update existing PR with proper permissions
+            gh pr edit "$EXISTING_PR" \
+              --title "🚀 Auto-promote: dev → staging (Updated)" \
+              --body "$PR_BODY" \
+              --add-label "automated,staging,promotion" || {
+                echo "Warning: Could not update PR #${EXISTING_PR}, posting comment instead"
+                gh pr comment "$EXISTING_PR" --body "**Pipeline Update**: CI passed successfully. Workflow run: ${WORKFLOW_URL}"
+              }
           else
+            echo "Creating new PR from dev to staging"
+
             # Create new PR
             gh pr create \
               --base staging \
@@ -161,5 +187,4 @@ jobs:
               --title "🚀 Auto-promote: dev → staging" \
               --body "$PR_BODY" \
               --label "automated,staging,promotion"
-            echo "Created new PR from dev to staging"
           fi
