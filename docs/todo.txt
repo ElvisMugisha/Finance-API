@@ -1,0 +1,20 @@
+# Signals and periodic tasks would go here in accounts/models.py
+# Example: Automatically generate recurring transactions daily
+# Example: Send budget notifications
+# Example: Update goal progress monthly
+
+Next Steps:
+1. Add Django Signals for automatic operations:
+    - Daily: Generate recurring transactions
+    - Weekly: Check budget thresholds
+    - Monthly: Advance budget periods
+
+2. Create Management Commands:
+    - python manage.py generate_recurring_transactions
+    - python manage.py advance_budget_periods
+    - python manage.py cleanup_expired_reports
+
+3. Implement Celery Tasks for async operations:
+    - Report generation (can be slow)
+    - Email notifications
+    - Data aggregation
