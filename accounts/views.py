@@ -1,15 +1,10 @@
-from django.db import transaction as db_transaction
-from django.db.models import ProtectedError
-from django.shortcuts import get_object_or_404
-from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import OpenApiResponse, extend_schema
-from rest_framework import filters, status, viewsets
+from rest_framework import status, viewsets
 from rest_framework.response import Response
-from rest_framework.views import APIView
 
 from utils import loggings
 from utils.paginations import CustomPageNumberPagination
-from utils.permissions import IsActiveAndVerified, IsOwnerOrAdmin
+from utils.permissions import IsOwnerOrAdmin
 
 from .models import Account, Transaction
 from .serializers import AccountSerializer, TransactionSerializer

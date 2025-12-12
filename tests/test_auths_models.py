@@ -1,12 +1,11 @@
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pytest
-from django.core.exceptions import ValidationError
 from django.db import IntegrityError
 from django.utils import timezone
 
-from auths.models import Passcode, Profile, User
+from auths.models import Passcode, Profile
 from utils import choices
 
 

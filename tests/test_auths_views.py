@@ -676,7 +676,7 @@ class TestEmailVerificationView:
         data = {"email": "unverified@example.com", "otp": "12345678"}
 
         # Mock email sending from utils
-        with patch("utils.utils.send_normal_email") as mock_send_email:
+        with patch("utils.utils.send_normal_email"):
             response = client.post(url, data, format="json")
 
             if response.status_code == status.HTTP_200_OK:
@@ -995,7 +995,7 @@ class TestPasswordResetRequestView:
         data = {"email": "verified@example.com"}
 
         # Mock from utils.utils module
-        with patch("utils.utils.send_code_to_user") as mock_send_code:
+        with patch("utils.utils.send_code_to_user"):
             response = client.post(url, data, format="json")
 
             # Could be 200 or 429 (rate limited)
@@ -1106,7 +1106,7 @@ class TestPasswordResetConfirmView:
         }
 
         # Mock from utils.utils module
-        with patch("utils.utils.send_normal_email") as mock_send_email:
+        with patch("utils.utils.send_normal_email"):
             response = client.post(url, data, format="json")
 
             # Handle rate limiting

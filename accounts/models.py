@@ -1,13 +1,15 @@
+import hashlib
+import json
 import uuid
-from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
-from typing import Optional, Dict, Any, List, Tuple
+from datetime import date, timedelta
+from decimal import Decimal
+from typing import Any, Dict, Optional
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.validators import MinValueValidator, MaxValueValidator
-from django.db import models, transaction, DatabaseError
-from django.db.models import Q, Sum, F, ExpressionWrapper, DecimalField
+from django.core.validators import MaxValueValidator, MinValueValidator
+from django.db import DatabaseError, models, transaction
+from django.db.models import Q, Sum
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -503,13 +505,13 @@ class RecurringTransaction(models.Model):
 
         # Frequency-specific validations
         if self.frequency == choices.FrequencyType.MONTHLY and not self.day_of_month:
-            logger.warning(f"Monthly recurring transaction without day_of_month set")
+            logger.warning("Monthly recurring transaction without day_of_month set")
             # Default to start date's day if not set
             if not self.day_of_month:
                 self.day_of_month = self.start_date.day
 
         if self.frequency == choices.FrequencyType.WEEKLY and not self.day_of_week:
-            logger.warning(f"Weekly recurring transaction without day_of_week set")
+            logger.warning("Weekly recurring transaction without day_of_week set")
             # Default to start date's weekday if not set
             if not self.day_of_week:
                 # Monday=1, Sunday=7
@@ -975,14 +977,14 @@ class Budget(models.Model):
 
         # Validate category for category budgets
         if self.budget_type == choices.BudgetType.CATEGORY and not self.category:
-            logger.error(f"Category budget must have a category")
+            logger.error("Category budget must have a category")
             raise ValidationError(
                 {"category": _("Category is required for category budgets.")}
             )
 
         # Validate no category for overall budgets
         if self.budget_type == choices.BudgetType.OVERALL and self.category:
-            logger.warning(f"Overall budget should not have a specific category")
+            logger.warning("Overall budget should not have a specific category")
             self.category = None
 
         logger.debug(f"Budget validation passed: {self.id}")
@@ -1395,12 +1397,12 @@ class FinancialGoal(models.Model):
             )
 
         if self.current_amount > self.target_amount:
-            logger.warning(f"Current amount exceeds target amount")
+            logger.warning("Current amount exceeds target amount")
             self.current_amount = self.target_amount
 
         # Validate dates
         if self.target_date <= self.start_date:
-            logger.error(f"Target date must be after start date")
+            logger.error("Target date must be after start date")
             raise ValidationError(
                 {"target_date": _("Target date must be after start date.")}
             )
@@ -1683,7 +1685,7 @@ class Report(models.Model):
             )
 
         # Set default expiry (30 days from creation)
-        if not self.expires_at and self.status == ReportStatus.COMPLETED:
+        if not self.expires_at and self.status == choices.ReportStatus.COMPLETED:
             self.expires_at = timezone.now() + timedelta(days=30)
 
         logger.debug(f"Report validation passed: {self.id}")
