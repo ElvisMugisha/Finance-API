@@ -945,7 +945,7 @@ class TestCategoryAPI:
 
     def test_update_category_create_duplicate(self, client, normal_user):
         """Cannot update to create duplicate name for same type."""
-        cat1 = Category.objects.create(
+        Category.objects.create(
             name="Cat1",
             user=normal_user,
             category_type=choices.TransactionType.EXPENSE,

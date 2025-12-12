@@ -16,7 +16,6 @@ from rest_framework.exceptions import ValidationError
 from accounts.models import Account, Transaction
 from accounts.serializers import AccountSerializer, TransactionSerializer
 from core.models import Category, Currency
-from core.serializers import CurrencySerializer
 from utils import choices
 
 User = get_user_model()
