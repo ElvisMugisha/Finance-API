@@ -25,6 +25,9 @@ class User(AbstractBaseUser, PermissionsMixin):
     last_name = models.CharField(max_length=255, null=False, blank=False)
     email = models.EmailField(max_length=255, unique=True)
 
+    is_premium = models.BooleanField(default=False)
+    premium_expires = models.DateTimeField(null=True, blank=True)
+
     is_superuser = models.BooleanField(default=False)
     is_staff = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
@@ -145,11 +148,35 @@ class Profile(models.Model):
     )
 
     occupation = models.CharField(max_length=255, null=True, blank=True)
+    annual_income = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    monthly_income_target = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    emergency_fund_target = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+
+    currency_preference = models.CharField(
+        max_length=3, default="USD", null=True, blank=True
+    )
 
     country = models.CharField(max_length=255, null=True, blank=True)
     city = models.CharField(max_length=255, null=True, blank=True)
     street = models.CharField(max_length=255, null=True, blank=True)
     zip_code = models.CharField(max_length=20, null=True, blank=True)
+
+    financial_goals = models.TextField(null=True, blank=True)
+    risk_tolerance = models.CharField(max_length=50, null=True, blank=True)
+    financial_advisor = models.CharField(max_length=255, null=True, blank=True)
+    retirement_goal = models.DecimalField(
+        max_digits=15, decimal_places=2, null=True, blank=True
+    )
+    investment_experience = models.CharField(max_length=50, null=True, blank=True)
+
+    notification_preferences = models.JSONField(default=dict, blank=True)
+    privacy_settings = models.JSONField(default=dict, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

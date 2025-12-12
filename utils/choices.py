@@ -13,3 +13,24 @@ class Gender(models.TextChoices):
     MALE = "Male", _("Male")
     FEMALE = "Female", _("Female")
     OTHER = "Other", _("Other")
+
+
+class AccountType(models.TextChoices):
+    CHECKING = "Checking", _("Checking")
+    SAVINGS = "Savings", _("Savings")
+    CREDIT_CARD = "Credit Card", _("Credit Card")
+    CASH = "Cash", _("Cash")
+    INVESTMENT = "Investment", _("Investment")
+    LOAN = "Loan", _("Loan")
+    OTHER = "Other", _("Other")
+
+
+class TransactionType(models.TextChoices):
+    INCOME = "Income", _("Income")
+    EXPENSE = "Expense", _("Expense")
+
+
+class TransactionStatus(models.TextChoices):
+    COMPLETED = "Completed", _("Completed")
+    PENDING = "Pending", _("Pending")
+    CANCELED = "Canceled", _("Canceled")

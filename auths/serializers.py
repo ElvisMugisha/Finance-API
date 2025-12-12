@@ -99,7 +99,7 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
 
         if password != confirm_password:
             logger.warning("Registration failed: Passwords do not match.")
-            raise ValidationError({"password": "Passwords do not match."})
+            raise serializers.ValidationError({"password": "Passwords do not match."})
 
         try:
             if password:
@@ -158,6 +158,8 @@ class UserSerializer(serializers.ModelSerializer):
             "email",
             "first_name",
             "last_name",
+            "is_premium",
+            "premium_expires",
             "is_active",
             "is_verified",
             "last_activity",
@@ -167,6 +169,8 @@ class UserSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id",
             "email",
+            "is_premium",
+            "premium_expires",
             "is_active",
             "is_verified",
             "last_activity",
@@ -248,6 +252,17 @@ class ProfileSerializer(serializers.ModelSerializer):
             "profile_picture",
             "gender",
             "occupation",
+            "annual_income",
+            "monthly_income_target",
+            "emergency_fund_target",
+            "currency_preference",
+            "financial_goals",
+            "risk_tolerance",
+            "financial_advisor",
+            "retirement_goal",
+            "investment_experience",
+            "notification_preferences",
+            "privacy_settings",
             "country",
             "city",
             "street",

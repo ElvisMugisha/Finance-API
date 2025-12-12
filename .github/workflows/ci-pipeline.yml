@@ -94,25 +94,26 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      issues: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Create Pull Request to Staging
+      - name: Create or Update Pull Request (API Approach)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Get commit details
           COMMIT_SHA="${{ github.sha }}"
           COMMIT_MSG="${{ github.event.head_commit.message }}"
           AUTHOR="${{ github.actor }}"
           WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          REPO="${GITHUB_REPOSITORY}"
 
           # Create PR body
-          PR_BODY=$(cat <<'EOF'
-          ## Automated Promotion from Dev to Staging
+          PR_BODY="## Automated Promotion from Dev to Staging
 
           This PR was automatically created after successful CI pipeline run on the \`dev\` branch.
 
@@ -131,35 +132,41 @@ jobs:
           - [ ] No breaking changes
           - [ ] Ready for staging deployment
 
-          **Note**: This PR can be merged automatically or after manual review depending on your team's policy.
-          EOF
-          )
+          **Note**: This PR can be merged automatically or after manual review depending on your team's policy."
 
-          # Check if PR already exists
-          EXISTING_PR=$(gh pr list --base staging --head dev --state open --json number --jq '.[0].number')
+          # Check for existing PRs using GitHub API
+          echo "Checking for existing PRs..."
+          RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${REPO}/pulls?base=staging&head=${REPO%/*}:dev&state=open")
 
-          # Ensure labels exist (ignore error if they already exist)
-          gh label create "automated" --color "0e8a16" --description "Automated PR" || true
-          gh label create "staging" --color "fbca04" --description "Staging environment" || true
-          gh label create "promotion" --color "1d76db" --description "Promotion workflow" || true
+          EXISTING_PR_NUMBER=$(echo "$RESPONSE" | jq -r '.[0].number // empty')
 
-          if [ -n "$EXISTING_PR" ]; then
-            echo "PR #${EXISTING_PR} already exists from dev to staging"
-            # Try to update the existing PR body
-            if gh pr edit "$EXISTING_PR" --body "$PR_BODY"; then
-              echo "Updated existing PR #${EXISTING_PR} body"
-            else
-              echo "Could not edit PR body (likely permission issue). Posting comment instead."
-              gh pr comment "$EXISTING_PR" --body "$PR_BODY"
-              echo "Commented on existing PR #${EXISTING_PR}"
-            fi
+          if [ -n "$EXISTING_PR_NUMBER" ]; then
+            echo "Updating existing PR #${EXISTING_PR_NUMBER}"
+
+            # Update PR body
+            curl -s -X PATCH -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\": $(echo "$PR_BODY" | jq -Rs .)}" \
+              "https://api.github.com/repos/${REPO}/pulls/${EXISTING_PR_NUMBER}"
+
+            # Add labels (if they exist)
+            curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"labels":["automated","staging","promotion"]}' \
+              "https://api.github.com/repos/${REPO}/issues/${EXISTING_PR_NUMBER}/labels" || true
           else
+            echo "Creating new PR..."
+
             # Create new PR
-            gh pr create \
-              --base staging \
-              --head dev \
-              --title "🚀 Auto-promote: dev → staging" \
-              --body "$PR_BODY" \
-              --label "automated,staging,promotion"
-            echo "Created new PR from dev to staging"
+            curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"title\": \"🚀 Auto-promote: dev → staging\",
+                \"body\": $(echo "$PR_BODY" | jq -Rs .),
+                \"head\": \"dev\",
+                \"base\": \"staging\",
+                \"maintainer_can_modify\": true
+              }" \
+              "https://api.github.com/repos/${REPO}/pulls"
           fi

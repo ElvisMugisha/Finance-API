@@ -47,7 +47,7 @@ THIRD_PARTY_APPS = [
 ]
 
 # Local apps
-LOCAL_APPS = ["auths"]
+LOCAL_APPS = ["auths", "core", "accounts"]
 
 # Installed apps
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
