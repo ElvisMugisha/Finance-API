@@ -215,6 +215,7 @@ REST_FRAMEWORK = {
         "otp_request": "5/30m",
         "password_change": "2/1d",
         "password_reset": "4/2d",
+        "transaction": "100/1h",
     },
     "DEFAULT_RENDERER_CLASSES": [
         "rest_framework.renderers.JSONRenderer",

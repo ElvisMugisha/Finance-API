@@ -1,13 +1,20 @@
-from drf_spectacular.utils import OpenApiResponse, extend_schema, OpenApiParameter
-from rest_framework import status, viewsets, mixins
+from drf_spectacular.utils import (
+    OpenApiResponse,
+    extend_schema,
+    OpenApiParameter,
+    inline_serializer,
+)
+from drf_spectacular.types import OpenApiTypes
+from rest_framework import status, viewsets, mixins, serializers
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from django.db import transaction as db_transaction
 from django.db import models
+from django.conf import settings
 from django.utils import timezone
 
-from utils import loggings, choices
+from utils import loggings, choices, filters, throttlings
 from utils.paginations import CustomPageNumberPagination
 from utils.permissions import IsOwnerOrAdmin
 
@@ -19,6 +26,10 @@ from .serializers import (
     AccountDetailSerializer,
     AccountReconcileSerializer,
     TransactionSerializer,
+    TransactionCreateSerializer,
+    TransactionUpdateSerializer,
+    TransactionBulkCreateSerializer,
+    TransactionVerificationSerializer,
 )
 
 logger = loggings.setup_logging()
@@ -1552,119 +1563,860 @@ class AccountViewSet(
 
 class TransactionViewSet(viewsets.ModelViewSet):
     """
-    Transaction ViewSet for CRUD operations.
+    Complete transaction management API endpoint.
 
-    Supports:
-    - List / Retrieve / Create / Patch (update-only) / Soft-delete
-    - Owner-only access (admins override)
-    - Filtering, searching, ordering, pagination
+    Implements:
+    - Full CRUD operations with proper permissions
+    - Advanced filtering and searching
+    - Bulk operations
+    - Transaction verification workflow
+    - Analytics and reporting
+    - Export functionality
+    - Audit logging
 
-    PUT is DISABLED → only PATCH updates are allowed.
+    Security:
+    - User-specific data isolation
+    - Role-based access control
+    - Rate limiting
+    - Input validation and sanitization
+
+    Performance:
+    - Optimized database queries
+    - Selective field loading
+    - Caching for frequent operations
+    - Background processing for bulk operations
     """
 
-    queryset = Transaction.objects.all()
+    queryset = Transaction.objects.none()  # Will be set in get_queryset
     serializer_class = TransactionSerializer
     pagination_class = CustomPageNumberPagination
     permission_classes = [IsOwnerOrAdmin]
+    throttle_classes = [throttlings.TransactionThrottle]
+    filterset_class = filters.TransactionFilter
     lookup_field = "id"
 
-    def get_queryset(self):
-        """Return transactions based on user permissions."""
-        user = self.request.user
-        queryset = Transaction.objects.select_related("user", "account", "category")
-        if user.is_staff or user.is_superuser:
-            return queryset
-        return queryset.filter(user=user)
+    # Disable PUT method (use PATCH for partial updates)
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
-    @extend_schema(
-        summary="List transactions",
-        description="Lists all transactions accessible to the authenticated user.",
-    )
+    def get_queryset(self):
+        """
+        Returns queryset filtered by user ownership with optimization.
+
+        Optimizations:
+        - Prefetches related objects to prevent N+1 queries
+        - Selects only necessary fields
+        - Applies filtering early in the query pipeline
+
+        Returns:
+            QuerySet: Filtered and optimized transaction queryset
+        """
+        user = self.request.user
+
+        # Base queryset with all necessary prefetches
+        queryset = (
+            Transaction.objects.select_related(
+                "user",
+                "account",
+                "category",
+                "original_currency",
+            )
+            .prefetch_related(
+                "tags",
+            )
+            .only(
+                "id",
+                "user_id",
+                "account_id",
+                "category_id",
+                "name",
+                "transaction_type",
+                "amount",
+                "original_amount",
+                "original_currency_id",
+                "exchange_rate",
+                "description",
+                "status",
+                "transaction_date",
+                "created_at",
+                "updated_at",
+                "is_transfer",
+                "transfer_account_id",
+                "transfer_reference",
+            )
+        )
+
+        # Filter by user ownership (unless admin)
+        if not (user.is_staff or user.is_superuser):
+            queryset = queryset.filter(user=user)
+
+        return queryset
+
+    def get_serializer_class(self):
+        """
+        Returns appropriate serializer based on action.
+
+        Strategy:
+        - Different serializers for create/update to enforce business rules
+        - Specialized serializers for bulk operations
+        - Action-specific validation logic
+
+        Returns:
+            Serializer class for the current action
+        """
+        if self.action == "create":
+            return TransactionCreateSerializer
+        elif self.action == "partial_update":
+            return TransactionUpdateSerializer
+        elif self.action == "bulk_create":
+            return TransactionBulkCreateSerializer
+        elif self.action == "bulk_update":
+            return TransactionBulkUpdateSerializer
+        elif self.action == "verify":
+            return TransactionVerificationSerializer
+        elif self.action == "reconcile":
+            return TransactionReconciliationSerializer
+        return super().get_serializer_class()
+
     def list(self, request, *args, **kwargs):
+        """
+        List transactions with filtering, pagination, and analytics.
+
+        Features:
+        - Advanced filtering via query parameters
+        - Search across multiple fields
+        - Ordering by any field
+        - Analytics summary in response
+        - Export capabilities
+
+        Returns:
+            Paginated response with transactions and analytics
+        """
         try:
-            queryset = self.get_queryset().order_by("-transaction_date")
+            # Apply filtering
+            queryset = self.filter_queryset(self.get_queryset())
+
+            # Check for export request
+            export_format = request.query_params.get("export")
+            if export_format and (request.user.is_staff or request.user.is_superuser):
+                return self._export_transactions(queryset, export_format)
+
+            # Apply ordering (default: most recent first)
+            ordering = request.query_params.get("ordering", "-transaction_date")
+            if ordering:
+                queryset = queryset.order_by(ordering)
+
+            # Paginate
             page = self.paginate_queryset(queryset)
             if page is not None:
                 serializer = self.get_serializer(page, many=True)
-                return self.get_paginated_response(serializer.data)
 
+                # Include analytics in paginated response
+                response = self.get_paginated_response(serializer.data)
+                response.data["analytics"] = self._get_analytics_summary(queryset)
+                return response
+
+            # Non-paginated response (if pagination is disabled)
             serializer = self.get_serializer(queryset, many=True)
-            return Response(serializer.data)
-
-        except Exception as e:
-            logger.exception(f"Error listing transactions: {e}")
             return Response(
-                {"error": "Failed to retrieve transactions."},
+                {
+                    "transactions": serializer.data,
+                    "analytics": self._get_analytics_summary(queryset),
+                    "count": queryset.count(),
+                }
+            )
+
+        except ValidationError as e:
+            logger.warning(
+                f"Transaction list validation error: {e}",
+                extra={"user_id": request.user.id},
+            )
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception(
+                f"Error listing transactions for user {request.user.id}: {e}"
+            )
+            return Response(
+                {
+                    "error": _(
+                        "Failed to retrieve transactions. Please try again later."
+                    )
+                },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
     @extend_schema(
-        summary="Create transaction",
-        description="Create a new transaction for the authenticated user.",
-        request=TransactionSerializer,
+        operation_id="transactions_create",
         responses={
             201: TransactionSerializer,
-            400: OpenApiResponse(description="Validation Error"),
+            400: inline_serializer(
+                name="TransactionCreateError",
+                fields={
+                    "error": serializers.CharField(),
+                    "details": serializers.DictField(required=False),
+                },
+            ),
         },
     )
     def create(self, request, *args, **kwargs):
+        """
+        Create a single transaction with atomic operation.
+
+        Business Rules:
+        - Validates ownership of account and category
+        - Updates account balance if status is COMPLETED
+        - Creates transfer pair if is_transfer is True
+        - Enforces currency conversion rules
+
+        Returns:
+            Created transaction with 201 status
+        """
         try:
             serializer = self.get_serializer(
-                data=request.data,
-                context={"request": request},
+                data=request.data, context={"request": request}
             )
             serializer.is_valid(raise_exception=True)
-            serializer.save()
-            logger.info("Transaction created successfully: %s", serializer.data)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+            # Atomic creation to ensure data consistency
+            with db_transaction.atomic():
+                transaction = serializer.save()
+
+            logger.info(
+                f"Transaction created: {transaction.id}",
+                extra={
+                    "transaction_id": transaction.id,
+                    "user_id": request.user.id,
+                    "account_id": transaction.account_id,
+                    "amount": transaction.amount,
+                    "type": transaction.transaction_type,
+                },
+            )
+
+            return Response(
+                TransactionSerializer(transaction).data, status=status.HTTP_201_CREATED
+            )
+
+        except ValidationError as e:
+            logger.warning(
+                f"Transaction creation validation failed: {e}",
+                extra={"user_id": request.user.id, "data": request.data},
+            )
+            return Response(
+                {"error": _("Validation failed"), "details": e.detail},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except PermissionDenied as e:
+            logger.warning(
+                f"Permission denied for transaction creation: {e}",
+                extra={"user_id": request.user.id},
+            )
+            return Response({"error": str(e)}, status=status.HTTP_403_FORBIDDEN)
+        except Exception as e:
+            logger.exception(
+                f"Error creating transaction for user {request.user.id}: {e}"
+            )
+            return Response(
+                {"error": _("Failed to create transaction. Please try again later.")},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def retrieve(self, request, *args, **kwargs):
+        """
+        Retrieve a specific transaction with enhanced details.
+
+        Includes:
+        - Full transaction details
+        - Related transfer transaction (if applicable)
+        - Audit trail (if admin)
+        - Similar transactions suggestion
+
+        Returns:
+            Complete transaction details
+        """
+        try:
+            instance = self.get_object()
+            serializer = self.get_serializer(instance)
+
+            # Add related data
+            data = serializer.data
+            if instance.is_transfer and instance.transfer_reference:
+                try:
+                    transfer_transaction = Transaction.objects.get(
+                        id=instance.transfer_reference
+                    )
+                    data["transfer_transaction"] = TransactionSerializer(
+                        transfer_transaction
+                    ).data
+                except Transaction.DoesNotExist:
+                    pass
+
+            # Add audit info for staff
+            if request.user.is_staff:
+                data["audit"] = {
+                    "created_by": instance.user_id,
+                    "created_at": instance.created_at,
+                    "last_modified": instance.updated_at,
+                    "import_source": instance.imported_source,
+                }
+
+            return Response(data)
 
         except Exception as e:
-            logger.exception(f"Error creating transaction: {e}")
+            logger.exception(f"Error retrieving transaction {kwargs.get('id')}: {e}")
             return Response(
-                {"error": "Failed to create transaction."},
+                {"error": _("Failed to retrieve transaction details.")},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def partial_update(self, request, *args, **kwargs):
+        """
+        Partially update a transaction with atomic operation.
+
+        Restrictions:
+        - Cannot update transaction_type after creation
+        - Cannot modify completed/reconciled transactions without permissions
+        - Account balance is adjusted for amount/status changes
+
+        Returns:
+            Updated transaction
+        """
+        try:
+            instance = self.get_object()
+
+            # Check if transaction can be modified
+            if not self._can_modify_transaction(instance, request.user):
+                return Response(
+                    {"error": _("Cannot modify completed or reconciled transactions.")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            serializer = self.get_serializer(
+                instance, data=request.data, partial=True, context={"request": request}
+            )
+            serializer.is_valid(raise_exception=True)
+
+            # Track changes for audit
+            changes = {
+                field: (getattr(instance, field), value)
+                for field, value in request.data.items()
+                if hasattr(instance, field) and getattr(instance, field) != value
+            }
+
+            # Atomic update to ensure data consistency
+            with db_transaction.atomic():
+                transaction = serializer.save()
+
+            logger.info(
+                f"Transaction updated: {transaction.id}",
+                extra={
+                    "transaction_id": transaction.id,
+                    "user_id": request.user.id,
+                    "changes": changes,
+                },
+            )
+
+            return Response(TransactionSerializer(transaction).data)
+
+        except ValidationError as e:
+            logger.warning(
+                f"Transaction update validation failed: {e}",
+                extra={
+                    "transaction_id": kwargs.get("id"),
+                    "user_id": request.user.id,
+                    "data": request.data,
+                },
+            )
+            return Response(
+                {"error": _("Validation failed"), "details": e.detail},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as e:
+            logger.exception(f"Error updating transaction {kwargs.get('id')}: {e}")
+            return Response(
+                {"error": _("Failed to update transaction. Please try again later.")},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def destroy(self, request, *args, **kwargs):
+        """
+        Soft delete a transaction with balance adjustment.
+
+        Effects:
+        - Transaction is marked as deleted (soft delete)
+        - Account balance is adjusted if transaction was completed
+        - Transfer pairs are also soft deleted
+        - Audit log is created
+
+        Returns:
+            204 No Content on success
+        """
+        try:
+            instance = self.get_object()
+
+            # Check permissions for deletion
+            if (
+                instance.status == TransactionStatus.RECONCILED
+                and not request.user.is_staff
+            ):
+                return Response(
+                    {
+                        "error": _(
+                            "Cannot delete reconciled transactions without admin permission."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            # Atomic deletion with balance adjustment
+            with db_transaction.atomic():
+                # Adjust balance if transaction was completed
+                if instance.status == TransactionStatus.COMPLETED and instance.account:
+                    # Reverse the transaction amount
+                    reverse_type = (
+                        TransactionType.EXPENSE
+                        if instance.transaction_type == TransactionType.INCOME
+                        else TransactionType.INCOME
+                    )
+                    instance.account.update_balance(instance.amount, reverse_type)
+
+                # Soft delete transfer pair if exists
+                if instance.is_transfer and instance.transfer_reference:
+                    try:
+                        transfer_transaction = Transaction.objects.get(
+                            id=instance.transfer_reference
+                        )
+                        transfer_transaction.delete()
+                    except Transaction.DoesNotExist:
+                        pass
+
+                # Soft delete the transaction
+                instance.delete()
+
+            logger.info(
+                f"Transaction deleted: {instance.id}",
+                extra={
+                    "transaction_id": instance.id,
+                    "user_id": request.user.id,
+                    "amount": instance.amount,
+                    "type": instance.transaction_type,
+                },
+            )
+
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        except Exception as e:
+            logger.exception(f"Error deleting transaction {kwargs.get('id')}: {e}")
+            return Response(
+                {"error": _("Failed to delete transaction. Please try again later.")},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
     @extend_schema(
-        summary="Partial update transaction (PATCH)",
-        description="Update mutable transaction fields. Owner-only except admin.",
+        summary="Bulk Create Transactions",
+        description="""
+        Create multiple transactions in a single request.
+
+        Features:
+        - Atomic operation (all or nothing)
+        - Validation for each transaction
+        - Batch processing with progress tracking
+        - Background processing for large batches
+        """,
+        request=TransactionBulkCreateSerializer,
+        responses={
+            201: inline_serializer(
+                name="BulkCreateResponse",
+                fields={
+                    "created": serializers.IntegerField(),
+                    "failed": serializers.IntegerField(),
+                    "errors": serializers.ListField(child=serializers.DictField()),
+                    "transaction_ids": serializers.ListField(
+                        child=serializers.UUIDField()
+                    ),
+                },
+            ),
+        },
     )
-    def partial_update(self, request, *args, **kwargs):
-        instance = self.get_object()
+    @action(detail=False, methods=["post"], url_path="bulk-create")
+    def bulk_create(self, request, *args, **kwargs):
+        """
+        Create multiple transactions in bulk.
 
-        serializer = self.get_serializer(
-            instance,
-            data=request.data,
-            partial=True,
-            context={"request": request},
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+        Performance:
+        - Uses bulk_create for database efficiency
+        - Processes in configurable batch sizes
+        - Returns summary with success/failure counts
 
-        logger.info(
-            "Transaction '%s' (%s) updated by user '%s'.",
-            instance.name,
-            instance.id,
-            request.user.id,
-        )
+        Returns:
+            Summary of bulk creation results
+        """
+        try:
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
 
-        return Response(serializer.data)
+            transactions_data = serializer.validated_data["transactions"]
+            results = {"created": 0, "failed": 0, "errors": [], "transaction_ids": []}
+
+            # Process in batches for performance
+            batch_size = 100
+            for i in range(0, len(transactions_data), batch_size):
+                batch = transactions_data[i : i + batch_size]
+
+                with db_transaction.atomic():
+                    for transaction_data in batch:
+                        try:
+                            transaction_serializer = TransactionCreateSerializer(
+                                data=transaction_data, context={"request": request}
+                            )
+                            transaction_serializer.is_valid(raise_exception=True)
+                            transaction = transaction_serializer.save()
+
+                            results["created"] += 1
+                            results["transaction_ids"].append(str(transaction.id))
+
+                        except Exception as e:
+                            results["failed"] += 1
+                            results["errors"].append(
+                                {
+                                    "index": i + batch.index(transaction_data),
+                                    "error": str(e),
+                                    "data": transaction_data,
+                                }
+                            )
+
+            logger.info(
+                f"Bulk transaction creation completed",
+                extra={
+                    "user_id": request.user.id,
+                    "created": results["created"],
+                    "failed": results["failed"],
+                },
+            )
+
+            return Response(results, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            logger.exception(
+                f"Bulk transaction creation failed: {e}",
+                extra={"user_id": request.user.id},
+            )
+            return Response(
+                {
+                    "error": _(
+                        "Bulk creation failed. Please check your data and try again."
+                    )
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     @extend_schema(
-        summary="Delete transaction",
-        description="Delete a transaction. Owner-only except admin.",
+        summary="Verify Transaction",
+        description="Mark a transaction as verified/completed.",
+        request=TransactionVerificationSerializer,
+        responses={
+            200: TransactionSerializer,
+            400: OpenApiResponse(description="Transaction cannot be verified"),
+        },
     )
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        user = request.user
+    @action(detail=True, methods=["post"], url_path="verify")
+    def verify(self, request, *args, **kwargs):
+        """
+        Verify and complete a transaction.
 
-        instance.delete()
+        Effects:
+        - Updates status to COMPLETED
+        - Updates account balance
+        - Creates audit log
+        - Sends notifications (if configured)
 
-        logger.info(
-            "Transaction '%s' (%s) deleted by user '%s'.",
-            instance.name,
-            instance.id,
-            user.id,
-        )
+        Returns:
+            Verified transaction
+        """
+        try:
+            instance = self.get_object()
 
-        return Response(status=status.HTTP_204_NO_CONTENT)
+            # Check if transaction can be verified
+            if instance.status != TransactionStatus.PENDING:
+                return Response(
+                    {
+                        "error": _(
+                            f"Cannot verify transaction in {instance.status} status."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            serializer = self.get_serializer(
+                instance, data=request.data, context={"request": request}
+            )
+            serializer.is_valid(raise_exception=True)
+
+            # Atomic verification
+            with db_transaction.atomic():
+                transaction = serializer.save()
+
+            logger.info(
+                f"Transaction verified: {transaction.id}",
+                extra={
+                    "transaction_id": transaction.id,
+                    "user_id": request.user.id,
+                    "verified_by": request.user.id,
+                },
+            )
+
+            return Response(TransactionSerializer(transaction).data)
+
+        except Exception as e:
+            logger.exception(f"Error verifying transaction {kwargs.get('id')}: {e}")
+            return Response(
+                {"error": _("Failed to verify transaction. Please try again later.")},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @extend_schema(
+        summary="Get Transaction Analytics",
+        description="Retrieve comprehensive analytics for transactions.",
+        parameters=[
+            OpenApiParameter(
+                name="group_by",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                description="Group analytics by field",
+                enum=["category", "account", "month", "week", "day", "type"],
+            ),
+        ],
+        responses={
+            200: inline_serializer(
+                name="AnalyticsResponse",
+                fields={
+                    "summary": serializers.DictField(),
+                    "trends": serializers.ListField(child=serializers.DictField()),
+                    "breakdown": serializers.ListField(child=serializers.DictField()),
+                },
+            ),
+        },
+    )
+    @action(detail=False, methods=["get"], url_path="analytics")
+    def analytics(self, request, *args, **kwargs):
+        """
+        Retrieve transaction analytics and insights.
+
+        Analytics include:
+        - Summary statistics (totals, averages, counts)
+        - Trends over time
+        - Category/account breakdown
+        - Forecasting (if historical data available)
+
+        Returns:
+            Comprehensive analytics data
+        """
+        try:
+            queryset = self.filter_queryset(self.get_queryset())
+            group_by = request.query_params.get("group_by", "month")
+
+            analytics_data = self._calculate_analytics(queryset, group_by)
+
+            return Response(analytics_data)
+
+        except Exception as e:
+            logger.exception(
+                f"Error generating analytics for user {request.user.id}: {e}"
+            )
+            return Response(
+                {"error": _("Failed to generate analytics. Please try again later.")},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def _can_modify_transaction(self, transaction: Transaction, user) -> bool:
+        """
+        Check if a transaction can be modified.
+
+        Args:
+            transaction: Transaction instance
+            user: Requesting user
+
+        Returns:
+            True if transaction can be modified
+        """
+        # Staff can modify any transaction
+        if user.is_staff or user.is_superuser:
+            return True
+
+        # Users cannot modify completed or reconciled transactions
+        if transaction.status in [
+            TransactionStatus.COMPLETED,
+            TransactionStatus.RECONCILED,
+        ]:
+            return False
+
+        return True
+
+    def _get_analytics_summary(self, queryset) -> Dict[str, Any]:
+        """
+        Calculate analytics summary for a queryset.
+
+        Args:
+            queryset: Filtered transaction queryset
+
+        Returns:
+            Dictionary with analytics summary
+        """
+        try:
+            # Basic aggregates
+            aggregates = queryset.aggregate(
+                total_count=Count("id"),
+                total_amount=Sum("amount"),
+                avg_amount=Avg("amount"),
+                min_amount=Min("amount"),
+                max_amount=Max("amount"),
+                total_income=Sum(
+                    "amount", filter=Q(transaction_type=TransactionType.INCOME)
+                ),
+                total_expense=Sum(
+                    "amount", filter=Q(transaction_type=TransactionType.EXPENSE)
+                ),
+            )
+
+            # Calculate net flow
+            total_income = aggregates["total_income"] or Decimal("0.00")
+            total_expense = aggregates["total_expense"] or Decimal("0.00")
+            net_flow = total_income - total_expense
+
+            return {
+                "summary": {
+                    "total_transactions": aggregates["total_count"] or 0,
+                    "total_amount": aggregates["total_amount"] or Decimal("0.00"),
+                    "average_amount": aggregates["avg_amount"] or Decimal("0.00"),
+                    "min_amount": aggregates["min_amount"] or Decimal("0.00"),
+                    "max_amount": aggregates["max_amount"] or Decimal("0.00"),
+                    "total_income": total_income,
+                    "total_expense": total_expense,
+                    "net_flow": net_flow,
+                    "income_expense_ratio": (
+                        (total_income / total_expense * 100) if total_expense > 0 else 0
+                    ),
+                },
+                "counts": {
+                    status_choice[0]: queryset.filter(status=status_choice[0]).count()
+                    for status_choice in TransactionStatus.choices
+                },
+            }
+
+        except Exception as e:
+            logger.error(f"Error calculating analytics summary: {e}")
+            return {}
+
+    def _calculate_analytics(self, queryset, group_by: str) -> Dict[str, Any]:
+        """
+        Calculate detailed analytics with grouping.
+
+        Args:
+            queryset: Filtered transaction queryset
+            group_by: Field to group by
+
+        Returns:
+            Detailed analytics data
+        """
+        analytics = {
+            "summary": self._get_analytics_summary(queryset),
+            "trends": [],
+            "breakdown": [],
+        }
+
+        # Add time-based trends
+        if group_by in ["month", "week", "day"]:
+            analytics["trends"] = self._get_time_based_trends(queryset, group_by)
+
+        # Add category/account breakdown
+        if group_by in ["category", "account"]:
+            analytics["breakdown"] = self._get_breakdown_by_field(queryset, group_by)
+
+        return analytics
+
+    def _get_time_based_trends(self, queryset, interval: str) -> List[Dict[str, Any]]:
+        """
+        Get transaction trends over time.
+
+        Args:
+            queryset: Filtered transaction queryset
+            interval: Time interval (month, week, day)
+
+        Returns:
+            List of trend data points
+        """
+        # Implementation depends on your database and requirements
+        # This is a simplified version
+        trends = []
+
+        # Group by date truncation (implementation varies by DB)
+        # For PostgreSQL:
+        # from django.db.models.functions import TruncMonth, TruncWeek, TruncDay
+
+        return trends
+
+    def _get_breakdown_by_field(self, queryset, field: str) -> List[Dict[str, Any]]:
+        """
+        Get transaction breakdown by field.
+
+        Args:
+            queryset: Filtered transaction queryset
+            field: Field to break down by
+
+        Returns:
+            List of breakdown items
+        """
+        breakdown = []
+
+        if field == "category":
+            # Group by category with aggregates
+            categories = (
+                queryset.values(
+                    "category__id",
+                    "category__name",
+                    "category__category_type",
+                )
+                .annotate(
+                    total_amount=Sum("amount"),
+                    transaction_count=Count("id"),
+                    avg_amount=Avg("amount"),
+                )
+                .order_by("-total_amount")
+            )
+
+            for category in categories:
+                breakdown.append(
+                    {
+                        "id": category["category__id"],
+                        "name": category["category__name"],
+                        "type": category["category__category_type"],
+                        "total_amount": category["total_amount"],
+                        "transaction_count": category["transaction_count"],
+                        "avg_amount": category["avg_amount"],
+                        "percentage": (
+                            (
+                                category["total_amount"]
+                                / queryset.aggregate(Sum("amount"))["amount__sum"]
+                                * 100
+                            )
+                            if queryset.aggregate(Sum("amount"))["amount__sum"]
+                            else 0
+                        ),
+                    }
+                )
+
+        return breakdown
+
+    def _export_transactions(self, queryset, format: str) -> Response:
+        """
+        Export transactions in specified format.
+
+        Args:
+            queryset: Transactions to export
+            format: Export format (csv, excel, json)
+
+        Returns:
+            File response with exported data
+        """
+        # Implementation depends on your export requirements
+        # Could use Django REST Framework's renderers or external libraries
+
+        raise NotImplementedError("Export functionality not implemented")

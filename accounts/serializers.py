@@ -7,7 +7,7 @@ from rest_framework import serializers, exceptions
 from django.utils.translation import gettext_lazy as _
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
-from django.db import transaction as db_transaction
+from django.db import models, transaction as db_transaction
 
 from core.models import Category, Currency
 from core.serializers import CurrencySerializer
@@ -170,7 +170,7 @@ class AccountSerializer(BaseAccountSerializer):
 
     def get_currency(self, obj: Account) -> Dict[str, Any]:
         """Get currency details for read operations."""
-        from .serializers import CurrencyListSerializer  # Avoid circular import
+        from core.serializers import CurrencyListSerializer  # Avoid circular import
 
         return CurrencyListSerializer(obj.currency).data
 
@@ -881,19 +881,41 @@ class TransactionSerializer(serializers.ModelSerializer):
         queryset=Account.objects.all(),
         required=False,
         allow_null=True,
+        help_text=_("Account associated with this transaction"),
     )
     category = serializers.PrimaryKeyRelatedField(
         queryset=Category.objects.all(),
         required=True,
+        help_text=_("Transaction category (must belong to user)"),
     )
 
-    # Automatically use request.user
-    user = serializers.HiddenField(default=serializers.CurrentUserDefault())
+    # Hidden field - automatically set from request
+    user = serializers.HiddenField(
+        default=serializers.CurrentUserDefault(),
+        help_text=_("Transaction owner (automatically set)"),
+    )
 
-    # Computed Read-Only Fields
-    currency_converted_amount = serializers.SerializerMethodField(read_only=True)
-    is_future_transaction = serializers.SerializerMethodField(read_only=True)
-    display_name = serializers.SerializerMethodField(read_only=True)
+    # === Computed Read-Only Fields ===
+    currency = serializers.SerializerMethodField(
+        read_only=True,
+        help_text=_("Account currency code"),
+    )
+    currency_converted_amount = serializers.SerializerMethodField(
+        read_only=True,
+        help_text=_(
+            "Amount converted to account currency (original_amount * exchange_rate)"
+        ),
+    )
+
+    is_future_transaction = serializers.SerializerMethodField(
+        read_only=True,
+        help_text=_("True if transaction_date is in the future"),
+    )
+
+    display_name = serializers.SerializerMethodField(
+        read_only=True,
+        help_text=_("Formatted display name for UI"),
+    )
 
     class Meta:
         model = Transaction
@@ -910,7 +932,6 @@ class TransactionSerializer(serializers.ModelSerializer):
             "exchange_rate",
             "currency",
             "description",
-            "notes",
             "status",
             "tags",
             "attachments",
@@ -936,27 +957,59 @@ class TransactionSerializer(serializers.ModelSerializer):
 
     # Computed Field Helpers
     @extend_schema_field(serializers.DecimalField(max_digits=18, decimal_places=2))
-    def get_currency_converted_amount(self, obj) -> float:
-        """Return the calculated amount based on original_amount * exchange_rate."""
+    def get_currency_converted_amount(self, obj: Transaction) -> Optional[Decimal]:
+        """
+        Calculate and return converted amount based on original_amount * exchange_rate.
+
+        Args:
+            obj: Transaction instance
+
+        Returns:
+            Converted amount or None if calculation fails
+        """
         try:
             if obj.original_amount and obj.exchange_rate:
                 return round(obj.original_amount * obj.exchange_rate, 2)
             return obj.amount
-        except Exception:
+        except (TypeError, ValueError, AttributeError) as e:
+            logger.error(f"Failed to calculate currency converted amount: {e}")
             return None
 
     @extend_schema_field(serializers.BooleanField())
-    def get_is_future_transaction(self, obj) -> bool:
-        """True if transaction_date is in the future."""
-        return obj.transaction_date > date.today()
+    def get_is_future_transaction(self, obj: Transaction) -> bool:
+        """
+        Determine if transaction date is in the future.
+
+        Args:
+            obj: Transaction instance
+
+        Returns:
+            True if transaction date is in the future
+        """
+        try:
+            return obj.transaction_date > date.today()
+        except (AttributeError, TypeError) as e:
+            logger.error(f"Failed to determine if transaction is future: {e}")
+            return False
 
     @extend_schema_field(serializers.CharField())
-    def get_display_name(self, obj) -> str:
+    def get_display_name(self, obj: Transaction) -> str:
         """
-        Useful display label used in UIs.
-        Example: 'Groceries - 45 USD (expense)'
+        Generate a user-friendly display name for the transaction.
+
+        Format: 'Transaction Name - Amount Currency (Type)'
+
+        Args:
+            obj: Transaction instance
+
+        Returns:
+            Formatted display string
         """
-        return f"{obj.name} - {obj.amount} {obj.currency} ({obj.transaction_type})"
+        try:
+            return f"{obj.name} - {obj.amount} {obj.currency} ({obj.transaction_type})"
+        except AttributeError as e:
+            logger.error(f"Failed to generate display name: {e}")
+            return str(obj.id)
 
     # Field-level Validation
     def validate_amount(self, value):
@@ -982,83 +1035,362 @@ class TransactionSerializer(serializers.ModelSerializer):
         - Account must belong to the user.
         """
         request = self.context["request"]
+        if not request:
+            logger.error("Serializer context missing request object")
+            raise serializers.ValidationError(_("Invalid request context."))
+
         user = request.user
+        instance = getattr(self, "instance", None)
 
-        account = data.get("account")
-        # On updates (PATCH), category might not be present in `data`.
-        # We should get it from the data or from the existing instance.
-        category = data.get("category") or getattr(self.instance, "category", None)
-
-        # Validate account belongs to user
+        # Validate account ownership
+        account = attrs.get("account", getattr(instance, "account", None))
         if account and account.user != user and not user.is_staff:
             logger.warning(
-                f"User {user.id} attempted to use another user's account {account.id}"
+                f"User {user.id} attempted to use account {account.id} owned by {account.user.id}",
+                extra={"user": user.id, "account_user": account.user.id},
             )
             raise serializers.ValidationError(
-                {"account": "You cannot use another user's account."}
+                {"account": _("You cannot use another user's account.")}
             )
 
-        # Validate category belongs to user (unless system category)
-        if category and not category.is_system_category and category.user != user:
-            logger.warning(
-                f"User {user.id} attempted to use another user's category {category.id}"
-            )
-            raise serializers.ValidationError(
-                {"category": "You cannot use another user's category."}
-            )
-
-        # Currency conversion validation
-        exchange_rate = data.get("exchange_rate", Decimal("1"))
-        original_amount = data.get("original_amount")
-        original_currency = data.get("original_currency")
-
-        if exchange_rate != 1:
-            if not original_amount or not original_currency:
+        # Validate category ownership (unless system category)
+        category = attrs.get("category", getattr(instance, "category", None))
+        if category:
+            if (
+                not category.is_system_category
+                and category.user != user
+                and not user.is_staff
+            ):
                 logger.warning(
-                    "Missing original_amount/original_currency for currency conversion"
+                    f"User {user.id} attempted to use category {category.id} owned by {category.user.id}",
+                    extra={"user": user.id, "category_user": category.user.id},
                 )
                 raise serializers.ValidationError(
+                    {"category": _("You cannot use another user's category.")}
+                )
+
+            # Validate category type matches transaction type
+            transaction_type = attrs.get(
+                "transaction_type", getattr(instance, "transaction_type", None)
+            )
+            if transaction_type and category.category_type != transaction_type:
+                raise serializers.ValidationError(
                     {
-                        "original_amount": (
-                            "original_amount & original_currency are required "
-                            "when exchange_rate is not 1."
+                        "category": _(
+                            f"Category type '{category.category_type}' does not match "
+                            f"transaction type '{transaction_type}'."
                         )
                     }
                 )
 
-        return data
+        # Validate currency conversion consistency
+        self._validate_currency_conversion(attrs, instance)
 
-    def create(self, validated_data):
+        # Validate transfer consistency if needed
+        if attrs.get("is_transfer", getattr(instance, "is_transfer", False)):
+            self._validate_transfer(attrs, instance)
+
+        return attrs
+
+    def _validate_transfer(
+        self, attrs: Dict[str, Any], instance: Optional[Transaction]
+    ) -> None:
         """
-        Create a new transaction instance.
+        Validate transfer-specific business rules.
+
+        Args:
+            attrs: Serializer attributes
+            instance: Existing transaction instance
+
+        Raises:
+            serializers.ValidationError: If transfer validation fails
+        """
+        transfer_account = attrs.get(
+            "transfer_account", getattr(instance, "transfer_account", None)
+        )
+        account = attrs.get("account", getattr(instance, "account", None))
+
+        if not transfer_account:
+            raise serializers.ValidationError(
+                {"transfer_account": _("Transfer account is required for transfers.")}
+            )
+
+        if account and transfer_account.id == account.id:
+            raise serializers.ValidationError(
+                {"transfer_account": _("Cannot transfer to the same account.")}
+            )
+
+    def _validate_currency_conversion(
+        self, attrs: Dict[str, Any], instance: Optional[Transaction]
+    ) -> None:
+        """
+        Validate currency conversion field consistency.
+
+        Args:
+            attrs: Serializer attributes
+            instance: Existing transaction instance (if updating)
+
+        Raises:
+            serializers.ValidationError: If currency conversion validation fails
+        """
+        exchange_rate = attrs.get(
+            "exchange_rate", getattr(instance, "exchange_rate", Decimal("1.0"))
+        )
+
+        if exchange_rate != Decimal("1.0"):
+            original_amount = attrs.get(
+                "original_amount", getattr(instance, "original_amount", None)
+            )
+            original_currency = attrs.get(
+                "original_currency", getattr(instance, "original_currency", None)
+            )
+
+            if not original_amount or not original_currency:
+                logger.warning(
+                    "Currency conversion fields missing for exchange_rate != 1.0",
+                    extra={"exchange_rate": exchange_rate},
+                )
+                raise serializers.ValidationError(
+                    {
+                        "original_amount": _(
+                            "Both original_amount and original_currency are required "
+                            "when exchange_rate is not 1.0."
+                        ),
+                        "original_currency": _(
+                            "Both original_amount and original_currency are required "
+                            "when exchange_rate is not 1.0."
+                        ),
+                    }
+                )
+
+            if original_amount <= 0:
+                raise serializers.ValidationError(
+                    {"original_amount": _("Original amount must be positive.")}
+                )
+
+    def create(self, validated_data: Dict[str, Any]) -> Transaction:
+        """
+        Create a new transaction with atomic operation and proper error handling.
+
+        Args:
+            validated_data: Validated transaction data
+
+        Returns:
+            Created transaction instance
+
+        Raises:
+            serializers.ValidationError: If creation fails
         """
         try:
-            transaction = Transaction.objects.create(**validated_data)
-            logger.info(
-                f"Transaction created: {transaction.id} by user {transaction.user_id}"
-            )
-            return transaction
+            with db_transaction.atomic():
+                transaction = Transaction.objects.create(**validated_data)
+
+                # If transaction is completed, update account balance
+                if transaction.status == TransactionStatus.COMPLETED:
+                    self._update_account_balance(transaction)
+
+                logger.info(
+                    f"Transaction created: {transaction.id}",
+                    extra={
+                        "user_id": transaction.user_id,
+                        "account_id": transaction.account_id,
+                        "amount": transaction.amount,
+                    },
+                )
+                return transaction
+
         except Exception as e:
             logger.exception(f"Failed to create transaction: {e}")
             raise serializers.ValidationError(
-                {"error": "Failed to create transaction. Please try again."}
+                {"error": _("Failed to create transaction. Please try again.")}
             )
 
-    def update(self, instance, validated_data):
+    def update(
+        self, instance: Transaction, validated_data: Dict[str, Any]
+    ) -> Transaction:
         """
-        Update an existing transaction instance.
+        Update an existing transaction with atomic operation.
+
+        Args:
+            instance: Existing transaction instance
+            validated_data: Validated update data
+
+        Returns:
+            Updated transaction instance
+
+        Raises:
+            serializers.ValidationError: If update fails
         """
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
         try:
-            instance.full_clean()  # enforce model-level validations
-            instance.save()
-            logger.info(
-                f"Transaction updated: {instance.id} by user {instance.user_id}"
-            )
-            return instance
+            with db_transaction.atomic():
+                # Track status change for balance update
+                old_status = instance.status
+                old_amount = instance.amount
+
+                # Update fields
+                for attr, value in validated_data.items():
+                    setattr(instance, attr, value)
+
+                # Run model validation
+                instance.full_clean()
+
+                # Save the instance
+                instance.save()
+
+                # Update account balance if status changed to COMPLETED
+                if (
+                    old_status != TransactionStatus.COMPLETED
+                    and instance.status == TransactionStatus.COMPLETED
+                ):
+                    self._update_account_balance(instance, old_amount)
+
+                logger.info(
+                    f"Transaction updated: {instance.id}",
+                    extra={
+                        "user_id": instance.user_id,
+                        "account_id": instance.account_id,
+                        "changes": list(validated_data.keys()),
+                    },
+                )
+                return instance
+
         except Exception as e:
-            logger.exception(f"Failed to update transaction: {e}")
+            logger.exception(f"Failed to update transaction {instance.id}: {e}")
             raise serializers.ValidationError(
-                {"error": "Failed to update transaction. Please try again."}
+                {"error": _("Failed to update transaction. Please try again.")}
             )
+
+    def _update_account_balance(
+        self, transaction: Transaction, old_amount: Optional[Decimal] = None
+    ) -> None:
+        """
+        Update account balance based on transaction.
+
+        Args:
+            transaction: The transaction affecting the balance
+            old_amount: Previous amount (for updates)
+        """
+        try:
+            if transaction.account:
+                if old_amount:
+                    # For updates, reverse old amount and apply new amount
+                    reverse_type = (
+                        choices.TransactionType.EXPENSE
+                        if transaction.transaction_type
+                        == choices.TransactionType.INCOME
+                        else choices.TransactionType.INCOME
+                    )
+
+                    # Reverse old amount
+                    transaction.account.update_balance(old_amount, reverse_type)
+
+                # Apply new amount
+                success = transaction.account.update_balance(
+                    transaction.amount, transaction.transaction_type
+                )
+
+                if not success:
+                    logger.error(
+                        f"Failed to update balance for account {transaction.account.id}",
+                        extra={"transaction_id": transaction.id},
+                    )
+
+        except Exception as e:
+            logger.error(f"Error updating account balance: {e}")
+
+    def to_representation(self, instance: Transaction) -> Dict[str, Any]:
+        """
+        Custom representation to include additional computed fields.
+
+        Args:
+            instance: Transaction instance
+
+        Returns:
+            Dictionary representation of the transaction
+        """
+        representation = super().to_representation(instance)
+
+        # Add extra computed properties
+        try:
+            representation["is_verified"] = instance.is_verified
+            representation["converted_amount"] = instance.converted_amount
+        except AttributeError as e:
+            logger.warning(f"Could not add computed properties: {e}")
+
+        return representation
+
+
+class TransactionCreateSerializer(serializers.ModelSerializer):
+    """Serializer for creating transactions with strict validation."""
+
+    class Meta:
+        model = Transaction
+        fields = [
+            "account",
+            "category",
+            "name",
+            "transaction_type",
+            "amount",
+            "original_amount",
+            "original_currency",
+            "exchange_rate",
+            "description",
+            "status",
+            "transaction_date",
+            "is_transfer",
+            "transfer_account",
+        ]
+        extra_kwargs = {
+            "transaction_type": {"required": True},
+            "amount": {"required": True},
+            "transaction_date": {"required": True},
+        }
+
+
+class TransactionUpdateSerializer(serializers.ModelSerializer):
+    """Serializer for updating transactions with business rules."""
+
+    class Meta:
+        model = Transaction
+        fields = [
+            "name",
+            "amount",
+            "description",
+            "status",
+            "transaction_date",
+            "category",
+            "account",
+            "tags",
+            "attachments",
+        ]
+        read_only_fields = ["transaction_type", "is_transfer"]
+
+
+class TransactionBulkCreateSerializer(serializers.Serializer):
+    """Serializer for bulk transaction creation."""
+
+    transactions = serializers.ListField(
+        child=TransactionCreateSerializer(),
+        max_length=1000,  # Prevent excessive bulk operations
+    )
+
+
+class TransactionVerificationSerializer(serializers.ModelSerializer):
+    """Serializer for verifying transactions."""
+
+    class Meta:
+        model = Transaction
+        fields = ["status", "posted_date"]
+        read_only_fields = ["status"]
+
+    def update(self, instance, validated_data):
+        """Mark transaction as verified."""
+        instance.status = TransactionStatus.COMPLETED
+        instance.posted_date = validated_data.get("posted_date")
+        instance.save()
+
+        # Update account balance
+        if instance.account:
+            instance.account.update_balance(instance.amount, instance.transaction_type)
+
+        return instance

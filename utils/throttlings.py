@@ -241,3 +241,12 @@ class SustainedRateThrottle(CustomScopedRateThrottle):
     anon_rate = "500/1d"
     user_rate = "5000/1d"
     premium_rate = "20000/1d"
+
+
+class TransactionThrottle(CustomScopedRateThrottle):
+    """Custom throttle for transaction endpoints."""
+
+    scope = "transaction"
+    anon_rate = "100/1h"
+    user_rate = "100/1h"
+    premium_rate = "100/1h"

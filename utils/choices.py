@@ -24,6 +24,8 @@ class AccountType(models.TextChoices):
     CASH = "Cash", _("Cash")
     INVESTMENT = "Investment", _("Investment")
     LOAN = "Loan", _("Loan")
+    BANK = "Bank", _("Bank")
+    WALLET = "Wallet", _("Wallet")
     OTHER = "Other", _("Other")
 
 
