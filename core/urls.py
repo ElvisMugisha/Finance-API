@@ -8,6 +8,4 @@ router.register(r"currencies", views.CurrencyViewSet, basename="currency")
 router.register(r"categories", views.CategoryViewSet, basename="category")
 
 
-urlpatterns = [
-    path("", include(router.urls)),
-]
+urlpatterns = router.urls
