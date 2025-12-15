@@ -15,13 +15,13 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from core.models import Category, Currency
-from utils import choices, loggings
+from utils import choices, utils, loggings, models as utils_models
 
 # Initialize logger
 logger = loggings.setup_logging()
 
 
-class Account(models.Model):
+class Account(utils_models.BaseModel):
     """
     Account model representing a financial account (e.g., Bank, Cash, Mobile Money).
     """
@@ -34,14 +34,19 @@ class Account(models.Model):
         on_delete=models.CASCADE,
         related_name="accounts",
         db_index=True,
+        help_text=_("Owner of the account"),
     )
     name = models.CharField(
-        max_length=255, help_text=_("Name of the account (e.g., 'Main Checking')")
+        max_length=255,
+        db_index=True,
+        help_text=_("Account name (e.g., 'Main Checking', 'Savings')"),
     )
     account_type = models.CharField(
         max_length=50,
         choices=choices.AccountType.choices,
         default=choices.AccountType.CASH,
+        db_index=True,
+        help_text=_("Type of account"),
     )
     account_number = models.CharField(
         max_length=100,
@@ -55,17 +60,24 @@ class Account(models.Model):
         blank=True,
         help_text=_("Name of the bank or institution"),
     )
+    bank_code = models.CharField(
+        max_length=50, null=True, blank=True, help_text=_("Bank code or routing number")
+    )
 
     # Currency linkage - strictly enforce valid currency from catalog
     currency = models.ForeignKey(
         Currency,
         on_delete=models.PROTECT,  # Prevent deleting currency if accounts use it
         related_name="accounts",
+        help_text=_("Account currency"),
     )
 
     # Balances
     initial_balance = models.DecimalField(
-        max_digits=18, decimal_places=2, default=Decimal("0.00")
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        help_text=_("Starting balance when account was created"),
     )
     current_balance = models.DecimalField(
         max_digits=18,
@@ -73,20 +85,42 @@ class Account(models.Model):
         default=Decimal("0.00"),
         help_text=_("Current calculated balance including all transactions"),
     )
+    reconciled_balance = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text=_("Last reconciled balance"),
+    )
+    reconciled_at = models.DateTimeField(
+        null=True, blank=True, help_text=_("When the account was last reconciled")
+    )
 
-    is_active = models.BooleanField(default=True, db_index=True)
+    is_active = models.BooleanField(
+        default=True, db_index=True, help_text=_("Whether this account is active")
+    )
     is_primary = models.BooleanField(
-        default=False, help_text=_("Whether this is the user's primary account")
+        default=False,
+        db_index=True,
+        help_text=_("Whether this is the user's primary account"),
+    )
+    is_locked = models.BooleanField(
+        default=False,
+        help_text=_("Whether this account is locked (no transactions allowed)"),
     )
 
     institution_data = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text=_("Store generic data for bank integrations"),
+        default=dict, blank=True, help_text=_("Additional data for bank integrations")
     )
-
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    last_synced_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=_("When the account was last synced with external service"),
+    )
+    # Audit trail for balance changes
+    balance_updated_at = models.DateTimeField(
+        null=True, blank=True, help_text=_("When the current balance was last updated")
+    )
 
     class Meta:
         verbose_name = _("Account")
@@ -95,69 +129,301 @@ class Account(models.Model):
         db_table = "accounts"
         indexes = [
             models.Index(fields=["user", "account_type"]),
+            models.Index(fields=["user", "is_active"]),
+            models.Index(fields=["user", "currency"]),
+            models.Index(fields=["user", "is_primary"]),
+            # Composite index for common account queries
+            models.Index(
+                fields=["user", "is_active", "account_type"],
+                name=utils.get_index_name(
+                    "accounts", ["user", "is_active", "account_type"]
+                ),
+            ),
         ]
-        # Ensure name is unique per user to prevent duplicate confusion
         constraints = [
             models.UniqueConstraint(
-                fields=["user", "name"], name="unique_account_name_per_user"
-            )
+                fields=["user", "name"],
+                name=utils.get_index_name("accounts", ["user", "name"]),
+            ),
+            models.CheckConstraint(
+                condition=models.Q(
+                    current_balance__gte=Decimal("-1000000000")
+                ),  # Reasonable minimum
+                name=utils.get_index_name("accounts", ["current_balance"]),
+            ),
         ]
 
-    def __str__(self):
-        """String representation: Name (Currency) - User."""
-        return f"{self.name} ({self.currency.code}) - {self.user}"
+    def __str__(self) -> str:
+        """Human-readable representation."""
+        primary = "★ " if self.is_primary else ""
+        return f"{primary}{self.name} ({self.currency.code}) - {self.user}"
 
-    def clean(self):
+    def clean(self) -> None:
         """
-        Validate model invariants.
+        Validate account fields and business rules.
+
+        Raises:
+            ValidationError: If validation fails
         """
-        super().clean()
-        if self.account_type == choices.AccountType.CASH and self.bank_name:
-            # Not a critical error but logical check
-            pass
+        logger.debug(f"Validating account: {self.name}")
+
+        # Account number validation based on type
+        if self.account_type == choices.AccountType.BANK and not self.account_number:
+            logger.warning(f"Bank account missing account number: {self.name}")
+
+        # Balance validation
+        if self.current_balance < Decimal("-1000000"):  # Arbitrary large negative
+            raise ValidationError(
+                {"current_balance": _("Balance cannot be less than -1,000,000.")}
+            )
+
+        # Institution validation
+        if self.account_type in [choices.AccountType.CASH, choices.AccountType.WALLET]:
+            if self.bank_name or self.account_number:
+                logger.info(
+                    f"Clearing institution details for {self.account_type} account: {self.name}"
+                )
+                self.bank_name = None
+                self.account_number = None
+
+        logger.debug(f"Account validation passed: {self.name}")
 
     def save(self, *args, **kwargs):
         """
-        Override save to handle 'is_primary' logic.
-        If this account is set to primary, unset primary for all other user accounts.
+        Override save to handle primary account logic and balance updates.
         """
-        if self.is_primary:
+        # Handle primary account logic
+        if self.is_primary and self.is_active:
             try:
                 with transaction.atomic():
-                    # Unset primary for other accounts of this user
+                    # Unset primary for other accounts
                     Account.objects.filter(user=self.user, is_primary=True).exclude(
                         id=self.id
                     ).update(is_primary=False)
+
+                    logger.debug(f"Set account as primary: {self.name}")
             except Exception as e:
-                logger.error(
-                    f"Error updating primary account status for user {self.user.id}: {e}"
-                )
-                raise e
+                logger.error(f"Error setting primary account: {e}")
+                raise
+
+        # Update balance timestamp
+        if "current_balance" in self.get_deferred_fields():
+            self.balance_updated_at = timezone.now()
 
         super().save(*args, **kwargs)
-        logger.debug(f"Account saved: {self.name} for user {self.user.id}")
+
+    def update_balance(self, amount: Decimal, transaction_type: str) -> bool:
+        """
+        Update account balance based on transaction.
+
+        Args:
+            amount: Transaction amount (positive)
+            transaction_type: 'income' or 'expense'
+
+        Returns:
+            True if balance updated successfully
+        """
+        if not isinstance(amount, Decimal):
+            try:
+                amount = Decimal(str(amount))
+            except (InvalidOperation, TypeError):
+                logger.error(f"Invalid amount for balance update: {amount}")
+                return False
+
+        if amount <= 0:
+            logger.error(f"Amount must be positive for balance update: {amount}")
+            return False
+
+        try:
+            with transaction.atomic():
+                if transaction_type == choices.TransactionType.INCOME:
+                    self.current_balance += amount
+                elif transaction_type == choices.TransactionType.EXPENSE:
+                    self.current_balance -= amount
+                else:
+                    logger.error(
+                        f"Invalid transaction type for balance update: {transaction_type}"
+                    )
+                    return False
+
+                self.balance_updated_at = timezone.now()
+                self.save(
+                    update_fields=[
+                        "current_balance",
+                        "balance_updated_at",
+                        "updated_at",
+                    ]
+                )
+
+                logger.debug(
+                    f"Updated balance for account {self.id}: {self.current_balance}"
+                )
+                return True
+
+        except Exception as e:
+            logger.error(f"Error updating balance for account {self.id}: {e}")
+            return False
 
     @property
-    def available_balance(self):
+    def available_balance(self) -> Decimal:
         """
-        Calculate available balance.
-        For now, same as current_balance, but can be extended for pending transactions.
+        Calculate available balance (current balance minus any holds).
+
+        For now, same as current_balance. Can be extended for pending transactions.
         """
         return self.current_balance
 
+    @property
+    def formatted_balance(self) -> str:
+        """Get formatted balance with currency symbol."""
+        symbol = self.currency.symbol or self.currency.code
+        return f"{symbol}{self.current_balance:.2f}"
 
-class Transaction(models.Model):
+    def get_balance_history(
+        self, start_date: Optional[date] = None, end_date: Optional[date] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get balance history within date range.
+
+        Args:
+            start_date: Start date (default: 30 days ago)
+            end_date: End date (default: today)
+
+        Returns:
+            List of balance snapshots
+        """
+        from .models import Transaction
+
+        if start_date is None:
+            start_date = timezone.now().date() - timedelta(days=30)
+        if end_date is None:
+            end_date = timezone.now().date()
+
+        try:
+            # Get daily balances from transactions
+            transactions = (
+                Transaction.objects.filter(
+                    account=self,
+                    transaction_date__gte=start_date,
+                    transaction_date__lte=end_date,
+                    status=choices.TransactionStatus.COMPLETED,
+                )
+                .values("transaction_date")
+                .annotate(
+                    day=models.F("transaction_date"),
+                    income=Coalesce(
+                        Sum(
+                            Case(
+                                When(
+                                    transaction_type=choices.TransactionType.INCOME,
+                                    then="amount",
+                                ),
+                                default=Value(0),
+                                output_field=models.DecimalField(),
+                            )
+                        ),
+                        Decimal("0.00"),
+                    ),
+                    expense=Coalesce(
+                        Sum(
+                            Case(
+                                When(
+                                    transaction_type=choices.TransactionType.EXPENSE,
+                                    then="amount",
+                                ),
+                                default=Value(0),
+                                output_field=models.DecimalField(),
+                            )
+                        ),
+                        Decimal("0.00"),
+                    ),
+                )
+                .order_by("day")
+            )
+
+            # Build balance history
+            balance = self.initial_balance
+            history = []
+
+            for tx in transactions:
+                balance += tx["income"] - tx["expense"]
+                history.append(
+                    {
+                        "date": tx["day"],
+                        "balance": balance,
+                        "income": tx["income"],
+                        "expense": tx["expense"],
+                    }
+                )
+
+            return history
+
+        except Exception as e:
+            logger.error(f"Error getting balance history for account {self.id}: {e}")
+            return []
+
+    @classmethod
+    def get_user_primary_account(cls, user_id: uuid.UUID) -> Optional["Account"]:
+        """Get user's primary account."""
+        return cls.objects.filter(
+            user_id=user_id, is_primary=True, is_active=True
+        ).first()
+
+    @classmethod
+    def get_user_accounts_summary(cls, user_id: uuid.UUID) -> Dict[str, Any]:
+        """Get summary of all user accounts."""
+        try:
+            accounts = cls.objects.filter(user_id=user_id, is_active=True)
+
+            total_balance = Decimal("0.00")
+            currency_balances = {}
+
+            for account in accounts:
+                total_balance += account.current_balance
+                currency_code = account.currency.code
+                if currency_code not in currency_balances:
+                    currency_balances[currency_code] = {
+                        "balance": Decimal("0.00"),
+                        "currency": account.currency,
+                        "accounts": [],
+                    }
+                currency_balances[currency_code]["balance"] += account.current_balance
+                currency_balances[currency_code]["accounts"].append(
+                    {
+                        "id": str(account.id),
+                        "name": account.name,
+                        "balance": account.current_balance,
+                        "type": account.account_type,
+                    }
+                )
+
+            return {
+                "total_balance": total_balance,
+                "currency_balances": currency_balances,
+                "account_count": accounts.count(),
+                "primary_account": cls.get_user_primary_account(user_id),
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting accounts summary for user {user_id}: {e}")
+            return {}
+
+
+class Transaction(utils_models.BaseModel):
     """
-    Represents a single financial transaction (income/expense/transfer).
+    Core transaction model with comprehensive financial tracking.
 
-    Key features:
-    - Supports user, account, and category associations.
-    - Handles currency conversion with original amount and exchange rate.
-    - Supports recurring transactions and transfers.
-    - Attachments and tags stored as JSON.
+    Features:
+    - Multi-currency support with automatic conversion
+    - Category and account associations
+    - Transfer tracking
+    - Recurring transaction linking
+    - Comprehensive status tracking
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Ownership
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -165,31 +431,66 @@ class Transaction(models.Model):
         db_index=True,
         help_text=_("Owner of the transaction"),
     )
+
     account = models.ForeignKey(
         Account,
-        on_delete=models.SET_NULL,
+        on_delete=models.PROTECT,  # Changed from SET_NULL for data integrity
+        related_name="transactions",
         null=True,
         blank=True,
-        related_name="transactions",
         db_index=True,
-        help_text=_("Account associated with the transaction, optional"),
+        help_text=_("Account associated with the transaction"),
     )
     category = models.ForeignKey(
         Category,
         on_delete=models.PROTECT,
         related_name="transactions",
         db_index=True,
-        help_text=_("Category of the transaction"),
+        help_text=_("Transaction category"),
     )
+
+    # Recurring transaction link (if applicable)
+    # recurring_transaction = models.ForeignKey(
+    #     "RecurringTransaction",
+    #     on_delete=models.SET_NULL,
+    #     null=True,
+    #     blank=True,
+    #     related_name="generated_transactions",
+    #     help_text=_("Recurring transaction that generated this transaction"),
+    # )
+    recurrence_metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_("Basic recurrence configuration (frequency, interval, etc.)"),
+    )
+
+    # Transfer tracking (for transfers between accounts)
+    transfer_account = models.ForeignKey(
+        Account,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="transfer_transactions",
+        help_text=_("Destination account for transfers"),
+    )
+    transfer_reference = models.UUIDField(
+        null=True,
+        blank=True,
+        help_text=_("Reference to paired transaction in transfer"),
+    )
+
+    # Transaction details
     name = models.CharField(
-        max_length=255, db_index=True, help_text=_("Transaction title or name")
+        max_length=255, db_index=True, help_text=_("Transaction description or name")
     )
     transaction_type = models.CharField(
         max_length=10,
         choices=choices.TransactionType.choices,
         db_index=True,
-        help_text=_("Income or Expense"),
+        help_text=_("Income or expense"),
     )
+
+    # Amounts and currency
     amount = models.DecimalField(
         max_digits=18,
         decimal_places=2,
@@ -202,619 +503,463 @@ class Transaction(models.Model):
         blank=True,
         help_text=_("Original amount before currency conversion"),
     )
-    original_currency = models.CharField(
-        max_length=3,
+    original_currency = models.ForeignKey(
+        Currency,
+        on_delete=models.PROTECT,
         null=True,
         blank=True,
+        related_name="original_transactions",
         help_text=_("Original currency before conversion"),
     )
     exchange_rate = models.DecimalField(
         max_digits=18,
-        decimal_places=6,
+        decimal_places=8,
         default=Decimal("1.0"),
-        help_text=_("Exchange rate from original currency to account currency"),
+        help_text=_("Exchange rate from original to account currency"),
     )
-    currency = models.CharField(
-        max_length=3,
-        default="USD",
-        db_index=True,
-        help_text=_("Currency of the transaction"),
+
+    # Dates
+    transaction_date = models.DateField(
+        default=date.today, db_index=True, help_text=_("Date when transaction occurred")
     )
-    description = models.CharField(max_length=255, null=True, blank=True)
-    notes = models.TextField(null=True, blank=True)
+    posted_date = models.DateField(
+        null=True, blank=True, help_text=_("Date when transaction was posted by bank")
+    )
+
+    # Status
     status = models.CharField(
         max_length=50,
         choices=choices.TransactionStatus.choices,
         default=choices.TransactionStatus.PENDING,
         db_index=True,
+        help_text=_("Transaction status"),
     )
-    tags = models.JSONField(default=list, blank=True)
-    attachments = models.JSONField(default=list, blank=True)
-    is_recurring = models.BooleanField(default=False)
-    is_transfer = models.BooleanField(default=False)
-    transaction_date = models.DateField(default=date.today, db_index=True)
 
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        verbose_name = "Transaction"
-        verbose_name_plural = "Transactions"
-        ordering = ["-transaction_date", "-created_at"]
-        indexes = [
-            models.Index(fields=["user", "transaction_date"]),
-            models.Index(fields=["account", "transaction_date"]),
-            models.Index(fields=["category", "transaction_type"]),
-            models.Index(fields=["status"]),
-        ]
-
-    def __str__(self):
-        return f"{self.name} ({self.get_transaction_type_display()}) - {self.amount} {self.currency}"
-
-    def clean(self):
-        """
-        Validate:
-        - Amount must be positive
-        - Exchange rate must be positive
-        - Original amount and currency must be set if exchange_rate != 1
-        """
-        logger.debug(f"Validating transaction: {self.id} for user {self.user_id}")
-
-        if self.amount <= 0:
-            logger.warning("Transaction amount must be positive")
-            raise ValidationError({"amount": _("Amount must be a positive value.")})
-
-        if self.exchange_rate <= 0:
-            logger.warning("Transaction exchange_rate must be positive")
-            raise ValidationError(
-                {"exchange_rate": _("Exchange rate must be positive.")}
-            )
-
-        if self.original_amount and self.original_amount <= 0:
-            logger.warning("Original amount must be positive if set")
-            raise ValidationError(
-                {"original_amount": _("Original amount must be positive if provided.")}
-            )
-
-        if self.exchange_rate != 1 and (
-            not self.original_amount or not self.original_currency
-        ):
-            logger.warning(
-                "Original amount and currency must be provided for currency conversion"
-            )
-            raise ValidationError(
-                {
-                    "original_amount": _(
-                        "Original amount and original currency must be set if exchange rate != 1."
-                    )
-                }
-            )
-
-
-class RecurringTransaction(models.Model):
-    """
-    Model for managing repeating income or expenses.
-
-    Examples:
-        - Monthly salary
-        - Rent payments
-        - Subscription services
-        - Loan repayments
-
-    Key Features:
-        - Flexible scheduling (daily, weekly, monthly, etc.)
-        - Support for end dates or max occurrences
-        - Automatic next occurrence calculation
-        - Graceful error handling for generation failures
-    """
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="recurring_transactions",
-        db_index=True,
-        help_text=_("User who owns this recurring transaction"),
+    # Metadata
+    description = models.TextField(
+        null=True, blank=True, help_text=_("Detailed description")
     )
-    account = models.ForeignKey(
-        Account,
-        on_delete=models.SET_NULL,
+    merchant = models.CharField(
+        max_length=255,
         null=True,
         blank=True,
-        related_name="recurring_transactions",
-        help_text=_("Account to use for generated transactions (optional)"),
-    )
-    category = models.ForeignKey(
-        Category,
-        on_delete=models.PROTECT,
-        related_name="recurring_transactions",
-        help_text=_("Category for generated transactions"),
-    )
-
-    # Transaction details
-    name = models.CharField(
-        max_length=255, help_text=_("Name of the recurring transaction")
-    )
-    transaction_type = models.CharField(
-        max_length=10,
-        choices=choices.TransactionType.choices,
         db_index=True,
-        help_text=_("Type of transaction (income or expense)"),
+        help_text=_("Merchant or payee name"),
     )
-    amount = models.DecimalField(
-        max_digits=18, decimal_places=2, help_text=_("Amount for each occurrence")
+    location = models.CharField(
+        max_length=500, null=True, blank=True, help_text=_("Transaction location")
     )
-    currency = models.CharField(
-        max_length=3,
-        default="USD",
-        db_index=True,
-        help_text=_("Currency code (ISO 4217)"),
-    )
-    description = models.CharField(
-        max_length=255, blank=True, null=True, help_text=_("Short description")
-    )
-    notes = models.TextField(
-        blank=True, null=True, help_text=_("Additional notes or details")
-    )
-
-    # Scheduling configuration
-    frequency = models.CharField(
-        max_length=20,
-        choices=choices.FrequencyType.choices,
-        default=choices.FrequencyType.MONTHLY,
-        help_text=_("How often the transaction repeats"),
-    )
-    interval = models.PositiveIntegerField(
-        default=1, help_text=_("Every N periods (e.g., 2 for every 2 weeks)")
-    )
-    day_of_month = models.PositiveIntegerField(
+    reference_number = models.CharField(
+        max_length=100,
         null=True,
         blank=True,
-        validators=[MinValueValidator(1), MaxValueValidator(31)],
-        help_text=_("Day of month for monthly transactions (1-31)"),
-    )
-    day_of_week = models.PositiveIntegerField(
-        null=True,
-        blank=True,
-        validators=[MinValueValidator(1), MaxValueValidator(7)],
-        choices=[
-            (i, day)
-            for i, day in enumerate(
-                [
-                    "Monday",
-                    "Tuesday",
-                    "Wednesday",
-                    "Thursday",
-                    "Friday",
-                    "Saturday",
-                    "Sunday",
-                ],
-                1,
-            )
-        ],
-        help_text=_("Day of week for weekly transactions"),
-    )
-
-    # Date management
-    start_date = models.DateField(
-        default=timezone.now,
-        help_text=_("Date when recurring transactions should start"),
-    )
-    end_date = models.DateField(
-        null=True,
-        blank=True,
-        help_text=_("Optional end date for the recurring transaction"),
-    )
-    next_occurrence = models.DateField(
-        db_index=True, help_text=_("Next date when transaction should be generated")
-    )
-
-    # Occurrence tracking
-    occurrences_created = models.PositiveIntegerField(
-        default=0, help_text=_("Number of transactions already generated")
-    )
-    max_occurrences = models.PositiveIntegerField(
-        null=True, blank=True, help_text=_("Maximum number of occurrences (optional)")
-    )
-
-    # Status and metadata
-    is_transfer = models.BooleanField(
-        default=False, help_text=_("Whether this is a transfer between accounts")
-    )
-    is_active = models.BooleanField(
-        default=True,
         db_index=True,
-        help_text=_("Whether this recurring transaction is active"),
+        help_text=_("Bank or payment reference number"),
     )
+
+    # Tags and attachments
     tags = models.JSONField(
-        default=list, blank=True, help_text=_("Tags for categorization")
+        default=list, blank=True, help_text=_("Tags for categorization and filtering")
     )
     attachments = models.JSONField(
-        default=list,
-        blank=True,
-        help_text=_("Attachment metadata (paths, descriptions)"),
+        default=list, blank=True, help_text=_("Metadata for attached files")
+    )
+
+    # Flags
+    is_recurring = models.BooleanField(
+        default=False, help_text=_("Whether this is part of a recurring transaction")
+    )
+    is_transfer = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text=_("Whether this is a transfer between accounts"),
+    )
+    needs_review = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text=_("Whether this transaction needs manual review"),
+    )
+    is_tax_deductible = models.BooleanField(
+        default=False, help_text=_("Whether this expense is tax deductible")
     )
 
     # Audit fields
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    last_generated_at = models.DateTimeField(
-        null=True, blank=True, help_text=_("When the last transaction was generated")
+    imported_at = models.DateTimeField(
+        null=True, blank=True, help_text=_("When this transaction was imported")
+    )
+    imported_source = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+        help_text=_("Source of import (e.g., 'CSV', 'Bank API')"),
     )
 
     class Meta:
-        verbose_name = _("Recurring Transaction")
-        verbose_name_plural = _("Recurring Transactions")
-        ordering = ["next_occurrence", "-created_at"]
-        db_table = "recurring_transactions"
+        verbose_name = _("Transaction")
+        verbose_name_plural = _("Transactions")
+        ordering = ["-transaction_date", "-created_at"]
+        db_table = "transactions"
         indexes = [
-            models.Index(fields=["user", "is_active", "next_occurrence"]),
-            models.Index(fields=["user", "frequency"]),
-            models.Index(fields=["next_occurrence", "is_active"]),
+            # Common filtering patterns
+            models.Index(fields=["user", "transaction_date"]),
+            models.Index(fields=["account", "transaction_date"]),
+            models.Index(fields=["category", "transaction_date"]),
+            models.Index(fields=["status", "transaction_date"]),
+            models.Index(fields=["transaction_type", "transaction_date"]),
+            # Composite indexes for performance
+            models.Index(
+                fields=["user", "status", "transaction_date"],
+                name=utils.get_index_name(
+                    "transactions", ["user", "status", "transaction_date"]
+                ),
+            ),
+            models.Index(
+                fields=["account", "status", "transaction_date"],
+                name=utils.get_index_name(
+                    "transactions", ["account", "status", "transaction_date"]
+                ),
+            ),
         ]
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(amount__gt=0),
-                name="recurring_transaction_amount_positive",
+                name=utils.get_index_name("transactions", ["amount"]),
             ),
             models.CheckConstraint(
-                condition=models.Q(interval__gte=1),
-                name="recurring_transaction_interval_minimum",
-            ),
-            models.CheckConstraint(
-                condition=models.Q(end_date__isnull=True)
-                | models.Q(end_date__gt=models.F("start_date")),
-                name="recurring_transaction_valid_end_date",
+                condition=models.Q(exchange_rate__gt=0),
+                name=utils.get_index_name("transactions", ["exchange_rate"]),
             ),
         ]
 
     def __str__(self) -> str:
-        """Human-readable string representation."""
-        return f"{self.name} - {self.amount} {self.currency} ({self.get_frequency_display()})"
+        """Human-readable representation."""
+        return f"{self.name} - {self.amount} {self.account.currency.code}"
 
     def clean(self) -> None:
         """
-        Validate the recurring transaction configuration.
-
-        Raises:
-            ValidationError: If configuration is invalid
-
-        Logs:
-            Warnings for questionable configurations
-        """
-        logger.debug(f"Validating recurring transaction: {self.id}")
-
-        # Validate amount
-        if self.amount <= 0:
-            logger.error(
-                f"Recurring transaction amount must be positive: {self.amount}"
-            )
-            raise ValidationError({"amount": _("Amount must be greater than zero.")})
-
-        # Validate interval
-        if self.interval < 1:
-            logger.error(f"Invalid interval: {self.interval}")
-            raise ValidationError({"interval": _("Interval must be at least 1.")})
-
-        # Validate date logic
-        if self.end_date and self.end_date <= self.start_date:
-            logger.error(
-                f"End date must be after start date: {self.start_date} -> {self.end_date}"
-            )
-            raise ValidationError({"end_date": _("End date must be after start date.")})
-
-        # Frequency-specific validations
-        if self.frequency == choices.FrequencyType.MONTHLY and not self.day_of_month:
-            logger.warning("Monthly recurring transaction without day_of_month set")
-            # Default to start date's day if not set
-            if not self.day_of_month:
-                self.day_of_month = self.start_date.day
-
-        if self.frequency == choices.FrequencyType.WEEKLY and not self.day_of_week:
-            logger.warning("Weekly recurring transaction without day_of_week set")
-            # Default to start date's weekday if not set
-            if not self.day_of_week:
-                # Monday=1, Sunday=7
-                self.day_of_week = self.start_date.isoweekday()
-
-        # Validate day_of_month for monthly
-        if self.day_of_month and self.day_of_month > 31:
-            logger.error(f"Invalid day_of_month: {self.day_of_month}")
-            raise ValidationError(
-                {"day_of_month": _("Day of month must be between 1 and 31.")}
-            )
-
-        # Set next occurrence if not set
-        if not self.next_occurrence:
-            self.next_occurrence = self.start_date
-
-        logger.debug(f"Recurring transaction validation passed: {self.id}")
-
-    def save(self, *args, **kwargs) -> None:
-        """
-        Save with validation and automatic next occurrence calculation.
+        Validate transaction fields and business rules.
 
         Raises:
             ValidationError: If validation fails
-            DatabaseError: If database constraints are violated
         """
-        try:
-            self.full_clean()
+        logger.debug(f"Validating transaction: {self.id}")
 
-            with transaction.atomic():
-                # Ensure next_occurrence is calculated
-                if not self.next_occurrence:
-                    self.next_occurrence = self.calculate_next_occurrence()
+        # Amount validation
+        if self.amount <= 0:
+            raise ValidationError({"amount": _("Amount must be positive.")})
 
-                super().save(*args, **kwargs)
-                logger.info(f"Recurring transaction saved: {self.id} - {self.name}")
-
-        except ValidationError as ve:
-            logger.error(f"Validation failed for recurring transaction {self.id}: {ve}")
-            raise
-        except DatabaseError as de:
-            logger.error(f"Database error saving recurring transaction {self.id}: {de}")
-            raise
-        except Exception as e:
-            logger.error(
-                f"Unexpected error saving recurring transaction {self.id}: {e}"
+        # Exchange rate validation
+        if self.exchange_rate <= 0:
+            raise ValidationError(
+                {"exchange_rate": _("Exchange rate must be positive.")}
             )
-            raise
 
-    def calculate_next_occurrence(self, from_date: Optional[date] = None) -> date:
-        """
-        Calculate the next occurrence date based on frequency and interval.
-
-        Args:
-            from_date: Date to calculate from (defaults to next_occurrence or today)
-
-        Returns:
-            Calculated next occurrence date
-
-        Raises:
-            ValueError: If frequency type is invalid
-        """
-        if from_date is None:
-            from_date = self.next_occurrence or timezone.now().date()
-
-        logger.debug(
-            f"Calculating next occurrence from {from_date} with frequency {self.frequency}"
-        )
-
-        try:
-            if self.frequency == choices.FrequencyType.DAILY:
-                return from_date + timedelta(days=self.interval)
-
-            elif self.frequency == choices.FrequencyType.WEEKLY:
-                days_to_add = self.interval * 7
-                return from_date + timedelta(days=days_to_add)
-
-            elif self.frequency == choices.FrequencyType.BI_WEEKLY:
-                return from_date + timedelta(weeks=2 * self.interval)
-
-            elif self.frequency == choices.FrequencyType.MONTHLY:
-                # Handle month arithmetic
-                year = from_date.year
-                month = from_date.month + self.interval
-
-                # Adjust year if month exceeds 12
-                while month > 12:
-                    month -= 12
-                    year += 1
-
-                # Handle day_of_month (e.g., 31st in February)
-                max_day = self._get_days_in_month(year, month)
-                day = min(self.day_of_month or from_date.day, max_day)
-
-                return date(year, month, day)
-
-            elif self.frequency == choices.FrequencyType.QUARTERLY:
-                months_to_add = self.interval * 3
-                year = from_date.year
-                month = from_date.month + months_to_add
-
-                while month > 12:
-                    month -= 12
-                    year += 1
-
-                max_day = self._get_days_in_month(year, month)
-                day = min(self.day_of_month or from_date.day, max_day)
-
-                return date(year, month, day)
-
-            elif self.frequency == choices.FrequencyType.YEARLY:
-                year = from_date.year + self.interval
-                month = from_date.month
-                day = from_date.day
-
-                # Handle leap year for Feb 29
-                if month == 2 and day == 29:
-                    # Check if target year is leap year
-                    if not self._is_leap_year(year):
-                        day = 28
-
-                return date(year, month, day)
-
-            else:
-                logger.error(f"Invalid frequency type: {self.frequency}")
-                raise ValueError(f"Invalid frequency type: {self.frequency}")
-
-        except Exception as e:
-            logger.error(f"Error calculating next occurrence for {self.id}: {e}")
-            # Fallback to adding 30 days
-            return from_date + timedelta(days=30)
-
-    def _get_days_in_month(self, year: int, month: int) -> int:
-        """Helper to get number of days in a month."""
-        if month == 2:
-            return 29 if self._is_leap_year(year) else 28
-        elif month in [4, 6, 9, 11]:
-            return 30
-        else:
-            return 31
-
-    def _is_leap_year(self, year: int) -> bool:
-        """Helper to check if a year is a leap year."""
-        return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
-
-    def should_generate_today(self) -> bool:
-        """Check if a transaction should be generated today."""
-        today = timezone.now().date()
-
-        # Check if we're past the end date
-        if self.end_date and today > self.end_date:
-            return False
-
-        # Check max occurrences
-        if self.max_occurrences and self.occurrences_created >= self.max_occurrences:
-            return False
-
-        # Check if today is the next occurrence
-        return today >= self.next_occurrence
-
-    def generate_transaction(self) -> Optional["Transaction"]:
-        """
-        Generate a transaction instance from this recurring template.
-
-        Returns:
-            Transaction instance (unsaved) or None if generation fails
-
-        Logs:
-            Success/failure of transaction generation
-        """
-        logger.info(f"Generating transaction from recurring template: {self.id}")
-
-        try:
-            if not self.should_generate_today():
-                logger.debug(f"Not generating transaction for {self.id} - not due yet")
-                return None
-
-            # Create transaction instance
-            transaction_data = {
-                "user": self.user,
-                "account": self.account,
-                "category": self.category,
-                "name": self.name,
-                "transaction_type": self.transaction_type,
-                "amount": self.amount,
-                "currency": self.currency,
-                "description": self.description
-                or f"Auto-generated from recurring: {self.name}",
-                "notes": self.notes,
-                "is_transfer": self.is_transfer,
-                "tags": self.tags.copy(),
-                "attachments": self.attachments.copy(),
-                "transaction_date": self.next_occurrence,
-                "status": choices.TransactionStatus.COMPLETED,
-            }
-
-            # Create transaction (don't save yet - let caller decide)
-            from .models import Transaction
-
-            generated_transaction = Transaction(**transaction_data)
-
-            # Update recurring transaction
-            self.occurrences_created += 1
-            self.last_generated_at = timezone.now()
-            self.next_occurrence = self.calculate_next_occurrence(self.next_occurrence)
-
-            # Check if we should deactivate
-            if (self.end_date and self.next_occurrence > self.end_date) or (
-                self.max_occurrences
-                and self.occurrences_created >= self.max_occurrences
-            ):
-                self.is_active = False
-                logger.info(
-                    f"Deactivating recurring transaction {self.id} - limit reached"
+        # Currency conversion validation
+        if self.exchange_rate != Decimal("1.0"):
+            if not self.original_amount or not self.original_currency:
+                raise ValidationError(
+                    {
+                        "original_amount": _(
+                            "Original amount and currency required when exchange rate != 1."
+                        ),
+                        "original_currency": _(
+                            "Original amount and currency required when exchange rate != 1."
+                        ),
+                    }
                 )
 
-            # Save recurring transaction updates
-            self.save(
-                update_fields=[
-                    "occurrences_created",
-                    "last_generated_at",
-                    "next_occurrence",
-                    "is_active",
-                    "updated_at",
-                ]
+            if self.original_amount <= 0:
+                raise ValidationError(
+                    {"original_amount": _("Original amount must be positive.")}
+                )
+
+        # Transfer validation
+        if self.is_transfer:
+            if not self.transfer_account:
+                raise ValidationError(
+                    {"transfer_account": _("Transfer account required for transfers.")}
+                )
+
+            if self.transfer_account.id == self.account.id:
+                raise ValidationError(
+                    {"transfer_account": _("Cannot transfer to the same account.")}
+                )
+
+        # Date validation
+        if self.posted_date and self.posted_date < self.transaction_date:
+            logger.warning(
+                f"Posted date earlier than transaction date: {self.posted_date} < {self.transaction_date}"
             )
 
-            logger.info(f"Successfully generated transaction from {self.id}")
-            return generated_transaction
+        # Category type validation
+        if self.category.category_type != self.transaction_type:
+            raise ValidationError(
+                {
+                    "category": _(
+                        f"Category type ({self.category.category_type}) "
+                        f"does not match transaction type ({self.transaction_type})."
+                    )
+                }
+            )
 
-        except Exception as e:
-            logger.error(f"Failed to generate transaction from {self.id}: {e}")
-            return None
+        logger.debug(f"Transaction validation passed: {self.id}")
 
-    @classmethod
-    def generate_due_transactions(
-        cls, user_id: Optional[uuid.UUID] = None
-    ) -> Dict[str, Any]:
+    def save(self, *args, **kwargs):
         """
-        Generate all due transactions for a user or all users.
-
-        Args:
-            user_id: Optional user ID to limit generation
-
-        Returns:
-            Dictionary with generation statistics
+        Override save to handle balance updates and transfer logic.
         """
-        logger.info(f"Generating due transactions for user: {user_id or 'all users'}")
-
-        query = Q(is_active=True, next_occurrence__lte=timezone.now().date())
-        if user_id:
-            query &= Q(user_id=user_id)
-
-        stats = {
-            "total_processed": 0,
-            "successful": 0,
-            "failed": 0,
-            "generated_transactions": [],
-            "errors": [],
-        }
+        is_new = self.pk is None
 
         try:
-            recurring_transactions = cls.objects.filter(query).select_related(
-                "user", "account", "category"
-            )
+            with transaction.atomic():
+                # Save the transaction first
+                super().save(*args, **kwargs)
 
-            for recurring in recurring_transactions:
-                stats["total_processed"] += 1
-
-                try:
-                    with transaction.atomic():
-                        generated = recurring.generate_transaction()
-                        if generated:
-                            # Save the generated transaction
-                            generated.save()
-                            stats["successful"] += 1
-                            stats["generated_transactions"].append(str(generated.id))
-                            logger.debug(
-                                f"Generated transaction {generated.id} from {recurring.id}"
-                            )
-                        else:
-                            stats["failed"] += 1
-                            logger.warning(f"Failed to generate from {recurring.id}")
-
-                except Exception as e:
-                    stats["failed"] += 1
-                    stats["errors"].append(
-                        {"recurring_id": str(recurring.id), "error": str(e)}
+                # Update account balance if transaction is completed
+                if self.status == choices.TransactionStatus.COMPLETED:
+                    success = self.account.update_balance(
+                        self.amount, self.transaction_type
                     )
-                    logger.error(f"Error generating from {recurring.id}: {e}")
 
-            logger.info(
-                f"Generation complete: {stats['successful']} successful, {stats['failed']} failed"
-            )
-            return stats
+                    if not success:
+                        logger.error(
+                            f"Failed to update balance for transaction {self.id}"
+                        )
+
+                    # Handle transfer logic
+                    if self.is_transfer and self.transfer_account:
+                        self._create_transfer_pair()
+
+                # Update category usage stats
+                if is_new:
+                    self.category.update_usage_stats()
+
+                logger.info(f"Transaction saved: {self.id} - {self.name}")
 
         except Exception as e:
-            logger.error(f"Failed to generate due transactions: {e}")
-            stats["errors"].append({"batch_error": str(e)})
-            return stats
+            logger.error(f"Error saving transaction {self.id}: {e}")
+            raise
+
+    def _create_transfer_pair(self) -> None:
+        """Create paired transaction for transfers."""
+        try:
+            # Calculate amount in transfer account's currency
+            transfer_amount = self._calculate_transfer_amount()
+
+            if not transfer_amount:
+                logger.error(
+                    f"Cannot calculate transfer amount for transaction {self.id}"
+                )
+                return
+
+            # Create the paired transaction
+            paired_transaction = Transaction.objects.create(
+                user=self.user,
+                account=self.transfer_account,
+                category=self.category,
+                name=f"Transfer: {self.name}",
+                transaction_type=(
+                    choices.TransactionType.INCOME
+                    if self.transaction_type == choices.TransactionType.EXPENSE
+                    else choices.TransactionType.EXPENSE
+                ),
+                amount=transfer_amount,
+                original_amount=self.original_amount,
+                original_currency=self.original_currency,
+                exchange_rate=self.exchange_rate,
+                transaction_date=self.transaction_date,
+                status=self.status,
+                is_transfer=True,
+                transfer_account=self.account,
+                transfer_reference=self.id,
+                description=f"Transfer from {self.account.name}",
+            )
+
+            # Update reference
+            self.transfer_reference = paired_transaction.id
+            self.save(update_fields=["transfer_reference", "updated_at"])
+
+            logger.debug(
+                f"Created transfer pair: {self.id} <-> {paired_transaction.id}"
+            )
+
+        except Exception as e:
+            logger.error(f"Error creating transfer pair for transaction {self.id}: {e}")
+
+    def _calculate_transfer_amount(self) -> Optional[Decimal]:
+        """Calculate transfer amount in destination account's currency."""
+        try:
+            if self.account.currency.id == self.transfer_account.currency.id:
+                # Same currency, no conversion needed
+                return self.amount
+
+            # Convert through base currency
+            base_currency = Currency.get_base_currency()
+            if not base_currency:
+                logger.error("No base currency configured")
+                return None
+
+            # Convert source amount to base currency
+            if self.account.currency.is_base_currency:
+                amount_in_base = self.amount
+            else:
+                amount_in_base = self.amount / self.account.currency.exchange_rate
+
+            # Convert from base to destination currency
+            if self.transfer_account.currency.is_base_currency:
+                return amount_in_base
+            else:
+                return amount_in_base * self.transfer_account.currency.exchange_rate
+
+        except Exception as e:
+            logger.error(f"Error calculating transfer amount: {e}")
+            return None
+
+    @property
+    def converted_amount(self) -> Decimal:
+        """Get converted amount in account currency."""
+        if self.original_amount and self.exchange_rate != Decimal("1.0"):
+            return self.original_amount * self.exchange_rate
+        return self.amount
+
+    @property
+    def is_verified(self) -> bool:
+        """Check if transaction is verified (completed or reconciled)."""
+        return self.status in [
+            choices.TransactionStatus.COMPLETED,
+            choices.TransactionStatus.RECONCILED,
+        ]
+
+    def verify(self, user) -> bool:
+        """
+        Verify and complete a transaction.
+
+        Args:
+            user: User performing the verification
+
+        Returns:
+            True if verification successful
+        """
+        if self.status != choices.TransactionStatus.PENDING:
+            logger.warning(f"Transaction {self.id} already in status {self.status}")
+            return False
+
+        try:
+            self.status = choices.TransactionStatus.COMPLETED
+            self.save(update_fields=["status", "updated_at"])
+
+            # Update account balance
+            self.account.update_balance(self.amount, self.transaction_type)
+
+            logger.info(f"Transaction {self.id} verified by user {user.id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error verifying transaction {self.id}: {e}")
+            return False
+
+    def reconcile(self, reconciled_amount: Optional[Decimal] = None) -> bool:
+        """
+        Reconcile the transaction.
+
+        Args:
+            reconciled_amount: Reconciled amount (if different)
+
+        Returns:
+            True if reconciliation successful
+        """
+        try:
+            self.status = choices.TransactionStatus.RECONCILED
+
+            if reconciled_amount and reconciled_amount != self.amount:
+                # Update with reconciled amount
+                self.amount = reconciled_amount
+                logger.info(
+                    f"Transaction {self.id} reconciled with new amount: {reconciled_amount}"
+                )
+
+            self.save(update_fields=["status", "amount", "updated_at"])
+            logger.info(f"Transaction {self.id} reconciled")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error reconciling transaction {self.id}: {e}")
+            return False
+
+    @classmethod
+    def get_user_transactions_summary(
+        cls,
+        user_id: uuid.UUID,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> Dict[str, Any]:
+        """
+        Get transaction summary for a user.
+
+        Args:
+            user_id: User UUID
+            start_date: Start date
+            end_date: End date
+
+        Returns:
+            Transaction summary
+        """
+        try:
+            query = cls.objects.filter(
+                user_id=user_id, status=choices.TransactionStatus.COMPLETED
+            )
+
+            if start_date:
+                query = query.filter(transaction_date__gte=start_date)
+            if end_date:
+                query = query.filter(transaction_date__lte=end_date)
+
+            summary = query.aggregate(
+                total_income=Coalesce(
+                    Sum(
+                        Case(
+                            When(
+                                transaction_type=choices.TransactionType.INCOME,
+                                then="amount",
+                            ),
+                            default=Value(0),
+                            output_field=models.DecimalField(),
+                        )
+                    ),
+                    Decimal("0.00"),
+                ),
+                total_expense=Coalesce(
+                    Sum(
+                        Case(
+                            When(
+                                transaction_type=choices.TransactionType.EXPENSE,
+                                then="amount",
+                            ),
+                            default=Value(0),
+                            output_field=models.DecimalField(),
+                        )
+                    ),
+                    Decimal("0.00"),
+                ),
+                transaction_count=Count("id"),
+            )
+
+            net_flow = summary["total_income"] - summary["total_expense"]
+
+            return {
+                "total_income": summary["total_income"],
+                "total_expense": summary["total_expense"],
+                "net_flow": net_flow,
+                "transaction_count": summary["transaction_count"],
+                "period": {"start": start_date, "end": end_date},
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting transactions summary for user {user_id}: {e}")
+            return {}
 
 
-class Budget(models.Model):
+class Budget(utils_models.BaseModel):
     """
     Budget model for financial planning and tracking.
 
@@ -920,8 +1065,6 @@ class Budget(models.Model):
     )
 
     # Audit fields
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
-    updated_at = models.DateTimeField(auto_now=True)
     last_recalculated_at = models.DateTimeField(
         null=True, blank=True, help_text=_("When spending was last recalculated")
     )
@@ -940,16 +1083,16 @@ class Budget(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(total_budget__gt=0),
-                name="budget_total_budget_positive",
+                name=utils.get_index_name("budgets", ["total_budget"]),
             ),
             models.CheckConstraint(
                 condition=models.Q(end_date__gt=models.F("start_date")),
-                name="budget_end_date_after_start_date",
+                name=utils.get_index_name("budgets", ["end_date", "start_date"]),
             ),
             models.UniqueConstraint(
                 fields=["user", "name"],
                 condition=models.Q(is_active=True),
-                name="unique_active_budget_name_per_user",
+                name=utils.get_index_name("budgets", ["user", "name", "is_active"]),
             ),
         ]
 
@@ -1189,7 +1332,7 @@ class BudgetCategory(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(allocated_amount__gt=0),
-                name="budget_category_allocated_amount_positive",
+                name=utils.get_index_name("budget_categories", ["allocated_amount"]),
             ),
         ]
 
@@ -1242,7 +1385,7 @@ class BudgetCategory(models.Model):
             return Decimal("0.00")
 
 
-class FinancialGoal(models.Model):
+class FinancialGoal(utils_models.BaseModel):
     """
     Model for tracking financial goals and savings targets.
 
@@ -1345,10 +1488,6 @@ class FinancialGoal(models.Model):
         help_text=_("Account linked to this goal (optional)"),
     )
 
-    # Audit fields
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
     class Meta:
         verbose_name = _("Financial Goal")
         verbose_name_plural = _("Financial Goals")
@@ -1363,15 +1502,17 @@ class FinancialGoal(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(target_amount__gt=0),
-                name="financial_goal_target_amount_positive",
+                name=utils.get_index_name("financial_goals", ["target_amount"]),
             ),
             models.CheckConstraint(
                 condition=models.Q(current_amount__gte=0),
-                name="financial_goal_current_amount_non_negative",
+                name=utils.get_index_name("financial_goals", ["current_amount"]),
             ),
             models.CheckConstraint(
                 condition=models.Q(target_date__gt=models.F("start_date")),
-                name="financial_goal_target_date_after_start",
+                name=utils.get_index_name(
+                    "financial_goals", ["target_date", "start_date"]
+                ),
             ),
         ]
 
@@ -1556,7 +1697,7 @@ class FinancialGoal(models.Model):
             return {"error": str(e)}
 
 
-class Report(models.Model):
+class Report(utils_models.BaseModel):
     """
     Model for storing generated financial reports.
 
@@ -1643,9 +1784,6 @@ class Report(models.Model):
         help_text=_("When this report should be automatically deleted"),
     )
 
-    # Audit fields
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
-    updated_at = models.DateTimeField(auto_now=True)
     generated_at = models.DateTimeField(
         null=True, blank=True, help_text=_("When the report was generated")
     )
@@ -1664,7 +1802,7 @@ class Report(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(period_end__gt=models.F("period_start")),
-                name="report_period_end_after_start",
+                name=utils.get_index_name("reports", ["period_end", "period_start"]),
             ),
         ]
 

@@ -1,6 +1,7 @@
 import random
 from datetime import timedelta
 
+from django.db import connection
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.mail import EmailMessage
@@ -280,3 +281,34 @@ def format_expiry_time(expiry_datetime):
         parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
 
     return ", ".join(parts)
+
+
+def get_index_name(table_name: str, fields: List[str]) -> str:
+    """
+    Get appropriate index name based on database backend.
+
+    Args:
+        table_name: Table name
+        fields: List of field names
+
+    Returns:
+        Database-appropriate index name
+    """
+    vendor = connection.vendor
+
+    if vendor == "sqlite":
+        # SQLite: ≤ 30 chars
+        base_name = f"idx_{table_name[:8]}_{'_'.join(f[:3] for f in fields)}"
+        return base_name[:30]
+
+    elif vendor == "postgresql":
+        # PostgreSQL: ≤ 63 chars, can be descriptive
+        return f"idx_{table_name}_{'_'.join(fields)}"
+
+    elif vendor == "mysql":
+        # MySQL: ≤ 64 chars
+        return f"idx_{table_name[:10]}_{'_'.join(fields)}"[:64]
+
+    else:
+        # Default: safe 30 chars
+        return f"idx_{table_name[:8]}_{'_'.join(f[:3] for f in fields)}"[:30]

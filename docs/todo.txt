@@ -18,3 +18,6 @@ Next Steps:
     - Report generation (can be slow)
     - Email notifications
     - Data aggregation
+
+4. Add Django Signals for automatic operations (balance updates, stats)
+5. Create Management Commands for batch operations
