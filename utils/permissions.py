@@ -74,45 +74,36 @@ class IsAdminOrReadOnly(BaseUserPermission):
         return request.user.is_superuser
 
 
-class IsOwnerOrAdmin(permissions.BasePermission):
+class IsOwnerOrAdmin(BaseUserPermission):
     """
-    Object-level permission:
-    - Admins (superuser or staff) have full access.
-    - Regular users can only access objects they own.
+    Custom permission to only allow account owners or admins to access.
+
+    Rules:
+    - Superusers and staff can access any account
+    - Regular users can only access their own accounts
+    - All users must be active and verified
     """
 
-    message = "You do not have permission to access or modify this resource."
-
-    def has_permission(self, request, view):
-        # Basic auth check
-        if not request.user or not request.user.is_authenticated:
-            self.message = "Authentication credentials were not provided."
-            return False
-
-        if not request.user.is_active:
-            self.message = "User account is not active."
-            return False
-
-        if not request.user.is_verified:
-            self.message = "User account is not verified."
-            return False
-
-        return True
+    message = "You do not have permission to access this account."
 
     def has_object_permission(self, request, view, obj):
-        user = request.user
-
-        # Admins always allowed
-        if user.is_superuser or user.is_staff:
-            return True
-
-        # Must have a "user" attribute
-        if not hasattr(obj, "user"):
-            self.message = "This object does not have an owner field."
+        """Check permission for specific account object."""
+        if not self._check_user(request):
             return False
 
-        # Regular users can access only their own objects
-        return obj.user == user
+        # Staff/Admin can do anything
+        if request.user.is_staff or request.user.is_superuser:
+            return True
+
+        # Regular users can only access their own accounts
+        if obj.user == request.user:
+            return True
+
+        logger.warning(
+            f"Permission denied: User {request.user.id} attempted to access "
+            f"account {obj.id} owned by user {obj.user.id}"
+        )
+        return False
 
 
 class CategoryPermission(BaseUserPermission):
