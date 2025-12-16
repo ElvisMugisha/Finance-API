@@ -55,7 +55,7 @@ class CurrencySerializer(serializers.ModelSerializer):
             "id",
             "exchange_source",
             "exchange_updated_at",
-            "is_base_currency",  # Should be managed through admin or special endpoint
+            # "is_base_currency",  # Managed via custom validation/logic
             "created_at",
             "updated_at",
             "historical_rates",  # Protected - only updated through batch operations
@@ -871,7 +871,7 @@ class CategorySerializer(BaseCategorySerializer):
         read_only_fields = [
             "id",
             "user",
-            "is_system_category",
+            # "is_system_category",  # Managed via custom validation
             "transaction_count",
             "last_used_at",
             "created_at",
@@ -1296,6 +1296,11 @@ class CategoryBulkUpdateSerializer(serializers.Serializer):
             )
 
         return attrs
+
+    def _get_request_user(self) -> Optional[models.Model]:
+        """Safely get request user from context."""
+        request = self.context.get("request")
+        return request.user if request and request.user.is_authenticated else None
 
     def create(self, validated_data: Dict[str, Any]) -> Dict[str, Any]:
         """
