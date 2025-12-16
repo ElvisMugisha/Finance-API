@@ -5,6 +5,12 @@ from rest_framework import viewsets, status, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.exceptions import (
+    PermissionDenied,
+    ValidationError,
+    NotAuthenticated,
+    NotFound,
+)
 
 from django.db import models, transaction as db_transaction
 from django.utils import timezone
@@ -660,6 +666,8 @@ class CategoryViewSet(
 
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
+        except (PermissionDenied, NotAuthenticated, NotFound, ValidationError) as e:
+            raise e
         except Exception as e:
             logger.exception(f"Error creating category: {e}")
             return Response(
@@ -793,6 +801,8 @@ class CategoryViewSet(
 
             return Response(serializer.data)
 
+        except (PermissionDenied, NotAuthenticated, NotFound, ValidationError) as e:
+            raise e
         except Exception as e:
             logger.exception(f"Error updating category: {e}")
             return Response(
@@ -847,6 +857,8 @@ class CategoryViewSet(
 
             return Response(serializer.data)
 
+        except (PermissionDenied, NotAuthenticated, NotFound, ValidationError) as e:
+            raise e
         except Exception as e:
             logger.exception(f"Error partially updating category: {e}")
             return Response(
@@ -891,6 +903,8 @@ class CategoryViewSet(
 
             return Response(status=status.HTTP_204_NO_CONTENT)
 
+        except (PermissionDenied, NotAuthenticated, NotFound, ValidationError) as e:
+            raise e
         except Exception as e:
             logger.exception(f"Error deleting category: {e}")
             return Response(
@@ -1009,6 +1023,8 @@ class CategoryViewSet(
 
             return Response(result)
 
+        except (PermissionDenied, NotAuthenticated, NotFound, ValidationError) as e:
+            raise e
         except Exception as e:
             logger.exception(f"Error in bulk update: {e}")
             return Response(

@@ -9,7 +9,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import DatabaseError, models, transaction
-from django.db.models import Q, Sum, Case, When, Value
+from django.db.models import Q, Sum, Case, When, Value, Count
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -692,7 +692,10 @@ class Transaction(utils_models.BaseModel):
             )
 
         # Category type validation
-        if self.category.category_type != self.transaction_type:
+        if (
+            not self.is_transfer
+            and self.category.category_type != self.transaction_type
+        ):
             raise ValidationError(
                 {
                     "category": _(
@@ -709,82 +712,135 @@ class Transaction(utils_models.BaseModel):
         Override save to handle balance updates and transfer logic.
         """
         is_new = self.pk is None
+        old_status = None
+        old_amount = None
 
-        try:
-            with transaction.atomic():
-                # Save the transaction first
-                super().save(*args, **kwargs)
+        # Check update_fields to avoid unnecessary balance processing
+        update_fields = kwargs.get("update_fields")
+        should_check_balance = True
+        if update_fields is not None:
+            if "status" not in update_fields and "amount" not in update_fields:
+                should_check_balance = False
 
-                # Update account balance if transaction is completed
-                if self.status == choices.TransactionStatus.COMPLETED:
-                    success = self.account.update_balance(
-                        self.amount, self.transaction_type
+        if not is_new and should_check_balance:
+            try:
+                # Get current DB state
+                old_instance = Transaction.objects.get(pk=self.pk)
+                old_status = old_instance.status
+                old_amount = old_instance.amount
+            except Transaction.DoesNotExist:
+                pass
+
+        # Save first
+        super().save(*args, **kwargs)
+
+        # Handle Balance Updates
+        if should_check_balance:
+            amount_diff = Decimal("0.00")
+            completed_states = [
+                choices.TransactionStatus.COMPLETED,
+                choices.TransactionStatus.RECONCILED,
+            ]
+
+            is_completed = self.status in completed_states
+
+            if is_new:
+                if is_completed:
+                    amount_diff = self.amount
+            else:
+                was_completed = old_status in completed_states if old_status else False
+
+                if not was_completed and is_completed:
+                    # Became completed
+                    amount_diff = self.amount
+                elif was_completed and not is_completed:
+                    # Un-completed (e.g. reverted to pending)
+                    amount_diff = -old_amount if old_amount else -self.amount
+                elif was_completed and is_completed:
+                    # Changed amount while staying completed
+                    current_amount = self.amount
+                    previous_amount = (
+                        old_amount if old_amount is not None else self.amount
                     )
+                    if current_amount != previous_amount:
+                        amount_diff = current_amount - previous_amount
 
-                    if not success:
-                        logger.error(
-                            f"Failed to update balance for transaction {self.id}"
-                        )
+            if amount_diff != 0:
+                print(
+                    f"DEBUG: Balance update for Tx {self.id}. Diff: {amount_diff}. Old Status: {old_status}, New Status: {self.status}"
+                )
+                # Apply update manually to support negative diffs (reversals)
+                if self.transaction_type == choices.TransactionType.INCOME:
+                    self.account.current_balance += amount_diff
+                elif self.transaction_type == choices.TransactionType.EXPENSE:
+                    self.account.current_balance -= amount_diff
 
-                    # Handle transfer logic
-                    if self.is_transfer and self.transfer_account:
-                        self._create_transfer_pair()
+                self.account.balance_updated_at = timezone.now()
+                self.account.save(
+                    update_fields=[
+                        "current_balance",
+                        "balance_updated_at",
+                        "updated_at",
+                    ]
+                )
 
-                # Update category usage stats
-                if is_new:
-                    self.category.update_usage_stats()
+        # Handle transfer logic
+        if (
+            self.is_transfer
+            and self.transfer_account
+            and not self.transfer_reference
+            and self.status == choices.TransactionStatus.COMPLETED
+        ):
+            self._create_transfer_pair()
 
-                logger.info(f"Transaction saved: {self.id} - {self.name}")
-
-        except Exception as e:
-            logger.error(f"Error saving transaction {self.id}: {e}")
-            raise
+        # Update category usage stats
+        if is_new:
+            self.category.update_usage_stats()
 
     def _create_transfer_pair(self) -> None:
         """Create paired transaction for transfers."""
-        try:
-            # Calculate amount in transfer account's currency
-            transfer_amount = self._calculate_transfer_amount()
+        # Calculate amount in transfer account's currency
+        transfer_amount = self._calculate_transfer_amount()
 
-            if not transfer_amount:
-                logger.error(
-                    f"Cannot calculate transfer amount for transaction {self.id}"
-                )
-                return
+        if not transfer_amount:
+            print(f"DEBUG: Cannot calculate transfer amount for {self.id}")
+            return
 
-            # Create the paired transaction
-            paired_transaction = Transaction.objects.create(
-                user=self.user,
-                account=self.transfer_account,
-                category=self.category,
-                name=f"Transfer: {self.name}",
-                transaction_type=(
-                    choices.TransactionType.INCOME
-                    if self.transaction_type == choices.TransactionType.EXPENSE
-                    else choices.TransactionType.EXPENSE
-                ),
-                amount=transfer_amount,
-                original_amount=self.original_amount,
-                original_currency=self.original_currency,
-                exchange_rate=self.exchange_rate,
-                transaction_date=self.transaction_date,
-                status=self.status,
-                is_transfer=True,
-                transfer_account=self.account,
-                transfer_reference=self.id,
-                description=f"Transfer from {self.account.name}",
-            )
+        # Determine paired type
+        paired_type = (
+            choices.TransactionType.INCOME
+            if self.transaction_type == choices.TransactionType.EXPENSE
+            else choices.TransactionType.EXPENSE
+        )
 
-            # Update reference
-            self.transfer_reference = paired_transaction.id
-            self.save(update_fields=["transfer_reference", "updated_at"])
+        print(
+            f"DEBUG: Creating transfer pair for {self.id} -> {self.transfer_account.id}"
+        )
 
-            logger.debug(
-                f"Created transfer pair: {self.id} <-> {paired_transaction.id}"
-            )
+        # Create the paired transaction
+        paired_transaction = Transaction.objects.create(
+            user=self.user,
+            account=self.transfer_account,
+            category=self.category,
+            name=f"Transfer: {self.name}",
+            transaction_type=paired_type,
+            amount=transfer_amount,
+            original_amount=self.original_amount,
+            original_currency=self.original_currency,
+            exchange_rate=self.exchange_rate,
+            transaction_date=self.transaction_date,
+            status=self.status,
+            is_transfer=True,
+            transfer_account=self.account,
+            transfer_reference=self.id,  # Link back to this one
+            description=f"Transfer from {self.account.name}",
+        )
 
-        except Exception as e:
-            logger.error(f"Error creating transfer pair for transaction {self.id}: {e}")
+        # Update this transaction's reference
+        Transaction.objects.filter(pk=self.pk).update(
+            transfer_reference=paired_transaction.id
+        )
+        self.transfer_reference = paired_transaction.id
 
     def _calculate_transfer_amount(self) -> Optional[Decimal]:
         """Calculate transfer amount in destination account's currency."""
@@ -796,7 +852,7 @@ class Transaction(utils_models.BaseModel):
             # Convert through base currency
             base_currency = Currency.get_base_currency()
             if not base_currency:
-                logger.error("No base currency configured")
+                print("DEBUG: No base currency configured")
                 return None
 
             # Convert source amount to base currency
@@ -812,7 +868,7 @@ class Transaction(utils_models.BaseModel):
                 return amount_in_base * self.transfer_account.currency.exchange_rate
 
         except Exception as e:
-            logger.error(f"Error calculating transfer amount: {e}")
+            print(f"DEBUG: Error calculating transfer amount: {e}")
             return None
 
     @property
@@ -841,22 +897,14 @@ class Transaction(utils_models.BaseModel):
             True if verification successful
         """
         if self.status != choices.TransactionStatus.PENDING:
-            logger.warning(f"Transaction {self.id} already in status {self.status}")
             return False
 
-        try:
-            self.status = choices.TransactionStatus.COMPLETED
-            self.save(update_fields=["status", "updated_at"])
+        self.status = choices.TransactionStatus.COMPLETED
+        # Save will handle balance update via logic above
+        self.save(update_fields=["status", "updated_at"])
 
-            # Update account balance
-            self.account.update_balance(self.amount, self.transaction_type)
-
-            logger.info(f"Transaction {self.id} verified by user {user.id}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error verifying transaction {self.id}: {e}")
-            return False
+        logger.info(f"Transaction {self.id} verified by user {user.id}")
+        return True
 
     def reconcile(self, reconciled_amount: Optional[Decimal] = None) -> bool:
         """
@@ -868,23 +916,18 @@ class Transaction(utils_models.BaseModel):
         Returns:
             True if reconciliation successful
         """
-        try:
-            self.status = choices.TransactionStatus.RECONCILED
+        self.status = choices.TransactionStatus.RECONCILED
+        update_fields = ["status", "updated_at"]
 
-            if reconciled_amount and reconciled_amount != self.amount:
-                # Update with reconciled amount
-                self.amount = reconciled_amount
-                logger.info(
-                    f"Transaction {self.id} reconciled with new amount: {reconciled_amount}"
-                )
+        if reconciled_amount and reconciled_amount != self.amount:
+            self.amount = reconciled_amount
+            update_fields.append("amount")
 
-            self.save(update_fields=["status", "amount", "updated_at"])
-            logger.info(f"Transaction {self.id} reconciled")
-            return True
+        # Save will handle balance update if amount changed or status changed (e.g. pending->reconciled)
+        self.save(update_fields=update_fields)
 
-        except Exception as e:
-            logger.error(f"Error reconciling transaction {self.id}: {e}")
-            return False
+        logger.info(f"Transaction {self.id} reconciled")
+        return True
 
     @classmethod
     def get_user_transactions_summary(
@@ -904,59 +947,54 @@ class Transaction(utils_models.BaseModel):
         Returns:
             Transaction summary
         """
-        try:
-            query = cls.objects.filter(
-                user_id=user_id, status=choices.TransactionStatus.COMPLETED
-            )
+        query = cls.objects.filter(
+            user_id=user_id, status=choices.TransactionStatus.COMPLETED
+        )
 
-            if start_date:
-                query = query.filter(transaction_date__gte=start_date)
-            if end_date:
-                query = query.filter(transaction_date__lte=end_date)
+        if start_date:
+            query = query.filter(transaction_date__gte=start_date)
+        if end_date:
+            query = query.filter(transaction_date__lte=end_date)
 
-            summary = query.aggregate(
-                total_income=Coalesce(
-                    Sum(
-                        Case(
-                            When(
-                                transaction_type=choices.TransactionType.INCOME,
-                                then="amount",
-                            ),
-                            default=Value(0),
-                            output_field=models.DecimalField(),
-                        )
-                    ),
-                    Decimal("0.00"),
+        summary = query.aggregate(
+            total_income=Coalesce(
+                Sum(
+                    Case(
+                        When(
+                            transaction_type=choices.TransactionType.INCOME,
+                            then="amount",
+                        ),
+                        default=Value(0),
+                        output_field=models.DecimalField(),
+                    )
                 ),
-                total_expense=Coalesce(
-                    Sum(
-                        Case(
-                            When(
-                                transaction_type=choices.TransactionType.EXPENSE,
-                                then="amount",
-                            ),
-                            default=Value(0),
-                            output_field=models.DecimalField(),
-                        )
-                    ),
-                    Decimal("0.00"),
+                Decimal("0.00"),
+            ),
+            total_expense=Coalesce(
+                Sum(
+                    Case(
+                        When(
+                            transaction_type=choices.TransactionType.EXPENSE,
+                            then="amount",
+                        ),
+                        default=Value(0),
+                        output_field=models.DecimalField(),
+                    )
                 ),
-                transaction_count=Count("id"),
-            )
+                Decimal("0.00"),
+            ),
+            transaction_count=Count("id"),
+        )
 
-            net_flow = summary["total_income"] - summary["total_expense"]
+        net_flow = summary["total_income"] - summary["total_expense"]
 
-            return {
-                "total_income": summary["total_income"],
-                "total_expense": summary["total_expense"],
-                "net_flow": net_flow,
-                "transaction_count": summary["transaction_count"],
-                "period": {"start": start_date, "end": end_date},
-            }
-
-        except Exception as e:
-            logger.error(f"Error getting transactions summary for user {user_id}: {e}")
-            return {}
+        return {
+            "total_income": summary["total_income"],
+            "total_expense": summary["total_expense"],
+            "net_flow": net_flow,
+            "transaction_count": summary["transaction_count"],
+            "period": {"start": start_date, "end": end_date},
+        }
 
 
 class Budget(utils_models.BaseModel):

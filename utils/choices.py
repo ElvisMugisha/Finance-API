@@ -37,6 +37,7 @@ class TransactionType(models.TextChoices):
 class TransactionStatus(models.TextChoices):
     COMPLETED = "Completed", _("Completed")
     PENDING = "Pending", _("Pending")
+    RECONCILED = "Reconciled", _("Reconciled")
     CANCELED = "Canceled", _("Canceled")
 
 

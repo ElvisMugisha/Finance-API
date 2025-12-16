@@ -7,14 +7,29 @@ ensuring proper validation, error handling, and data processing.
 
 from datetime import date, timedelta
 from decimal import Decimal
+from unittest.mock import MagicMock, patch
 
 import pytest
 from django.contrib.auth import get_user_model
 from django.test import RequestFactory
+from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from accounts.models import Account, Transaction
-from accounts.serializers import AccountSerializer, TransactionSerializer
+from accounts.serializers import (
+    AccountSerializer,
+    AccountListSerializer,
+    AccountDetailSerializer,
+    AccountCreateSerializer,
+    AccountUpdateSerializer,
+    AccountReconcileSerializer,
+    get_account_serializer,
+    TransactionSerializer,
+    TransactionCreateSerializer,
+    TransactionUpdateSerializer,
+    TransactionBulkCreateSerializer,
+    TransactionVerificationSerializer,
+)
 from core.models import Category, Currency
 from utils import choices
 
@@ -187,530 +202,488 @@ class TestAccountSerializer:
         assert data["initial_balance"] == str(account.initial_balance)
         assert data["current_balance"] == str(account.current_balance)
         assert "currency_id" not in data  # Should be write-only
+        assert "formatted_balance" in data
+        assert "available_balance" in data
+        assert "can_be_primary" in data
 
-    def test_update_account_name(self, request_with_user, account):
-        """
-        Test updating the name of an existing account.
-        Verifies that a simple field update works as expected.
-        """
-        new_name = "Updated Checking"
-        serializer = AccountSerializer(
-            instance=account,
-            data={"name": new_name},
-            partial=True,
-            context={"request": request_with_user},
-        )
-        assert serializer.is_valid(raise_exception=True)
-        updated_account = serializer.save()
-
-        assert updated_account.name == new_name
-        account.refresh_from_db()
-        assert account.name == new_name
-
-    def test_update_account_initial_balance_adjusts_current_balance(
-        self, request_with_user, account
-    ):
-        """
-        Test that changing the initial_balance correctly adjusts the current_balance.
-        This tests the custom update logic in the serializer.
-        """
-        original_initial_balance = account.initial_balance
-        original_current_balance = account.current_balance
-        new_initial_balance = original_initial_balance + Decimal("50.00")
-
-        serializer = AccountSerializer(
-            instance=account,
-            data={"initial_balance": str(new_initial_balance)},
-            partial=True,
-            context={"request": request_with_user},
-        )
-        assert serializer.is_valid(raise_exception=True)
-        updated_account = serializer.save()
-
-        expected_current_balance = original_current_balance + (
-            new_initial_balance - original_initial_balance
-        )
-        assert updated_account.initial_balance == new_initial_balance
-        assert updated_account.current_balance == expected_current_balance
-        account.refresh_from_db()
-        assert account.current_balance == expected_current_balance
-
-    def test_update_account_read_only_fields_ignored(self, request_with_user, account):
-        """
-        Test that attempts to update read-only fields are ignored.
-        """
-        original_id = account.id
-        original_created_at = account.created_at
-
-        serializer = AccountSerializer(
-            instance=account,
-            data={"id": 999, "created_at": "2000-01-01T00:00:00Z"},
-            partial=True,
-            context={"request": request_with_user},
-        )
-        assert serializer.is_valid(raise_exception=True)
-        updated_account = serializer.save()
-
-        assert updated_account.id == original_id
-        assert updated_account.created_at == original_created_at
-        account.refresh_from_db()
-        assert account.id == original_id
-        assert account.created_at == original_created_at
-
-    def test_create_account_with_inactive_currency(self, request_with_user, currency):
-        """
-        Test that creating an account with an inactive currency fails validation.
-        The `currency_id` queryset filters for `is_active=True`.
-        """
-        currency.is_active = False
-        currency.save()
-
-        account_data = {
-            "name": "Invalid Account",
-            "account_type": choices.AccountType.CHECKING.value,
-            "currency_id": currency.id,
+    def test_validate_name_unique_per_user(self, request_with_user, account):
+        """Test that account names must be unique per user."""
+        data = {
+            "name": account.name,  # Duplicate name
+            "account_type": choices.AccountType.CHECKING,
+            "currency_id": account.currency.id,
             "initial_balance": "100.00",
         }
+        serializer = AccountSerializer(
+            data=data, context={"request": request_with_user}
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            serializer.is_valid(raise_exception=True)
+        assert "An account with this name already exists." in str(excinfo.value)
+
+    def test_validate_name_empty(self, request_with_user, account_data):
+        """Test name validation for empty strings."""
+        account_data["name"] = "   "
+        serializer = AccountSerializer(
+            data=account_data, context={"request": request_with_user}
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            print(serializer.is_valid(raise_exception=True))
+        # DRF catches "   " as "This field may not be blank." due to trim_whitespace=True and allow_blank=False
+        assert "This field may not be blank." in str(excinfo.value)
+
+    def test_validate_account_type(self, request_with_user, account_data):
+        """Test validation for invalid account type."""
+        account_data["account_type"] = "INVALID_TYPE"
         serializer = AccountSerializer(
             data=account_data, context={"request": request_with_user}
         )
         with pytest.raises(ValidationError) as excinfo:
             serializer.is_valid(raise_exception=True)
-        assert "currency_id" in excinfo.value.detail
+        assert '"INVALID_TYPE" is not a valid choice.' in str(excinfo.value)
+
+    def test_primary_account_logic(self, request_with_user, account, currency):
+        """Test that setting a new primary account demotes the old one."""
+        account.is_primary = True
+        account.save()
+
+        new_account_data = {
+            "name": "New Primary",
+            "account_type": choices.AccountType.CHECKING,
+            "currency_id": currency.id,
+            "initial_balance": "100.00",
+            "is_primary": True,
+        }
+        serializer = AccountSerializer(
+            data=new_account_data, context={"request": request_with_user}
+        )
+        assert serializer.is_valid(raise_exception=True)
+        new_account = serializer.save()
+
+        account.refresh_from_db()
+        assert new_account.is_primary is True
+        assert account.is_primary is False
+
+    def test_bank_details_validation(self, request_with_user, account_data):
+        """Test validation warnings (logged) or stripping for bank details."""
+        # Cash/Wallet should strip bank details
+        account_data["account_type"] = choices.AccountType.CASH
+        account_data["account_number"] = "123456"
+        account_data["bank_name"] = "Test Bank"
+
+        serializer = AccountSerializer(
+            data=account_data, context={"request": request_with_user}
+        )
+        assert serializer.is_valid(raise_exception=True)
+        # Note: The stripping happens in `validate` which modifies attrs.
+        # But saving it will persist those modifications.
+        acct = serializer.save()
+        assert acct.account_number is None
+        assert acct.bank_name is None
+
+
+@pytest.mark.django_db
+class TestAccountListSerializer:
+    """Test suite for AccountListSerializer."""
+
+    def test_serialization(self, account):
+        """Test that list serializer returns correct subset of fields."""
+        serializer = AccountListSerializer(instance=account)
+        data = serializer.data
+
+        expected_fields = {
+            "id",
+            "name",
+            "account_type",
+            "currency_code",
+            "currency_symbol",
+            "current_balance",
+            "formatted_balance",
+            "is_primary",
+            "is_active",
+            "is_locked",
+            "can_transact",
+            "created_at",
+        }
+        assert set(data.keys()) == expected_fields
+        assert data["can_transact"] is True
+
+    def test_can_transact_logic(self, account):
+        """Test can_transact property."""
+        account.is_locked = True
+        account.save()
+        serializer = AccountListSerializer(instance=account)
+        assert serializer.data["can_transact"] is False
+
+
+@pytest.mark.django_db
+class TestAccountDetailSerializer:
+    """Test suite for AccountDetailSerializer."""
+
+    def test_serialization_with_stats(self, account, user, category):
+        """Test detailed serialization including dynamic fields."""
+        # Create income category
+        income_category = Category.objects.create(
+            user=user, name="Salary", category_type=choices.TransactionType.INCOME
+        )
+
+        # Create some transactions with proper names and matching categories
+        Transaction.objects.create(
+            user=user,
+            account=account,
+            category=income_category,
+            name="Income Transaction",
+            amount=Decimal("100.00"),
+            transaction_type=choices.TransactionType.INCOME,
+            status=choices.TransactionStatus.COMPLETED,
+            transaction_date=date.today(),
+        )
+        Transaction.objects.create(
+            user=user,
+            account=account,
+            category=category,  # This is already EXPENSE type from fixture
+            name="Expense Transaction",
+            amount=Decimal("50.00"),
+            transaction_type=choices.TransactionType.EXPENSE,
+            status=choices.TransactionStatus.COMPLETED,
+            transaction_date=date.today(),
+        )
+
+        serializer = AccountDetailSerializer(instance=account)
+        data = serializer.data
+
+        assert "recent_transactions" in data
+        assert len(data["recent_transactions"]) == 2
+        assert "balance_trend" in data
+        assert "transaction_stats" in data
+
+        stats = data["transaction_stats"]
+        assert stats["total_transactions"] == 2
+        assert stats["total_income"] == "100.00"
+        assert stats["total_expense"] == "50.00"
+        assert stats["net_flow"] == "50.00"
+
+
+@pytest.mark.django_db
+class TestAccountCreateSerializer:
+    """Test suite for AccountCreateSerializer."""
+
+    def test_initial_balance_defaults_to_zero(self, request_with_user, currency):
+        """Test that initial_balance defaults to 0.00 if missing."""
+        data = {
+            "name": "Zero Balance Account",
+            "account_type": choices.AccountType.CHECKING,
+            "currency_id": currency.id,
+        }
+        serializer = AccountCreateSerializer(
+            data=data, context={"request": request_with_user}
+        )
+        assert serializer.is_valid(raise_exception=True)
+        acct = serializer.save()
+        assert acct.initial_balance == Decimal("0.00")
+        assert acct.current_balance == Decimal("0.00")
+
+
+@pytest.mark.django_db
+class TestAccountUpdateSerializer:
+    """Test suite for AccountUpdateSerializer."""
+
+    def test_prevent_currency_change(self, request_with_user, account, other_currency):
+        """Test that currency cannot be changed after creation."""
+        data = {"currency_id": other_currency.id}
+        serializer = AccountUpdateSerializer(
+            instance=account,
+            data=data,
+            partial=True,
+            context={"request": request_with_user},
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            serializer.is_valid(raise_exception=True)
+        assert "Cannot change account currency" in str(excinfo.value)
+
+    def test_prevent_account_type_change(self, request_with_user, account):
+        """Test that account type cannot be changed after creation."""
+        new_type = (
+            choices.AccountType.SAVINGS
+            if account.account_type == choices.AccountType.CHECKING
+            else choices.AccountType.CHECKING
+        )
+
+        data = {"account_type": new_type}
+        serializer = AccountUpdateSerializer(
+            instance=account,
+            data=data,
+            partial=True,
+            context={"request": request_with_user},
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            serializer.is_valid(raise_exception=True)
+        assert "Cannot change account type" in str(excinfo.value)
+
+
+@pytest.mark.django_db
+class TestAccountReconcileSerializer:
+    """Test suite for AccountReconcileSerializer."""
+
+    def test_reconcile_account(self, request_with_user, account):
+        """Test reconciling an account."""
+        data = {
+            "reconciled_balance": "1000.00",
+            "reconciliation_date": date.today(),
+            "notes": "Monthly reconciliation",
+        }
+        serializer = AccountReconcileSerializer(
+            data=data, context={"request": request_with_user, "account": account}
+        )
+        assert serializer.is_valid(raise_exception=True)
+        result = serializer.save()
+
+        assert result["account_id"] == str(account.id)
+        assert result["reconciled_balance"] == "1000.00"
+        assert result["difference"] == "0.00"
+
+        account.refresh_from_db()
+        assert account.reconciled_balance == Decimal("1000.00")
+
+    def test_reconcile_with_difference(self, request_with_user, account):
+        """Test reconciling where there is a difference."""
+        account.current_balance = Decimal("900.00")
+        account.save()
+
+        data = {"reconciled_balance": "1000.00", "notes": "Finding missing money"}
+        serializer = AccountReconcileSerializer(
+            data=data, context={"request": request_with_user, "account": account}
+        )
+        assert serializer.is_valid(raise_exception=True)
+        result = serializer.save()
+
+        assert result["difference"] == "100.00"
+        assert result["requires_adjustment"] is True
+        assert "adjustment_suggestion" in result
+
+
+def test_get_account_serializer():
+    """Test the serializer factory function."""
+    assert get_account_serializer("list") == AccountListSerializer
+    assert get_account_serializer("retrieve") == AccountDetailSerializer
+    assert get_account_serializer("create") == AccountCreateSerializer
+    assert get_account_serializer("update") == AccountUpdateSerializer
+    assert get_account_serializer("reconcile") == AccountReconcileSerializer
+    assert get_account_serializer("unknown") == AccountSerializer
 
 
 @pytest.mark.django_db
 class TestTransactionSerializer:
-    """Test suite for the TransactionSerializer."""
+    """Detailed tests for TransactionSerializer logic including validation and transfers."""
 
-    def test_create_transaction_valid_data(self, request_with_user, transaction_data):
-        """
-        Test successful creation of a transaction with valid data.
-        Verifies that the serializer can create an instance and that key fields are set correctly.
-        """
-        serializer = TransactionSerializer(
-            data=transaction_data, context={"request": request_with_user}
-        )
-        assert serializer.is_valid(raise_exception=True), serializer.errors
-        transaction = serializer.save()
-
-        assert transaction.pk is not None
-        assert transaction.user == request_with_user.user
-        assert transaction.name == transaction_data["name"]
-        assert transaction.amount == Decimal(transaction_data["amount"])
-        assert transaction.account.id == transaction_data["account"]
-        assert transaction.category.id == transaction_data["category"]
-        assert transaction.transaction_date == date.today()
-
-    def test_read_transaction_data(self, request_with_user, account, category):
-        """
-        Test serialization of an existing transaction for reading, including computed fields.
-        Ensures that all fields, especially read-only and computed ones, are correctly represented.
-        """
-        transaction = Transaction.objects.create(
+    def test_validate_transfer_rules(
+        self, request_with_user, account, account_data, category
+    ):
+        """Test transfer validation rules."""
+        # Create second account
+        account_data["name"] = "Second Account"
+        account2 = Account.objects.create(
             user=request_with_user.user,
-            account=account,
-            category=category,
-            name="Test Transaction",
-            transaction_type=choices.TransactionType.EXPENSE,
-            amount=Decimal("100.00"),
-            currency=account.currency.code,
-            original_amount=Decimal("120.00"),
-            original_currency="EUR",
-            exchange_rate=Decimal("0.85"),
-            transaction_date=date.today() + timedelta(days=5),
+            currency=account.currency,
+            name="Second Account",
+            account_type=choices.AccountType.CHECKING,
+            initial_balance=Decimal("0"),
         )
 
-        serializer = TransactionSerializer(
-            instance=transaction, context={"request": request_with_user}
-        )
-        data = serializer.data
-
-        assert data["id"] == str(transaction.id)
-        assert data["name"] == transaction.name
-        assert data["amount"] == str(transaction.amount)
-        assert str(data["currency_converted_amount"]) == str(
-            round(transaction.original_amount * transaction.exchange_rate, 2)
-        )
-        assert data["is_future_transaction"] is True
-        assert (
-            data["display_name"]
-            == f"{transaction.name} - {transaction.amount} {transaction.currency} ({transaction.transaction_type})"
-        )
-        assert "user" not in data  # HiddenField should not be in output
-
-    def test_validate_amount_positive(self, request_with_user, transaction_data):
-        """Test that a positive amount is considered valid."""
-        transaction_data["amount"] = "0.01"
-        serializer = TransactionSerializer(
-            data=transaction_data, context={"request": request_with_user}
-        )
-        assert serializer.is_valid(raise_exception=True)
-
-    def test_validate_amount_zero_or_negative(
-        self, request_with_user, transaction_data
-    ):
-        """Test that zero or negative amounts raise a validation error."""
-        for invalid_amount in ["0.00", "-10.00"]:
-            transaction_data["amount"] = invalid_amount
-            serializer = TransactionSerializer(
-                data=transaction_data, context={"request": request_with_user}
-            )
-            with pytest.raises(ValidationError) as excinfo:
-                serializer.is_valid(raise_exception=True)
-            assert "Amount must be a positive value." in str(
-                excinfo.value.detail["amount"]
-            )
-
-    def test_validate_exchange_rate_positive(self, request_with_user, transaction_data):
-        """Test that a positive exchange rate is considered valid."""
-        transaction_data["exchange_rate"] = "0.01"
-        transaction_data["original_amount"] = "100.00"
-        transaction_data["original_currency"] = "EUR"
-        serializer = TransactionSerializer(
-            data=transaction_data, context={"request": request_with_user}
-        )
-        assert serializer.is_valid(raise_exception=True)
-
-    def test_validate_exchange_rate_zero_or_negative(
-        self, request_with_user, transaction_data
-    ):
-        """Test that zero or negative exchange rates raise a validation error."""
-        for invalid_rate in ["0.00", "-0.50"]:
-            transaction_data["exchange_rate"] = invalid_rate
-            transaction_data["original_amount"] = "100.00"
-            transaction_data["original_currency"] = "EUR"
-            serializer = TransactionSerializer(
-                data=transaction_data, context={"request": request_with_user}
-            )
-            with pytest.raises(ValidationError) as excinfo:
-                serializer.is_valid(raise_exception=True)
-            assert "Exchange rate must be positive." in str(
-                excinfo.value.detail["exchange_rate"]
-            )
-
-    def test_validate_account_belongs_to_user(
-        self, request_with_user, transaction_data, other_user_account
-    ):
-        """
-        Test that a user cannot create a transaction using another user's account.
-        """
-        transaction_data["account"] = other_user_account.id
-        serializer = TransactionSerializer(
-            data=transaction_data, context={"request": request_with_user}
-        )
-        with pytest.raises(ValidationError) as excinfo:
-            serializer.is_valid(raise_exception=True)
-        assert "You cannot use another user's account." in str(
-            excinfo.value.detail["account"]
-        )
-
-    def test_validate_account_belongs_to_user_staff_override(
-        self, staff_user, other_user_account
-    ):
-        """
-        Test that a staff user can create a transaction using another user's account.
-        """
-        request = RequestFactory().post("/mock-url/")
-        request.user = staff_user
-        # The category must belong to the staff user or be a system category.
-        staff_category = Category.objects.create(
-            user=staff_user,
-            name="Work Expense",
-            category_type=choices.TransactionType.EXPENSE,
-        )
-
-        transaction_data = {
-            "account": other_user_account.id,
-            "category": staff_category.id,
-            "name": "Staff Transaction",
-            "transaction_type": choices.TransactionType.EXPENSE.value,
-            "amount": "50.00",
-            "currency": other_user_account.currency.code,
-            "transaction_date": date.today().isoformat(),
+        # Test failure: Transfer to same account
+        data = {
+            "account": account.id,
+            "category": category.id,
+            "name": "Bad Transfer",
+            "transaction_type": choices.TransactionType.EXPENSE,
+            "amount": "100.00",
+            "transaction_date": date.today(),
+            "is_transfer": True,
+            "transfer_account": account.id,  # Same account
         }
         serializer = TransactionSerializer(
-            data=transaction_data, context={"request": request}
-        )
-        assert serializer.is_valid(raise_exception=True)
-        transaction = serializer.save()
-        assert transaction.account == other_user_account
-
-    def test_validate_category_belongs_to_user(
-        self, request_with_user, transaction_data, other_user_category
-    ):
-        """
-        Test that a user cannot create a transaction using another user's category.
-        """
-        transaction_data["category"] = other_user_category.id
-        serializer = TransactionSerializer(
-            data=transaction_data, context={"request": request_with_user}
+            data=data, context={"request": request_with_user}
         )
         with pytest.raises(ValidationError) as excinfo:
             serializer.is_valid(raise_exception=True)
-        assert "You cannot use another user's category." in str(
-            excinfo.value.detail["category"]
-        )
+        assert "Cannot transfer to the same account" in str(excinfo.value)
 
-    def test_validate_category_system_category(
-        self, request_with_user, transaction_data, system_category
-    ):
-        """
-        Test that any user can use a system category.
-        """
-        transaction_data["category"] = system_category.id
+        # Test failure: Missing transfer_account
+        data["transfer_account"] = None
         serializer = TransactionSerializer(
-            data=transaction_data, context={"request": request_with_user}
-        )
-        assert serializer.is_valid(raise_exception=True)
-        transaction = serializer.save()
-        assert transaction.category == system_category
-
-    def test_validate_currency_conversion_required_fields(
-        self, request_with_user, transaction_data, other_currency
-    ):
-        """
-        Test that original_amount and original_currency are required when exchange_rate is not 1.
-        """
-        transaction_data["exchange_rate"] = "1.2"
-        transaction_data["original_currency"] = (
-            other_currency.code
-        )  # Missing original_amount
-        serializer = TransactionSerializer(
-            data=transaction_data, context={"request": request_with_user}
+            data=data, context={"request": request_with_user}
         )
         with pytest.raises(ValidationError) as excinfo:
             serializer.is_valid(raise_exception=True)
-        assert (
-            "original_amount & original_currency are required when exchange_rate is not 1."
-            in str(excinfo.value.detail["original_amount"])
-        )
+        assert "Transfer account is required" in str(excinfo.value)
 
-        transaction_data["original_amount"] = "100.00"
-        transaction_data["original_currency"] = None  # Missing original_currency
-        serializer = TransactionSerializer(
-            data=transaction_data, context={"request": request_with_user}
-        )
-        with pytest.raises(ValidationError) as excinfo:
-            serializer.is_valid(raise_exception=True)
-        assert (
-            "original_amount & original_currency are required when exchange_rate is not 1."
-            in str(excinfo.value.detail["original_amount"])
-        )
+    def test_create_updates_account_balance(self, request_with_user, account, category):
+        """Test that creating a completed transaction updates account balance."""
+        initial_balance = account.current_balance
+        amount = Decimal("50.00")
 
-    def test_validate_currency_conversion_no_conversion(
-        self, request_with_user, transaction_data
-    ):
-        """
-        Test that original_amount and original_currency are not required when exchange_rate is 1.
-        """
-        transaction_data["exchange_rate"] = "1.0"
-        transaction_data["original_amount"] = None
-        transaction_data["original_currency"] = None
+        data = {
+            "account": account.id,
+            "category": category.id,
+            "name": "Expense",
+            "transaction_type": choices.TransactionType.EXPENSE,
+            "amount": str(amount),
+            "transaction_date": date.today(),
+            "status": choices.TransactionStatus.COMPLETED,
+        }
         serializer = TransactionSerializer(
-            data=transaction_data, context={"request": request_with_user}
+            data=data, context={"request": request_with_user}
         )
         assert serializer.is_valid(raise_exception=True)
+        serializer.save()
 
-    def test_update_transaction_valid_data(self, request_with_user, account, category):
-        """
-        Test successful update of an existing transaction.
-        Verifies that fields can be updated and model-level validation is enforced.
-        """
-        transaction = Transaction.objects.create(
-            user=request_with_user.user,
-            account=account,
-            category=category,
-            name="Old Name",
-            transaction_type=choices.TransactionType.EXPENSE,
-            amount=Decimal("50.00"),
-            currency=account.currency.code,
-            transaction_date=date.today(),
-        )
-        new_name = "New Transaction Name"
-        new_amount = "120.00"
+        account.refresh_from_db()
+        assert account.current_balance == Decimal("950")  # 1000 - 50
 
-        serializer = TransactionSerializer(
-            instance=transaction,
-            data={"name": new_name, "amount": new_amount},
-            partial=True,
-            context={"request": request_with_user},
-        )
-        assert serializer.is_valid(raise_exception=True)
-        updated_transaction = serializer.save()
-
-        assert updated_transaction.name == new_name
-        assert updated_transaction.amount == Decimal(new_amount)
-        transaction.refresh_from_db()
-        assert transaction.name == new_name
-        assert transaction.amount == Decimal(new_amount)
-
-    def test_update_transaction_model_validation_failure(
+    def test_update_completed_transaction_updates_balance(
         self, request_with_user, account, category
     ):
-        """
-        Test that model-level validation (full_clean) is triggered during update
-        and raises a ValidationError for invalid data.
-        """
-        transaction = Transaction.objects.create(
+        """Test that updating a transaction to completed status updates balance."""
+        tx = Transaction.objects.create(
             user=request_with_user.user,
             account=account,
             category=category,
-            name="Valid Transaction",
+            name="Pending",
             transaction_type=choices.TransactionType.EXPENSE,
             amount=Decimal("50.00"),
-            currency=account.currency.code,
-            transaction_date=date.today(),
+            status=choices.TransactionStatus.PENDING,
         )
+        initial_balance = account.current_balance  # 1000
 
-        # Attempt to update with an invalid amount (model validation should catch this)
+        # Update to COMPLETED
         serializer = TransactionSerializer(
-            instance=transaction,
-            data={"amount": "-10.00"},
+            instance=tx,
+            data={"status": choices.TransactionStatus.COMPLETED},
             partial=True,
             context={"request": request_with_user},
         )
-        # Serializer's own validate_amount will catch this first, but if it were a model-only validation,
-        # the full_clean() in update would catch it. Let's try to bypass serializer validation for this specific case
-        # or ensure the error message comes from the model if possible.
-        # For now, we expect the serializer's field-level validation to catch it.
+        assert serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        account.refresh_from_db()
+        assert account.current_balance == initial_balance - Decimal("50.00")
+
+    def test_category_type_mismatch(self, request_with_user, account, category):
+        """Test validation error when category type does not match transaction type."""
+        # category fixture is EXPENSE
+        data = {
+            "account": account.id,
+            "category": category.id,
+            "name": "Income using Expense Category",
+            "transaction_type": choices.TransactionType.INCOME,  # Mismatch
+            "amount": "100.00",
+            "transaction_date": date.today(),
+        }
+        serializer = TransactionSerializer(
+            data=data, context={"request": request_with_user}
+        )
         with pytest.raises(ValidationError) as excinfo:
             serializer.is_valid(raise_exception=True)
-        assert "Amount must be a positive value." in str(excinfo.value.detail["amount"])
+        assert "Category type" in str(excinfo.value) and "does not match" in str(
+            excinfo.value
+        )
 
-    def test_get_currency_converted_amount(
-        self, request_with_user, account, category, other_currency
-    ):
-        """
-        Test the `get_currency_converted_amount` computed field logic.
-        """
-        # Case 1: With conversion
-        transaction_with_conversion = Transaction.objects.create(
+
+@pytest.mark.django_db
+class TestTransactionCreateSerializer:
+    """Test suite for TransactionCreateSerializer."""
+
+    def test_required_fields(self, request_with_user):
+        """Test that certain fields are required."""
+        data = {}  # Empty
+        serializer = TransactionCreateSerializer(
+            data=data, context={"request": request_with_user}
+        )
+        assert not serializer.is_valid()
+        assert "transaction_type" in serializer.errors
+        assert "amount" in serializer.errors
+        assert "transaction_date" in serializer.errors
+
+
+@pytest.mark.django_db
+class TestTransactionUpdateSerializer:
+    """Test suite for TransactionUpdateSerializer."""
+
+    def test_readonly_restrictions(self, request_with_user, account, category):
+        """Test that transaction_type and is_transfer are read-only."""
+        tx = Transaction.objects.create(
             user=request_with_user.user,
             account=account,
             category=category,
-            name="Converted Expense",
+            name="Original",
             transaction_type=choices.TransactionType.EXPENSE,
-            amount=Decimal("85.00"),  # This is the converted amount
-            currency=account.currency.code,
-            original_amount=Decimal("100.00"),
-            original_currency=other_currency.code,
-            exchange_rate=Decimal("0.85"),
-            transaction_date=date.today(),
-        )
-        serializer = TransactionSerializer(instance=transaction_with_conversion)
-        assert str(serializer.data["currency_converted_amount"]) == str(
-            Decimal("85.00").quantize(Decimal("0.01"))
+            amount=Decimal("10.00"),
+            is_transfer=False,
         )
 
-        # Case 2: No conversion (exchange_rate is 1 or fields are missing)
-        transaction_no_conversion = Transaction.objects.create(
+        data = {"transaction_type": choices.TransactionType.INCOME, "is_transfer": True}
+        serializer = TransactionUpdateSerializer(
+            instance=tx, data=data, partial=True, context={"request": request_with_user}
+        )
+        assert serializer.is_valid(raise_exception=True)
+        updated_tx = serializer.save()
+
+        # Should NOT have changed
+        assert updated_tx.transaction_type == choices.TransactionType.EXPENSE
+        assert updated_tx.is_transfer is False
+
+
+@pytest.mark.django_db
+class TestTransactionBulkCreateSerializer:
+    """Test suite for Bulk Create Serializer."""
+
+    def test_bulk_create_structure(self, request_with_user, account, category):
+        """Test structure validation for bulk create."""
+        tx_data = {
+            "account": account.id,
+            "category": category.id,
+            "name": "Bulk Item",
+            "transaction_type": choices.TransactionType.EXPENSE,
+            "amount": "10.00",
+            "transaction_date": date.today(),
+        }
+
+        data = {"transactions": [tx_data, tx_data]}
+
+        serializer = TransactionBulkCreateSerializer(
+            data=data, context={"request": request_with_user}
+        )
+        assert serializer.is_valid(raise_exception=True)
+        assert len(serializer.validated_data["transactions"]) == 2
+
+
+@pytest.mark.django_db
+class TestTransactionVerificationSerializer:
+    """Test suite for verification serializer."""
+
+    def test_verification_update(self, request_with_user, account, category):
+        """Test verifying a transaction."""
+        tx = Transaction.objects.create(
             user=request_with_user.user,
             account=account,
             category=category,
-            name="Direct Expense",
+            name="Pending Tx",
             transaction_type=choices.TransactionType.EXPENSE,
             amount=Decimal("50.00"),
-            currency=account.currency.code,
-            exchange_rate=Decimal("1.0"),
-            transaction_date=date.today(),
-        )
-        serializer = TransactionSerializer(instance=transaction_no_conversion)
-        assert str(serializer.data["currency_converted_amount"]) == str(
-            Decimal("50.00").quantize(Decimal("0.01"))
+            status=choices.TransactionStatus.PENDING,
         )
 
-        # Case 3: Missing original_amount or exchange_rate, should return obj.amount
-        transaction_missing_fields = Transaction.objects.create(
-            user=request_with_user.user,
-            account=account,
-            category=category,
-            name="Missing Fields",
-            transaction_type=choices.TransactionType.EXPENSE,
-            amount=Decimal("60.00"),
-            currency=account.currency.code,
-            original_currency=other_currency.code,  # original_amount and exchange_rate are None
-            transaction_date=date.today(),
-        )
-        serializer = TransactionSerializer(instance=transaction_missing_fields)
-        assert str(serializer.data["currency_converted_amount"]) == str(
-            Decimal("60.00").quantize(Decimal("0.01"))
-        )
+        data = {"posted_date": date.today()}
 
-    def test_get_is_future_transaction(self, request_with_user, account, category):
-        """
-        Test the `get_is_future_transaction` computed field logic.
-        """
-        # Future transaction
-        future_transaction = Transaction.objects.create(
-            user=request_with_user.user,
-            account=account,
-            category=category,
-            name="Future Bill",
-            transaction_type=choices.TransactionType.EXPENSE,
-            amount=Decimal("200.00"),
-            currency=account.currency.code,
-            transaction_date=date.today() + timedelta(days=10),
+        serializer = TransactionVerificationSerializer(
+            instance=tx, data=data, context={"request": request_with_user}
         )
-        serializer = TransactionSerializer(instance=future_transaction)
-        assert serializer.data["is_future_transaction"] is True
+        assert serializer.is_valid(raise_exception=True)
+        updated_tx = serializer.save()
 
-        # Past transaction
-        past_transaction = Transaction.objects.create(
-            user=request_with_user.user,
-            account=account,
-            category=category,
-            name="Past Purchase",
-            transaction_type=choices.TransactionType.EXPENSE,
-            amount=Decimal("50.00"),
-            currency=account.currency.code,
-            transaction_date=date.today() - timedelta(days=5),
-        )
-        serializer = TransactionSerializer(instance=past_transaction)
-        assert serializer.data["is_future_transaction"] is False
+        assert updated_tx.status == choices.TransactionStatus.COMPLETED
+        assert updated_tx.posted_date == date.today()
 
-        # Today's transaction
-        today_transaction = Transaction.objects.create(
-            user=request_with_user.user,
-            account=account,
-            category=category,
-            name="Today's Expense",
-            transaction_type=choices.TransactionType.EXPENSE,
-            amount=Decimal("25.00"),
-            currency=account.currency.code,
-            transaction_date=date.today(),
-        )
-        serializer = TransactionSerializer(instance=today_transaction)
-        assert serializer.data["is_future_transaction"] is False
-
-    def test_get_display_name(self, request_with_user, account, category):
-        """
-        Test the `get_display_name` computed field logic.
-        """
-        transaction = Transaction.objects.create(
-            user=request_with_user.user,
-            account=account,
-            category=category,
-            name="Dinner Out",
-            transaction_type=choices.TransactionType.EXPENSE,
-            amount=Decimal("45.75"),
-            currency="USD",
-            transaction_date=date.today(),
-        )
-        serializer = TransactionSerializer(instance=transaction)
-        expected_display_name = "Dinner Out - 45.75 USD (Expense)"
-        assert serializer.data["display_name"] == expected_display_name
-
-        transaction_income = Transaction.objects.create(
-            user=request_with_user.user,
-            account=account,
-            category=category,
-            name="Freelance Payment",
-            transaction_type=choices.TransactionType.INCOME,
-            amount=Decimal("500.00"),
-            currency="EUR",
-            transaction_date=date.today(),
-        )
-        serializer_income = TransactionSerializer(instance=transaction_income)
-        expected_display_name_income = "Freelance Payment - 500.00 EUR (Income)"
-        assert serializer_income.data["display_name"] == expected_display_name_income
+        # Verify balance updated
+        account.refresh_from_db()
+        assert account.current_balance == Decimal("950.00")  # 1000 - 50

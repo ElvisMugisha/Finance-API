@@ -1013,12 +1013,15 @@ class CategorySerializer(BaseCategorySerializer):
         )
         parent = attrs.get("parent", getattr(instance, "parent", None))
 
-        # Prevent users from creating system categories
-        if attrs.get("is_system_category", False):
-            self._log_validation_warning("Attempted to create system category")
-            raise serializers.ValidationError(
-                {"is_system_category": _("Users cannot create system categories.")}
-            )
+        # Prevent users from creating system categories (unless admin)
+        is_system_update = attrs.get("is_system_category", False)
+        if is_system_update:
+            request = self.context.get("request")
+            if not request or not (request.user.is_staff or request.user.is_superuser):
+                self._log_validation_warning("Attempted to create system category")
+                raise serializers.ValidationError(
+                    {"is_system_category": _("Users cannot create system categories.")}
+                )
 
         # Validate unique constraint
         if user and name and category_type:
@@ -1135,9 +1138,13 @@ class CategorySerializer(BaseCategorySerializer):
         try:
             user = self._get_request_user()
 
-            # Ensure user is set
-            if "user" not in validated_data and user:
-                validated_data["user"] = user
+            # Ensure user is set (only for non-system categories)
+            if not validated_data.get("is_system_category", False):
+                if "user" not in validated_data and user:
+                    validated_data["user"] = user
+            else:
+                # System categories have no user
+                validated_data["user"] = None
 
             # Create category
             category = Category.objects.create(**validated_data)
