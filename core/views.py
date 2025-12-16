@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
 from rest_framework import viewsets, status, mixins
 from rest_framework.decorators import action
@@ -166,9 +168,7 @@ class CurrencyViewSet(
             with db_transaction.atomic():
                 serializer.save()
 
-            logger.info(
-                f"Currencies created by {request.user.role} {request.user.email}"
-            )
+            logger.info(f"Currencies created by {request.user}")
 
             status_code = (
                 status.HTTP_201_CREATED if not is_bulk else status.HTTP_207_MULTI_STATUS
@@ -278,7 +278,7 @@ class CurrencyViewSet(
 
     def _is_currency_in_use(self, currency):
         """Check if currency is used by any account or transaction."""
-        from .models import Account, Transaction
+        from accounts.models import Account, Transaction
 
         account_count = Account.objects.filter(currency=currency).count()
         transaction_count = Transaction.objects.filter(
@@ -432,7 +432,7 @@ class CurrencyViewSet(
 
     def _get_currency_usage(self, currency):
         """Get detailed usage statistics for currency."""
-        from .models import Account, Transaction
+        from accounts.models import Account, Transaction
 
         try:
             # Get account usage

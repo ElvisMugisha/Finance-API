@@ -1,10 +1,13 @@
 import uuid
-from decimal import Decimal, InvalidOperation
+from datetime import date
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Dict, List, Optional, Tuple
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models
+from django.db import models, transaction
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from utils.models import BaseModel
@@ -44,12 +47,12 @@ class Currency(BaseModel):
 
     decimal_places = models.PositiveSmallIntegerField(
         default=2,
-        validators=[MinValueValidator(0), MaxValueValidator(6)],
+        validators=[MinValueValidator(0), MaxValueValidator(10)],
         help_text=_("Number of decimal places for this currency"),
     )
     exchange_rate = models.DecimalField(
-        max_digits=18,
-        decimal_places=8,  # Increased for crypto currencies
+        max_digits=20,
+        decimal_places=10,  # Increased for crypto currencies
         default=Decimal("1.0"),
         help_text=_("Exchange rate to base currency"),
     )
@@ -182,12 +185,39 @@ class Currency(BaseModel):
         # TODO: Implement historical rate lookup
         # For now, use current rates
         if self.is_base_currency:
-            return target_currency.exchange_rate
+            # Base (1.0) -> Target (Rate).
+            # If Target Rate is "Value in Base", then 1 Base = 1/Rate Target?
+            # Standard: Rate is "How many units of this currency match 1 Base"
+            # OR Rate is "How much is 1 unit of this currency in Base".
+            #
+            # Based on Test Expectation:
+            # 100 EUR (0.85) -> 85 USD (1.0). (0.85 USD per EUR).
+            # So Rate = Value in Base.
+            #
+            # If Self is Base (1.0):
+            # 100 USD -> EUR?
+            # 1 EUR = 0.85 USD.
+            # 1 USD = 1/0.85 EUR.
+            # So Rate = 1 / TargetRate.
+            if target_currency.exchange_rate == 0:
+                return None
+            return Decimal("1.0") / target_currency.exchange_rate
+
         elif target_currency.is_base_currency:
-            return Decimal("1.0") / self.exchange_rate
+            # Self (Rate) -> Base (1.0).
+            # 100 EUR -> USD.
+            # Rate is 0.85 (USD per EUR).
+            # So Rate = Self.Rate.
+            return self.exchange_rate
+
         else:
-            # Convert through base currency
-            return target_currency.exchange_rate / self.exchange_rate
+            # EUR (0.85) -> GBP (0.75).
+            # EUR -> Base -> GBP.
+            # Rate = Self.Rate (to Base) * (1/Target.Rate) (Base to Target).
+            # Rate = Self.Rate / Target.Rate.
+            if target_currency.exchange_rate == 0:
+                return None
+            return self.exchange_rate / target_currency.exchange_rate
 
     @classmethod
     def get_base_currency(cls) -> Optional["Currency"]:
@@ -444,9 +474,15 @@ class Category(BaseModel):
             List of ancestor categories
         """
         ancestors = []
+        visited = set()
         current = self if include_self else self.parent
 
         while current:
+            # Check for circular reference
+            if current.id in visited:
+                break  # Break the loop to prevent infinite recursion
+
+            visited.add(current.id)
             ancestors.append(current)
             current = current.parent
 
@@ -524,7 +560,7 @@ class Category(BaseModel):
     def update_usage_stats(self) -> None:
         """Update transaction count and last used timestamp."""
         try:
-            from .models import Transaction
+            from accounts.models import Transaction
 
             count = Transaction.objects.filter(
                 category=self, status=choices.TransactionStatus.COMPLETED

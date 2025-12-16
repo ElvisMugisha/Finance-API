@@ -677,7 +677,7 @@ class CurrencyDetailSerializer(CurrencySerializer):
     def _get_usage_count(self, currency: Currency) -> Dict[str, int]:
         """Get usage statistics for the currency."""
         # Import here to avoid circular imports
-        from .models import Account, Transaction
+        from accounts.models import Account, Transaction
 
         try:
             account_count = Account.objects.filter(currency=currency).count()
