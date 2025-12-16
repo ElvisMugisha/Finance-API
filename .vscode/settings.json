@@ -1,0 +1,27 @@
+{
+  "files.autoSave": "onFocusChange",
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.wordWrap": "on",
+  "editor.formatOnPaste": true,
+  "editor.autoIndentOnPaste": true,
+  "editor.bracketPairColorization.independentColorPoolPerBracketType": true,
+  "editor.codeActions.triggerOnFocusChange": true,
+  "editor.definitionLinkOpensInPeek": true,
+  "editor.experimental.asyncTokenizationLogging": false,
+  "workbench.preferredDarkColorTheme": "Default Dark Modern",
+  "workbench.iconTheme": "symbols",
+  "workbench.view.alwaysShowHeaderActions": true,
+  "workbench.editor.alwaysShowEditorActions": false,
+  "workbench.editor.autoLockGroups": {
+    "workbench.editorinputs.searchEditorInput": true
+  },
+  "workbench.editor.closeOnFileDelete": true,
+  "workbench.editor.defaultBinaryEditor": "default",
+  "workbench.editor.highlightModifiedTabs": false,
+  "workbench.editor.limit.enabled": true,
+  "workbench.editor.showIcons": true,
+  "workbench.editor.scrollToSwitchTabs": true,
+  "workbench.editor.sharedViewState": false,
+  "workbench.settings.openDefaultKeybindings": true,
+  "workbench.settings.openDefaultSettings": false
+}

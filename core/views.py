@@ -126,8 +126,11 @@ class CurrencyViewSet(
             # Staff/Admin can filter by is_active
             if request.user.is_staff or request.user.is_superuser:
                 is_active = request.query_params.get("is_active")
-                if is_active is not None:
-                    queryset = queryset.filter(is_active=is_active.lower() == "true")
+                if is_active:  # Check for non-empty string
+                    if is_active.lower() == "true":
+                        queryset = queryset.filter(is_active=True)
+                    elif is_active.lower() == "false":
+                        queryset = queryset.filter(is_active=False)
 
             page = self.paginate_queryset(queryset)
             if page is not None:

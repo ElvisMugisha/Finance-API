@@ -432,6 +432,21 @@ class TestCurrencyAPI:
         response = client.delete(url)
         assert response.status_code == status.HTTP_403_FORBIDDEN
 
+    def test_list_currencies_admin_sees_all_with_empty_filter(
+        self, client, admin_user, currency, inactive_currency
+    ):
+        """Admin users see all currencies when is_active is empty string."""
+        client.force_authenticate(user=admin_user)
+        url = "/core/currencies/?is_active="
+        response = client.get(url)
+
+        assert response.status_code == status.HTTP_200_OK
+        data_key = "results" if "results" in response.data else "data"
+        assert len(response.data[data_key]) == 2
+        codes = {c["code"] for c in response.data[data_key]}
+        assert "USD" in codes
+        assert "EUR" in codes
+
     # ---------------------------
     # Error Handling Tests
     # ---------------------------
