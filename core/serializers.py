@@ -1,6 +1,7 @@
 from rest_framework import serializers, exceptions
+from drf_spectacular.utils import extend_schema_field
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from django.utils.translation import gettext_lazy as _
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import models
@@ -697,31 +698,17 @@ class CurrencyDetailSerializer(CurrencySerializer):
 class BaseCategorySerializer(serializers.ModelSerializer):
     """Base serializer with common category functionality."""
 
-    def _get_request_user(self) -> Optional[models.Model]:
+    def _get_request_user(self):
         """Safely get request user from context."""
         request = self.context.get("request")
         return request.user if request and request.user.is_authenticated else None
 
-    def _log_validation_warning(self, message: str, **kwargs) -> None:
-        """Log validation warnings consistently."""
-        user = self._get_request_user()
-        user_id = user.id if user else "anonymous"
-        logger.warning(f"User {user_id}: {message}", **kwargs)
-
 
 class CategoryListSerializer(BaseCategorySerializer):
     """
-    Lightweight serializer for category listing.
+    Lightweight serializer for listing categories.
 
-    Optimized for:
-    - Category dropdowns
-    - List views with minimal data
-    - Tree/hierarchy displays
-
-    Features:
-    - Minimal fields for performance
-    - Hierarchical parent information
-    - Active status filtering
+    Optimized for performance with minimal fields.
     """
 
     parent_name = serializers.CharField(source="parent.name", read_only=True)
@@ -744,10 +731,12 @@ class CategoryListSerializer(BaseCategorySerializer):
         ]
         read_only_fields = fields
 
+    # @extend_schema_field(serializers.BooleanField)
     def get_has_children(self, obj: Category) -> bool:
         """Check if category has children."""
-        return obj.children.exists()
+        return obj.children.filter(is_active=True).exists()
 
+    # @extend_schema_field(serializers.CharField)
     def get_full_path(self, obj: Category) -> str:
         """Get full hierarchical path."""
         return obj.full_path if hasattr(obj, "full_path") else obj.name
@@ -757,11 +746,7 @@ class CategoryDetailSerializer(BaseCategorySerializer):
     """
     Detailed serializer for category retrieval.
 
-    Includes:
-    - Complete category information
-    - Hierarchy details
-    - Usage statistics
-    - System category metadata
+    Includes complete information and relationships.
     """
 
     parent_info = serializers.SerializerMethodField()
@@ -792,35 +777,40 @@ class CategoryDetailSerializer(BaseCategorySerializer):
         ]
         read_only_fields = fields
 
+    # @extend_schema_field(
+    #     serializers.DictField(child=serializers.CharField(), allow_null=True)
+    # )
     def get_parent_info(self, obj: Category) -> Optional[Dict[str, Any]]:
         """Get parent category information."""
         if obj.parent:
             return {
-                "id": obj.parent.id,
+                "id": str(obj.parent.id),
                 "name": obj.parent.name,
                 "category_type": obj.parent.category_type,
                 "is_active": obj.parent.is_active,
             }
         return None
 
+    # @extend_schema_field(serializers.ListField(child=serializers.DictField()))
     def get_children(self, obj: Category) -> List[Dict[str, Any]]:
         """Get immediate children."""
-        return CategoryListSerializer(
-            obj.children.filter(is_active=True), many=True, context=self.context
-        ).data
+        children = obj.children.filter(is_active=True)
+        return CategoryListSerializer(children, many=True, context=self.context).data
 
+    # @extend_schema_field(serializers.ListField(child=serializers.DictField()))
     def get_ancestors(self, obj: Category) -> List[Dict[str, Any]]:
         """Get ancestor categories."""
         ancestors = obj.get_ancestors() if hasattr(obj, "get_ancestors") else []
         return [
             {
-                "id": cat.id,
+                "id": str(cat.id),
                 "name": cat.name,
                 "category_type": cat.category_type,
             }
             for cat in ancestors
         ]
 
+    # @extend_schema_field(serializers.DictField(child=serializers.CharField()))
     def get_usage_stats(self, obj: Category) -> Dict[str, Any]:
         """Get usage statistics."""
         return {
@@ -830,106 +820,69 @@ class CategoryDetailSerializer(BaseCategorySerializer):
         }
 
 
-class CategorySerializer(BaseCategorySerializer):
+class CategoryCreateUpdateSerializer(BaseCategorySerializer):
     """
-    Primary serializer for Category CRUD operations.
+    Serializer for creating and updating categories.
 
-    Responsibilities:
-    - Validates user vs system categories
-    - Ensures unique names per user and type
-    - Maintains hierarchy integrity
-    - Prevents modification of system categories
-    - Logs meaningful errors for debugging
-
-    Security:
-    - Users cannot create/modify system categories
-    - Parent must belong to same user
-    - Hierarchical integrity checks
+    Handles:
+    - Automatic user assignment
+    - Validation of unique constraints
+    - Hierarchy validation
+    - System category restrictions
     """
 
-    parent_name = serializers.CharField(source="parent.name", read_only=True)
     can_delete = serializers.SerializerMethodField()
 
     class Meta:
         model = Category
         fields = [
             "id",
-            "user",
             "name",
             "description",
             "category_type",
             "parent",
-            "parent_name",
             "is_system_category",
             "is_active",
-            "transaction_count",
-            "last_used_at",
-            "created_at",
-            "updated_at",
             "can_delete",
         ]
-        read_only_fields = [
-            "id",
-            "user",
-            # "is_system_category",  # Managed via custom validation
-            "transaction_count",
-            "last_used_at",
-            "created_at",
-            "updated_at",
-            "can_delete",
-        ]
+        read_only_fields = ["id", "can_delete"]
         extra_kwargs = {
             "name": {
-                "help_text": _("Category name (unique per user and type)"),
                 "max_length": 255,
                 "trim_whitespace": True,
             },
             "description": {
-                "help_text": _("Detailed category description"),
                 "required": False,
                 "allow_blank": True,
             },
             "parent": {
-                "help_text": _("Parent category for hierarchy"),
                 "required": False,
                 "allow_null": True,
             },
+            "is_system_category": {
+                "read_only": True,  # Managed by ViewSet
+            },
         }
 
+    # @extend_schema_field(serializers.BooleanField)
     def get_can_delete(self, obj: Category) -> bool:
         """
         Check if category can be deleted.
 
         Rules:
-        - Must not be a system category
-        - Must have no transactions
-        - Must have no active children
+        - No transactions
+        - No active children
         """
-        if obj.is_system_category:
-            return False
-
         if obj.transaction_count > 0:
             return False
 
-        # Check if has active children
         if obj.children.filter(is_active=True).exists():
             return False
 
         return True
 
     def validate_name(self, value: str) -> str:
-        """
-        Validate category name.
-
-        Args:
-            value: Category name
-
-        Returns:
-            Cleaned category name
-
-        Raises:
-            serializers.ValidationError: If name is invalid
-        """
+        """Validate category name."""
         value = value.strip()
 
         if not value:
@@ -942,22 +895,10 @@ class CategorySerializer(BaseCategorySerializer):
                 _("Category name cannot exceed 255 characters."), code="name_too_long"
             )
 
-        logger.debug(f"Category name validation passed: {value}")
         return value
 
     def validate_parent(self, value: Optional[Category]) -> Optional[Category]:
-        """
-        Validate parent category.
-
-        Args:
-            value: Parent category instance
-
-        Returns:
-            Validated parent category
-
-        Raises:
-            serializers.ValidationError: If parent is invalid
-        """
+        """Validate parent category."""
         if value is None:
             return None
 
@@ -965,9 +906,6 @@ class CategorySerializer(BaseCategorySerializer):
 
         # Check if parent belongs to same user
         if value.user != user:
-            self._log_validation_warning(
-                f"Attempted to use parent category from different user: {value.id}"
-            )
             raise serializers.ValidationError(
                 _("Parent category must belong to the same user."),
                 code="invalid_parent_user",
@@ -989,61 +927,25 @@ class CategorySerializer(BaseCategorySerializer):
         return value
 
     def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Perform cross-field validation.
-
-        Args:
-            attrs: Dictionary of validated attributes
-
-        Returns:
-            Validated attributes
-
-        Raises:
-            serializers.ValidationError: If validation fails
-        """
-        logger.debug("Performing cross-field validation for category")
-
+        """Perform cross-field validation."""
         user = self._get_request_user()
         instance = self.instance
 
-        # Get values with fallbacks
+        # Get current values
         name = attrs.get("name", getattr(instance, "name", None))
         category_type = attrs.get(
             "category_type", getattr(instance, "category_type", None)
         )
         parent = attrs.get("parent", getattr(instance, "parent", None))
 
-        # Prevent users from creating system categories (unless admin)
-        is_system_update = attrs.get("is_system_category", False)
-        if is_system_update:
-            request = self.context.get("request")
-            if not request or not (request.user.is_staff or request.user.is_superuser):
-                self._log_validation_warning("Attempted to create system category")
-                raise serializers.ValidationError(
-                    {"is_system_category": _("Users cannot create system categories.")}
-                )
-
         # Validate unique constraint
         if user and name and category_type:
-            try:
-                self._validate_unique_constraint(user, name, category_type, instance)
-            except DjangoValidationError as e:
-                # Convert Django ValidationError to DRF ValidationError
-                raise serializers.ValidationError(e.message_dict)
+            self._validate_unique_constraint(user, name, category_type, instance)
 
         # Validate hierarchy
-        if parent:
+        if parent and instance:
             self._validate_hierarchy(parent, instance)
 
-        # Ensure category type matches parent type
-        if parent and category_type and parent.category_type != category_type:
-            self._log_validation_warning(
-                f"Category type mismatch: {category_type} vs parent {parent.category_type}"
-            )
-            # This is a warning, not an error
-            # attrs['category_type'] = parent.category_type  # Uncomment to auto-correct
-
-        logger.debug("Cross-field validation passed")
         return attrs
 
     def _validate_unique_constraint(
@@ -1053,19 +955,7 @@ class CategorySerializer(BaseCategorySerializer):
         category_type: str,
         instance: Optional[Category],
     ) -> None:
-        """
-        Validate unique constraint per (user, name, category_type).
-
-        Args:
-            user: User instance
-            name: Category name
-            category_type: Category type
-            instance: Current instance (if updating)
-
-        Raises:
-            DjangoValidationError: If constraint violated
-        """
-        # Build query
+        """Validate unique constraint per (user, name, category_type)."""
         query = models.Q(name=name, category_type=category_type)
 
         if user:
@@ -1079,153 +969,81 @@ class CategorySerializer(BaseCategorySerializer):
 
         # Check for existing category
         if Category.objects.filter(query).exists():
-            error_message = _(
-                f"A category with name '{name}' and type '{category_type}' "
-                f"already exists."
+            raise serializers.ValidationError(
+                {
+                    "name": _(
+                        f"A category with name '{name}' and type '{category_type}' "
+                        f"already exists."
+                    )
+                }
             )
 
-            raise DjangoValidationError(
-                {"name": [error_message], "category_type": [error_message]}
-            )
-
-    def _validate_hierarchy(
-        self, parent: Category, instance: Optional[Category]
-    ) -> None:
-        """
-        Validate hierarchical relationships.
-
-        Args:
-            parent: Parent category
-            instance: Current instance
-
-        Raises:
-            serializers.ValidationError: If hierarchy is invalid
-        """
+    def _validate_hierarchy(self, parent: Category, instance: Category) -> None:
+        """Validate hierarchical relationships."""
         # Check for circular references
-        if instance:
-            # Get all ancestors of the parent
-            try:
-                parent_ancestors = parent.get_ancestors(include_self=True)
-            except AttributeError:
-                # Fallback if get_ancestors not available
-                parent_ancestors = []
-                current = parent
-                while current:
-                    parent_ancestors.append(current)
-                    current = current.parent
+        ancestors = (
+            parent.get_ancestors(include_self=True)
+            if hasattr(parent, "get_ancestors")
+            else []
+        )
 
-            # Check if instance is in parent's ancestors
-            if instance in parent_ancestors:
-                raise serializers.ValidationError(
-                    {"parent": _("Circular reference detected in category hierarchy.")}
-                )
+        if instance in ancestors:
+            raise serializers.ValidationError(
+                {"parent": _("Circular reference detected in category hierarchy.")}
+            )
 
     def create(self, validated_data: Dict[str, Any]) -> Category:
-        """
-        Create a new category.
-
-        Args:
-            validated_data: Validated data for creation
-
-        Returns:
-            Created Category instance
-
-        Raises:
-            serializers.ValidationError: If creation fails
-        """
-        logger.info("Creating new category")
+        """Create a new category."""
+        logger.info(f"Creating category with validated data: {validated_data}")
 
         try:
-            user = self._get_request_user()
+            # Extract user from validated_data
+            user = validated_data.pop("user", None)
 
-            # Ensure user is set (only for non-system categories)
-            if not validated_data.get("is_system_category", False):
-                if "user" not in validated_data and user:
-                    validated_data["user"] = user
-            else:
-                # System categories have no user
-                validated_data["user"] = None
-
-            # Create category
+            # Create category instance
             category = Category.objects.create(**validated_data)
 
+            # If user is provided (not None), assign it
+            if user is not None:
+                category.user = user
+                category.save()
+
             logger.info(
-                f"Category created: id={category.id}, "
-                f"name='{category.name}', user={user.id if user else 'system'}"
+                f"Category created successfully in serializer: id={category.id}, "
+                f"name='{category.name}', user={category.user.id if category.user else 'system'}"
             )
 
             return category
 
-        except DjangoValidationError as e:
-            logger.error(f"Model validation failed creating category: {e}")
-            raise serializers.ValidationError(e.message_dict)
-
         except Exception as e:
-            logger.exception(f"Unexpected error creating category: {e}")
-            raise serializers.ValidationError(
-                _("An unexpected error occurred while creating the category."),
-                code="creation_error",
-            )
+            logger.exception(f"Error in serializer.create(): {e}")
+            raise serializers.ValidationError(f"Failed to create category: {str(e)}")
 
     def update(self, instance: Category, validated_data: Dict[str, Any]) -> Category:
-        """
-        Update an existing category.
-
-        Args:
-            instance: Existing Category instance
-            validated_data: Validated data for update
-
-        Returns:
-            Updated Category instance
-
-        Raises:
-            serializers.ValidationError: If update fails
-        """
+        """Update an existing category."""
         logger.info(f"Updating category: id={instance.id}, name='{instance.name}'")
 
-        # Prevent modification of system categories
-        if instance.is_system_category:
-            self._log_validation_warning(
-                f"Attempted to modify system category: {instance.id}"
-            )
+        # Prevent modification of system categories for regular users
+        user = self._get_request_user()
+        if instance.is_system_category and not (user.is_staff or user.is_superuser):
             raise serializers.ValidationError(
                 _("System categories cannot be modified."),
                 code="system_category_readonly",
             )
 
-        try:
-            # Update fields
-            for attr, value in validated_data.items():
-                setattr(instance, attr, value)
+        # Update fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
 
-            # Save with validation
-            instance.save()
+        instance.save()
 
-            logger.info(f"Category updated: id={instance.id}, name='{instance.name}'")
-            return instance
-
-        except DjangoValidationError as e:
-            logger.error(
-                f"Model validation failed updating category {instance.id}: {e}"
-            )
-            raise serializers.ValidationError(e.message_dict)
-
-        except Exception as e:
-            logger.exception(f"Unexpected error updating category {instance.id}: {e}")
-            raise serializers.ValidationError(
-                _("An unexpected error occurred while updating the category."),
-                code="update_error",
-            )
+        logger.info(f"Category updated: name='{instance.name}'")
+        return instance
 
 
 class CategoryTreeSerializer(BaseCategorySerializer):
     """
     Serializer for hierarchical category tree display.
-
-    Optimized for:
-    - Category management interfaces
-    - Tree visualization
-    - Bulk operations
     """
 
     children = serializers.SerializerMethodField()
@@ -1245,11 +1063,13 @@ class CategoryTreeSerializer(BaseCategorySerializer):
         ]
         read_only_fields = fields
 
+    # @extend_schema_field(serializers.ListField(child=serializers.DictField()))
     def get_children(self, obj: Category) -> List[Dict[str, Any]]:
         """Recursively get children."""
         children = obj.children.filter(is_active=True).order_by("name")
         return CategoryTreeSerializer(children, many=True, context=self.context).data
 
+    # @extend_schema_field(serializers.IntegerField)
     def get_depth(self, obj: Category) -> int:
         """Calculate category depth in hierarchy."""
         depth = 0
@@ -1260,165 +1080,3 @@ class CategoryTreeSerializer(BaseCategorySerializer):
             current = current.parent
 
         return depth
-
-
-class CategoryBulkUpdateSerializer(serializers.Serializer):
-    """
-    Serializer for bulk category operations.
-
-    Used for:
-    - Batch activation/deactivation
-    - Mass parent reassignment
-    - Bulk deletion
-    """
-
-    category_ids = serializers.ListField(
-        child=serializers.UUIDField(),
-        help_text=_("List of category IDs to update"),
-        min_length=1,
-        max_length=100,  # Limit batch size
-    )
-    action = serializers.ChoiceField(
-        choices=[
-            ("activate", "Activate"),
-            ("deactivate", "Deactivate"),
-            ("change_parent", "Change Parent"),
-        ],
-        help_text=_("Action to perform on categories"),
-    )
-    parent_id = serializers.UUIDField(
-        required=False,
-        allow_null=True,
-        help_text=_("New parent category ID (for change_parent action)"),
-    )
-
-    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate bulk operation."""
-        action = attrs["action"]
-        parent_id = attrs.get("parent_id")
-
-        if action == "change_parent" and parent_id is None:
-            raise serializers.ValidationError(
-                {"parent_id": _("Parent ID is required for change_parent action.")}
-            )
-
-        return attrs
-
-    def _get_request_user(self) -> Optional[models.Model]:
-        """Safely get request user from context."""
-        request = self.context.get("request")
-        return request.user if request and request.user.is_authenticated else None
-
-    def create(self, validated_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute bulk category operation.
-
-        Args:
-            validated_data: Validated bulk operation data
-
-        Returns:
-            Operation statistics
-        """
-        category_ids = validated_data["category_ids"]
-        action = validated_data["action"]
-        parent_id = validated_data.get("parent_id")
-        user = self._get_request_user()
-
-        logger.info(
-            f"Bulk category operation: action={action}, "
-            f"categories={len(category_ids)}, user={user.id if user else 'system'}"
-        )
-
-        try:
-            # Get categories belonging to user
-            categories = Category.objects.filter(
-                id__in=category_ids,
-                user=user,
-                is_system_category=False,  # Cannot modify system categories
-            )
-
-            stats = {
-                "total_requested": len(category_ids),
-                "total_processed": categories.count(),
-                "successful": 0,
-                "failed": 0,
-                "errors": [],
-            }
-
-            # Perform action
-            if action == "activate":
-                updated = categories.filter(is_active=False).update(is_active=True)
-                stats["successful"] = updated
-
-            elif action == "deactivate":
-                # Check for categories with transactions
-                for category in categories:
-                    if category.transaction_count > 0:
-                        stats["failed"] += 1
-                        stats["errors"].append(
-                            {
-                                "category_id": str(category.id),
-                                "error": "Category has transactions and cannot be deactivated.",
-                            }
-                        )
-                    else:
-                        category.is_active = False
-                        category.save()
-                        stats["successful"] += 1
-
-            elif action == "change_parent":
-                parent = (
-                    Category.objects.filter(
-                        id=parent_id, user=user, is_active=True
-                    ).first()
-                    if parent_id
-                    else None
-                )
-
-                for category in categories:
-                    try:
-                        # Check for circular reference
-                        if parent and category.id == parent.id:
-                            raise ValueError("Cannot set category as its own parent.")
-
-                        category.parent = parent
-                        category.save()
-                        stats["successful"] += 1
-
-                    except Exception as e:
-                        stats["failed"] += 1
-                        stats["errors"].append(
-                            {"category_id": str(category.id), "error": str(e)}
-                        )
-
-            logger.info(f"Bulk operation completed: {stats}")
-            return stats
-
-        except Exception as e:
-            logger.exception(f"Bulk category operation failed: {e}")
-            raise serializers.ValidationError(
-                _("Bulk operation failed. Please try again."),
-                code="bulk_operation_failed",
-            )
-
-
-# Factory function for getting appropriate serializer
-def get_category_serializer(action: str = "default") -> serializers.Serializer:
-    """
-    Get appropriate serializer based on action.
-
-    Args:
-        action: Serializer action ('list', 'detail', 'tree', 'bulk', 'default')
-
-    Returns:
-        Appropriate serializer class
-    """
-    serializer_map = {
-        "list": CategoryListSerializer,
-        "detail": CategoryDetailSerializer,
-        "tree": CategoryTreeSerializer,
-        "bulk": CategoryBulkUpdateSerializer,
-        "default": CategorySerializer,
-    }
-
-    return serializer_map.get(action, CategorySerializer)

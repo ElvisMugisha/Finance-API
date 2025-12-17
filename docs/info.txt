@@ -1,0 +1,7 @@
+Design Principles:
+- DRY (Don't Repeat Yourself): Eliminate code duplication
+- KISS (Keep It Simple, Stupid): Keep implementation simple and clear
+- YAGNI (You Ain't Gonna Need It): Remove unnecessary features
+- SoC (Separation of Concerns): Separate concerns appropriately
+- SOLID (Single Responsibility, Open/Closed, Liskov Substitution, Interface Segregation, Dependency Inversion): Follow object-oriented design principles
+-

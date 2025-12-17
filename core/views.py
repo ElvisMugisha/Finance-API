@@ -14,9 +14,11 @@ from rest_framework.exceptions import (
 
 from django.db import models, transaction as db_transaction
 from django.utils import timezone
+from django.conf import settings
 
-from utils import loggings
+from utils import loggings, choices
 from utils.paginations import CustomPageNumberPagination
+from utils.filters import CategoryFilter
 
 from .models import Category, Currency
 from utils.permissions import (
@@ -31,11 +33,10 @@ from .serializers import (
     CurrencyDetailSerializer,
     CurrencyConversionSerializer,
     ExchangeRateUpdateSerializer,
-    CategorySerializer,
     CategoryListSerializer,
     CategoryDetailSerializer,
+    CategoryCreateUpdateSerializer,
     CategoryTreeSerializer,
-    CategoryBulkUpdateSerializer,
 )
 
 # Initialize logger
@@ -470,24 +471,52 @@ class CurrencyViewSet(
             return {}
 
 
-class BaseCategoryViewSet(viewsets.GenericViewSet):
-    """Base ViewSet with common category functionality."""
+class CategoryViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    """
+    Comprehensive ViewSet for category management.
 
+    Features:
+    1. Role-based category ownership (user vs system)
+    2. Unified create method (handles single and bulk)
+    3. PATCH-only updates (no PUT, no bulk update)
+    4. Comprehensive filtering and search
+    5. Proper error handling and logging
+    """
+
+    queryset = Category.objects.all()
     permission_classes = [CategoryPermission]
     pagination_class = CustomPageNumberPagination
+    lookup_field = "pk"
+
+    # Serializer mapping
+    serializer_action_map = {
+        "list": CategoryListSerializer,
+        "retrieve": CategoryDetailSerializer,
+        "create": CategoryCreateUpdateSerializer,
+        "partial_update": CategoryCreateUpdateSerializer,
+        "tree": CategoryTreeSerializer,
+        "system": CategoryListSerializer,
+        "mine": CategoryListSerializer,
+    }
 
     def get_queryset(self):
         """
         Get categories based on user permissions.
 
         Rules:
-        - Regular users: their categories + system categories
         - Staff/Admin: all categories
+        - Regular users: their categories + system categories
         """
         user = self.request.user
 
         if user.is_staff or user.is_superuser:
-            # Staff/Admin can see everything
             return Category.objects.all()
 
         # Regular users see their categories + system categories
@@ -497,121 +526,71 @@ class BaseCategoryViewSet(viewsets.GenericViewSet):
 
     def get_serializer_class(self):
         """Return appropriate serializer based on action."""
-        serializer_map = {
-            "list": CategoryListSerializer,
-            "retrieve": CategoryDetailSerializer,
-            "tree": CategoryTreeSerializer,
-            "bulk_update": CategoryBulkUpdateSerializer,
-        }
-        return serializer_map.get(self.action, CategorySerializer)
-
-
-class CategoryViewSet(
-    BaseCategoryViewSet,
-    mixins.ListModelMixin,
-    mixins.RetrieveModelMixin,
-    mixins.CreateModelMixin,
-    mixins.UpdateModelMixin,
-    mixins.DestroyModelMixin,
-):
-    """
-    Category ViewSet for CRUD operations with role-based permissions.
-
-    Permissions:
-    - List/Retrieve: All authenticated users (their categories + system categories)
-    - Create: All users (auto-assigns user/system based on role)
-    - Update/Delete: Users can only modify their own categories
-    - Staff/Admin: Can CRUD any category including system categories
-
-    Business Rules:
-    - Staff/Admin creating categories become system categories (user=None)
-    - Regular users create personal categories (user=request.user)
-    - System categories are read-only for regular users
-    """
-
-    queryset = Category.objects.all()
-    lookup_field = "pk"
+        return self.serializer_action_map.get(
+            self.action, CategoryCreateUpdateSerializer
+        )
 
     @extend_schema(
-        summary="List categories",
-        description=(
-            "List categories visible to the user. "
-            "Regular users see their categories + system categories. "
-            "Staff/Admin see all categories."
-        ),
         parameters=[
             OpenApiParameter(
                 name="search",
-                description="Search by category name",
-                required=False,
                 type=str,
+                location=OpenApiParameter.QUERY,
+                description="Search categories by name",
+                required=False,
             ),
             OpenApiParameter(
                 name="category_type",
-                description="Filter by category type (income/expense)",
-                required=False,
                 type=str,
-                enum=["income", "expense"],
+                location=OpenApiParameter.QUERY,
+                description="Filter by category type",
+                enum=[choice[0] for choice in choices.TransactionType.choices],
+                required=False,
             ),
             OpenApiParameter(
                 name="parent_id",
+                type=str,
+                location=OpenApiParameter.QUERY,
                 description="Filter by parent category ID",
                 required=False,
-                type=str,
             ),
             OpenApiParameter(
                 name="include_inactive",
-                description="Include inactive categories (staff/admin only)",
-                required=False,
                 type=bool,
+                location=OpenApiParameter.QUERY,
+                description="Include inactive categories",
+                required=False,
             ),
-        ],
+        ]
     )
     def list(self, request, *args, **kwargs):
-        """List categories with optional filtering."""
+        """
+        List categories with comprehensive filtering.
+
+        Filters:
+        - search: Search by name
+        - category_type: Filter by type (income/expense)
+        - parent_id: Filter by parent
+        - include_inactive: Include inactive categories
+
+        Permissions:
+        - Staff/Admin: See all categories
+        - Regular users: See their categories + system categories
+        """
         try:
             queryset = self.get_queryset()
-            user = request.user
 
             # Apply filters
-            search_query = request.query_params.get("search")
-            if search_query:
-                queryset = queryset.filter(name__icontains=search_query)
+            filter_instance = CategoryFilter(request, queryset)
+            filtered_queryset = filter_instance.apply_filters()
 
-            category_type = request.query_params.get("category_type")
-            if category_type:
-                queryset = queryset.filter(category_type=category_type)
-
-            parent_id = request.query_params.get("parent_id")
-            if parent_id:
-                try:
-                    queryset = queryset.filter(parent_id=parent_id)
-                except ValueError:
-                    logger.warning(f"Invalid parent_id filter: {parent_id}")
-
-            # Staff/Admin can see inactive categories
-            include_inactive = request.query_params.get("include_inactive")
-            if include_inactive and (user.is_staff or user.is_superuser):
-                if include_inactive.lower() == "true":
-                    queryset = Category.objects.filter(
-                        models.Q(user=user)
-                        | models.Q(is_system_category=True)
-                        | models.Q(user__isnull=False)
-                    )
-            else:
-                # Regular users only see active categories
-                if not (user.is_staff or user.is_superuser):
-                    queryset = queryset.filter(is_active=True)
-
-            # Order by name for consistency
-            queryset = queryset.order_by("name")
-
-            page = self.paginate_queryset(queryset)
+            # Paginate and serialize
+            page = self.paginate_queryset(filtered_queryset)
             if page is not None:
                 serializer = self.get_serializer(page, many=True)
                 return self.get_paginated_response(serializer.data)
 
-            serializer = self.get_serializer(queryset, many=True)
+            serializer = self.get_serializer(filtered_queryset, many=True)
             return Response(serializer.data)
 
         except Exception as e:
@@ -621,172 +600,197 @@ class CategoryViewSet(
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-    @extend_schema(
-        summary="Create category",
-        description=(
-            "Create a new category. "
-            "Staff/Admin create system categories (user=None). "
-            "Regular users create personal categories (user=request.user)."
-        ),
-        request=CategorySerializer,
-        responses={201: CategorySerializer},
-    )
     def create(self, request, *args, **kwargs):
-        """Create a new category with automatic user assignment."""
+        """
+        Create category/categories.
+
+        Features:
+        - Handles both single object and list of objects
+        - Automatic user assignment
+        - System categories for staff/admin
+        - Proper error handling for bulk operations
+        """
         try:
+            data = request.data
             user = request.user
             is_staff_or_admin = user.is_staff or user.is_superuser
 
-            # Prepare data with user assignment
-            data = request.data.copy()
+            # Determine if this is a bulk or single create
+            is_bulk = isinstance(data, list)
 
-            if is_staff_or_admin:
-                # Staff/Admin create system categories
-                data["is_system_category"] = True
-                data["user"] = None
-                logger.debug(f"Staff/Admin creating system category")
+            if is_bulk:
+                return self._bulk_create_categories(data, user, is_staff_or_admin)
             else:
-                # Regular users create personal categories
-                data["is_system_category"] = False
-                data["user"] = user.id
-                logger.debug(f"Regular user creating personal category")
+                return self._create_single_category(data, user, is_staff_or_admin)
 
-            serializer = self.get_serializer(data=data, context={"request": request})
-            serializer.is_valid(raise_exception=True)
-
-            with db_transaction.atomic():
-                category = serializer.save()
-
-            logger.info(
-                f"Category created: id={category.id}, "
-                f"name='{category.name}', "
-                f"user={'system' if category.is_system_category else user.id}, "
-                f"type={category.category_type}"
-            )
-
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-        except (PermissionDenied, NotAuthenticated, NotFound, ValidationError) as e:
+        except ValidationError as e:
+            logger.warning(f"Validation error creating category: {e}")
             raise e
         except Exception as e:
             logger.exception(f"Error creating category: {e}")
             return Response(
-                {"error": "Failed to create category. Please check your data."},
+                {"error": "Failed to create category."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-    @extend_schema(
-        summary="Bulk create categories",
-        description="Create multiple categories at once.",
-        request=CategorySerializer(many=True),
-        responses={207: CategorySerializer(many=True)},
-    )
-    @action(detail=False, methods=["post"], url_path="bulk-create")
-    def bulk_create(self, request):
-        """Create multiple categories."""
+    def _create_single_category(self, data, user, is_staff_or_admin):
+        """Create a single category."""
+        # Prepare data with user assignment
+        logger.debug(
+            f"Creating single category. User: {user.id}, Is staff/admin: {is_staff_or_admin}"
+        )
+        logger.debug(f"Raw data: {data}")
+        prepared_data = self._prepare_category_data(data, user, is_staff_or_admin)
+        logger.debug(f"Prepared data: {prepared_data}")
+
+        # Validate and save
+        serializer = self.get_serializer(
+            data=prepared_data, context={"request": self.request}
+        )
+
+        # Log validation errors if any
+        if not serializer.is_valid():
+            logger.error(f"Serializer validation errors: {serializer.errors}")
+            raise ValidationError(serializer.errors)
+
+        serializer.is_valid(raise_exception=True)
+
+        with db_transaction.atomic():
+            category = serializer.save()
+
+        logger.info(
+            f"Category created successfully: id={category.id}, name='{category.name}', "
+            f"user={'system' if is_staff_or_admin else user.id}, "
+            f"is_system_category={category.is_system_category}"
+        )
+
+        # Double-check the category was saved
         try:
-            user = request.user
-            is_staff_or_admin = user.is_staff or user.is_superuser
+            saved_category = Category.objects.get(id=category.id)
+            logger.debug(f"Category verified in DB: {saved_category}")
+        except Category.DoesNotExist:
+            logger.error(f"Category {category.id} was not saved to database!")
 
-            # Prepare data for each category
-            categories_data = request.data
-            if not isinstance(categories_data, list):
-                return Response(
-                    {"error": "Expected a list of categories."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-            # Limit batch size
-            if len(categories_data) > 50:
-                return Response(
-                    {"error": "Cannot create more than 50 categories at once."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+    def _bulk_create_categories(self, data_list, user, is_staff_or_admin):
+        """Create multiple categories with proper error handling."""
+        # Validate input
+        if not isinstance(data_list, list):
+            return Response(
+                {"error": "Expected a list of categories."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-            created = []
-            errors = []
+        # Limit batch size
+        MAX_BATCH_SIZE = settings.MAX_BATCH_SIZE
+        if len(data_list) > MAX_BATCH_SIZE:
+            return Response(
+                {
+                    "error": f"Cannot create more than {MAX_BATCH_SIZE} categories at once."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-            for idx, category_data in enumerate(categories_data):
+        created = []
+        errors = []
+
+        with db_transaction.atomic():
+            for idx, data in enumerate(data_list):
                 try:
-                    # Prepare data with user assignment
-                    data = category_data.copy()
+                    # Prepare data for each category
+                    prepared_data = self._prepare_category_data(
+                        data, user, is_staff_or_admin
+                    )
 
-                    if is_staff_or_admin:
-                        data["is_system_category"] = True
-                        data["user"] = None
-                    else:
-                        data["is_system_category"] = False
-                        data["user"] = user.id
-
-                    serializer = CategorySerializer(
-                        data=data, context={"request": request}
+                    # Validate
+                    serializer = self.get_serializer(
+                        data=prepared_data, context={"request": self.request}
                     )
                     serializer.is_valid(raise_exception=True)
 
-                    with db_transaction.atomic():
-                        category = serializer.save()
-
+                    # Save
+                    category = serializer.save()
                     created.append(serializer.data)
+
                     logger.debug(f"Bulk create: created category {category.id}")
 
                 except Exception as e:
-                    errors.append(
-                        {"index": idx, "error": str(e), "data": category_data}
-                    )
+                    errors.append({"index": idx, "error": str(e), "data": data})
                     logger.warning(f"Bulk create error at index {idx}: {e}")
 
-            if errors:
-                return Response(
-                    {
-                        "created": created,
-                        "errors": errors,
-                        "message": f"Created {len(created)} categories, {len(errors)} failed.",
-                    },
-                    status=status.HTTP_207_MULTI_STATUS,
-                )
-
-            logger.info(
-                f"Bulk create successful: created {len(created)} categories "
-                f"for user {'system' if is_staff_or_admin else user.id}"
-            )
-
-            return Response(created, status=status.HTTP_201_CREATED)
-
-        except Exception as e:
-            logger.exception(f"Error in bulk create: {e}")
+        # Return appropriate response
+        if errors:
             return Response(
-                {"error": "Failed to create categories."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                {
+                    "created": created,
+                    "errors": errors,
+                    "message": f"Created {len(created)} categories, {len(errors)} failed.",
+                },
+                status=status.HTTP_207_MULTI_STATUS,
             )
 
-    @extend_schema(
-        summary="Update category",
-        description=(
-            "Update a category. "
-            "Regular users can only update their own categories. "
-            "Staff/Admin can update any category."
-        ),
-        request=CategorySerializer,
-        responses={200: CategorySerializer},
-    )
-    def update(self, request, *args, **kwargs):
-        """Update category."""
+        logger.info(
+            f"Bulk create successful: created {len(created)} categories "
+            f"for user {'system' if is_staff_or_admin else user.id}"
+        )
+
+        return Response(created, status=status.HTTP_201_CREATED)
+
+    def _prepare_category_data(self, data, user, is_staff_or_admin):
+        """Prepare category data with proper user assignment."""
+        logger.debug(
+            f"Preparing category data. User: {user.id}, Is staff/admin: {is_staff_or_admin}"
+        )
+
+        prepared_data = data.copy() if isinstance(data, dict) else {}
+        logger.debug(f"Original data copy: {prepared_data}")
+
+        # Determine category ownership
+        if is_staff_or_admin:
+            prepared_data["is_system_category"] = True
+            prepared_data["user"] = None  # System categories have no user
+            logger.debug("Setting as system category (staff/admin)")
+        else:
+            prepared_data["is_system_category"] = False
+            prepared_data["user"] = user.id  # Regular users own their categories
+            logger.debug(f"Setting as user category for user {user.id}")
+
+        # Ensure is_active defaults to True
+        if "is_active" not in prepared_data:
+            prepared_data["is_active"] = True
+            logger.debug("Setting default is_active=True")
+
+        # Ensure required fields are present
+        required_fields = ["name", "category_type"]
+        for field in required_fields:
+            if field not in prepared_data:
+                logger.warning(f"Required field '{field}' not in prepared data")
+
+        logger.debug(f"Final prepared data: {prepared_data}")
+        return prepared_data
+
+    def partial_update(self, request, *args, **kwargs):
+        """
+        Update specific fields of a category.
+
+        Restrictions:
+        - Regular users cannot modify system categories
+        - Regular users cannot change is_system_category
+        """
         try:
             instance = self.get_object()
             user = request.user
 
-            # Check if user can modify this category
+            # Check permissions
             self.check_object_permissions(request, instance)
 
-            # Prevent regular users from modifying system categories
-            if instance.is_system_category and not (user.is_staff or user.is_superuser):
-                return Response(
-                    {"error": "Cannot modify system categories."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
+            # Validate modification rights
+            self._validate_update_permissions(instance, user, request.data)
 
+            # Perform update
             serializer = self.get_serializer(
-                instance, data=request.data, partial=False, context={"request": request}
+                instance, data=request.data, partial=True, context={"request": request}
             )
             serializer.is_valid(raise_exception=True)
 
@@ -795,7 +799,7 @@ class CategoryViewSet(
 
             logger.info(
                 f"Category updated: id={updated_instance.id}, "
-                f"name='{updated_instance.name}', "
+                f"updated_fields={list(request.data.keys())}, "
                 f"by user={user.id}"
             )
 
@@ -810,73 +814,27 @@ class CategoryViewSet(
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-    @extend_schema(
-        summary="Partial update category",
-        description="Update specific fields of a category.",
-        request=CategorySerializer,
-        responses={200: CategorySerializer},
-    )
-    def partial_update(self, request, *args, **kwargs):
-        """Partial update category."""
-        try:
-            instance = self.get_object()
-            user = request.user
+    def _validate_update_permissions(self, category, user, update_data):
+        """Validate if user can update the category."""
+        # Regular users cannot modify system categories
+        if category.is_system_category and not (user.is_staff or user.is_superuser):
+            raise PermissionDenied("Cannot modify system categories.")
 
-            # Check permissions
-            self.check_object_permissions(request, instance)
+        # Regular users cannot change is_system_category field
+        if "is_system_category" in update_data and not (
+            user.is_staff or user.is_superuser
+        ):
+            raise PermissionDenied("Cannot change system category status.")
 
-            # Prevent regular users from modifying system categories
-            if instance.is_system_category and not (user.is_staff or user.is_superuser):
-                return Response(
-                    {"error": "Cannot modify system categories."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-
-            # Prevent changing is_system_category for regular users
-            if "is_system_category" in request.data and not (
-                user.is_staff or user.is_superuser
-            ):
-                return Response(
-                    {"error": "Cannot change system category status."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-
-            serializer = self.get_serializer(
-                instance, data=request.data, partial=True, context={"request": request}
-            )
-            serializer.is_valid(raise_exception=True)
-
-            with db_transaction.atomic():
-                updated_instance = serializer.save()
-
-            logger.info(
-                f"Category partially updated: id={updated_instance.id}, "
-                f"updated fields={list(request.data.keys())}, "
-                f"by user={user.id}"
-            )
-
-            return Response(serializer.data)
-
-        except (PermissionDenied, NotAuthenticated, NotFound, ValidationError) as e:
-            raise e
-        except Exception as e:
-            logger.exception(f"Error partially updating category: {e}")
-            return Response(
-                {"error": "Failed to update category."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-    @extend_schema(
-        summary="Delete category",
-        description=(
-            "Soft delete a category (set is_active=False). "
-            "Categories with transactions cannot be deleted. "
-            "System categories can only be deleted by staff/admin."
-        ),
-        responses={204: OpenApiResponse(description="No Content")},
-    )
     def destroy(self, request, *args, **kwargs):
-        """Soft delete category."""
+        """
+        Soft delete a category (set is_active=False).
+
+        Restrictions:
+        - Cannot delete categories with transactions
+        - Cannot delete categories with active children
+        - System categories can only be deleted by staff/admin
+        """
         try:
             instance = self.get_object()
             user = request.user
@@ -884,26 +842,24 @@ class CategoryViewSet(
             # Check permissions
             self.check_object_permissions(request, instance)
 
-            # Check if category can be deleted
+            # Validate deletion
             if not self._can_delete_category(instance, user):
                 error_msg = self._get_delete_error_message(instance, user)
+                logger.error(error_msg)
                 return Response(
                     {"error": error_msg}, status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Soft delete (set is_active=False)
+            # Soft delete
             instance.is_active = False
             instance.save(update_fields=["is_active", "updated_at"])
 
             logger.info(
-                f"Category soft deleted: id={instance.id}, "
-                f"name='{instance.name}', "
-                f"by user={user.id}"
+                f"Category soft deleted: name='{instance.name}', by user={user.id}"
             )
-
             return Response(status=status.HTTP_204_NO_CONTENT)
 
-        except (PermissionDenied, NotAuthenticated, NotFound, ValidationError) as e:
+        except (PermissionDenied, NotAuthenticated, NotFound) as e:
             raise e
         except Exception as e:
             logger.exception(f"Error deleting category: {e}")
@@ -912,17 +868,9 @@ class CategoryViewSet(
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-    def _can_delete_category(self, category: Category, user) -> bool:
+    def _can_delete_category(self, category, user):
         """Check if category can be deleted."""
-        # Staff/Admin can delete any category (except with transactions)
-        if user.is_staff or user.is_superuser:
-            return category.transaction_count == 0
-
-        # Regular users can only delete their own categories
-        if category.user != user:
-            return False
-
-        # Check for transactions
+        # Check transaction count
         if category.transaction_count > 0:
             return False
 
@@ -930,9 +878,17 @@ class CategoryViewSet(
         if category.children.filter(is_active=True).exists():
             return False
 
+        # Check ownership
+        if not category.is_system_category and category.user != user:
+            return False
+
+        # Check system category permissions
+        if category.is_system_category and not (user.is_staff or user.is_superuser):
+            return False
+
         return True
 
-    def _get_delete_error_message(self, category: Category, user) -> str:
+    def _get_delete_error_message(self, category, user):
         """Get appropriate error message for delete failure."""
         if category.transaction_count > 0:
             return "Cannot delete category with transactions."
@@ -940,7 +896,7 @@ class CategoryViewSet(
         if category.children.filter(is_active=True).exists():
             return "Cannot delete category with active subcategories."
 
-        if category.user != user and not (user.is_staff or user.is_superuser):
+        if not category.is_system_category and category.user != user:
             return "Cannot delete another user's category."
 
         if category.is_system_category and not (user.is_staff or user.is_superuser):
@@ -949,36 +905,61 @@ class CategoryViewSet(
         return "Cannot delete category."
 
     @extend_schema(
-        summary="Get category tree",
-        description="Get hierarchical category tree for the user.",
-        responses={200: CategoryTreeSerializer(many=True)},
+        parameters=[
+            OpenApiParameter(
+                name="search",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Search categories by name",
+                required=False,
+            ),
+            OpenApiParameter(
+                name="category_type",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Filter by category type",
+                enum=[choice[0] for choice in choices.TransactionType.choices],
+                required=False,
+            ),
+            OpenApiParameter(
+                name="parent_id",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Filter by parent category ID",
+                required=False,
+            ),
+        ]
     )
-    @action(detail=False, methods=["get"], url_path="tree")
+    @action(detail=False, methods=["get"])
     def tree(self, request):
         """Get hierarchical category tree."""
         try:
             user = request.user
 
-            # Get root categories (no parent)
+            # Get base queryset
             if user.is_staff or user.is_superuser:
-                # Staff/Admin see all root categories
-                root_categories = Category.objects.filter(
-                    parent__isnull=True, is_active=True
-                )
+                queryset = Category.objects.all()
             else:
-                # Regular users see their root categories + system root categories
-                root_categories = Category.objects.filter(
-                    models.Q(parent__isnull=True)
-                    & (models.Q(user=user) | models.Q(is_system_category=True))
-                    & models.Q(is_active=True)
+                queryset = Category.objects.filter(
+                    models.Q(user=user) | models.Q(is_system_category=True)
                 )
 
-            serializer = CategoryTreeSerializer(
-                root_categories.order_by("name"),
-                many=True,
-                context={"request": request},
-            )
+            # Apply filters
+            filter_instance = CategoryFilter(request, queryset)
+            filtered_queryset = filter_instance.apply_filters()
 
+            # For tree view, we want to show only root categories by default
+            # But allow filtering by parent_id if specified
+            if not request.query_params.get("parent_id"):
+                filtered_queryset = filtered_queryset.filter(parent__isnull=True)
+
+            # Paginate and serialize
+            page = self.paginate_queryset(filtered_queryset.order_by("name"))
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+
+            serializer = self.get_serializer(filtered_queryset, many=True)
             return Response(serializer.data)
 
         except Exception as e:
@@ -989,65 +970,55 @@ class CategoryViewSet(
             )
 
     @extend_schema(
-        summary="Bulk update categories",
-        description="Bulk update categories (activate/deactivate/change parent). Staff/Admin only.",
-        request=CategoryBulkUpdateSerializer,
-        responses={200: CategoryBulkUpdateSerializer},
+        parameters=[
+            OpenApiParameter(
+                name="search",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Search system categories by name",
+                required=False,
+            ),
+            OpenApiParameter(
+                name="category_type",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Filter system categories by type",
+                enum=[choice[0] for choice in choices.TransactionType.choices],
+                required=False,
+            ),
+            OpenApiParameter(
+                name="parent_id",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Filter system categories by parent ID",
+                required=False,
+            ),
+        ]
     )
-    @action(detail=False, methods=["post"], url_path="bulk-update")
-    def bulk_update(self, request):
-        """Bulk update categories (staff/admin only)."""
+    @action(detail=False, methods=["get"])
+    def system(self, request):
+        """Get all system categories."""
         try:
             user = request.user
 
-            # Only staff/admin can perform bulk operations
-            if not (user.is_staff or user.is_superuser):
-                return Response(
-                    {"error": "Bulk operations require staff/admin privileges."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
+            # Base queryset for system categories
+            queryset = Category.objects.all()
+            if user.is_staff or user.is_superuser:
+                queryset = queryset
+            else:
+                queryset = queryset.filter(is_active=True)
 
-            serializer = CategoryBulkUpdateSerializer(
-                data=request.data, context={"request": request}
-            )
-            serializer.is_valid(raise_exception=True)
+            # Apply filters
+            filter_instance = CategoryFilter(request, queryset, is_system=True)
+            filtered_queryset = filter_instance.apply_filters()
 
-            result = serializer.save()
+            # Paginate and serialize
+            page = self.paginate_queryset(filtered_queryset.order_by("name"))
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
 
-            logger.info(
-                f"Bulk update completed by {user.id}: "
-                f"action={request.data.get('action')}, "
-                f"successful={result.get('successful', 0)}, "
-                f"failed={result.get('failed', 0)}"
-            )
-
-            return Response(result)
-
-        except (PermissionDenied, NotAuthenticated, NotFound, ValidationError) as e:
-            raise e
-        except Exception as e:
-            logger.exception(f"Error in bulk update: {e}")
-            return Response(
-                {"error": "Bulk update failed."}, status=status.HTTP_400_BAD_REQUEST
-            )
-
-    @extend_schema(
-        summary="Get system categories",
-        description="Get all system categories.",
-        responses={200: CategoryListSerializer(many=True)},
-    )
-    @action(detail=False, methods=["get"], url_path="system")
-    def system_categories(self, request):
-        """Get all system categories."""
-        try:
-            system_categories = Category.objects.filter(
-                is_system_category=True, is_active=True
-            ).order_by("name")
-
-            serializer = CategoryListSerializer(
-                system_categories, many=True, context={"request": request}
-            )
-
+            serializer = self.get_serializer(filtered_queryset, many=True)
             return Response(serializer.data)
 
         except Exception as e:
@@ -1058,23 +1029,54 @@ class CategoryViewSet(
             )
 
     @extend_schema(
-        summary="Get user categories",
-        description="Get categories belonging to the current user.",
-        responses={200: CategoryListSerializer(many=True)},
+        parameters=[
+            OpenApiParameter(
+                name="search",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Search your categories by name",
+                required=False,
+            ),
+            OpenApiParameter(
+                name="category_type",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Filter your categories by type",
+                enum=[choice[0] for choice in choices.TransactionType.choices],
+                required=False,
+            ),
+            OpenApiParameter(
+                name="parent_id",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Filter your categories by parent ID",
+                required=False,
+            ),
+        ]
     )
-    @action(detail=False, methods=["get"], url_path="mine")
-    def my_categories(self, request):
+    @action(detail=False, methods=["get"])
+    def mine(self, request):
         """Get categories belonging to the current user."""
         try:
             user = request.user
-            user_categories = Category.objects.filter(
-                user=user, is_active=True
-            ).order_by("name")
 
-            serializer = CategoryListSerializer(
-                user_categories, many=True, context={"request": request}
-            )
+            queryset = Category.objects.all()
+            if user.is_staff or user.is_superuser:
+                queryset = queryset
+            else:
+                queryset = queryset.filter(is_active=True)
 
+            # Apply filters
+            filter_instance = CategoryFilter(request, queryset, is_mine=True)
+            filtered_queryset = filter_instance.apply_filters()
+
+            # Paginate and serialize
+            page = self.paginate_queryset(filtered_queryset.order_by("name"))
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+
+            serializer = self.get_serializer(filtered_queryset, many=True)
             return Response(serializer.data)
 
         except Exception as e:

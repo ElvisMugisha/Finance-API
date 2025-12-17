@@ -314,3 +314,5 @@ SIMPLE_JWT = {
     "SLIDING_TOKEN_LIFETIME": timedelta(minutes=180),
     "SLIDING_TOKEN_REFRESH_LIFETIME": timedelta(days=2),
 }
+
+MAX_BATCH_SIZE = config("MAX_BATCH_SIZE", default=5, cast=int)

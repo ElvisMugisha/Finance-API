@@ -9,8 +9,8 @@ from rest_framework import status, viewsets, mixins, serializers
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from django.db import transaction as db_transaction
-from django.db import models
+from django.db import models, transaction as db_transaction
+from django.db.models import Count, Q
 from django.conf import settings
 from django.utils import timezone
 
@@ -60,8 +60,16 @@ class BaseAccountViewSet(viewsets.GenericViewSet):
         user = self.request.user
 
         # Optimize queries with select_related and prefetch_related
-        queryset = Account.objects.select_related("currency", "user").prefetch_related(
-            "transactions"
+        queryset = (
+            Account.objects.select_related("currency", "user")
+            .prefetch_related("transactions")
+            .annotate(
+                transaction_count=Count(
+                    "transactions",
+                    filter=Q(transactions__status=choices.TransactionStatus.COMPLETED),
+                    distinct=True,
+                )
+            )
         )
 
         if user.is_staff or user.is_superuser:
@@ -739,7 +747,7 @@ class AccountViewSet(
         Returns:
             Detailed error message with specific reason
         """
-        from .models import Transaction, Budget, RecurringTransaction, FinancialGoal
+        from .models import Transaction, Budget, FinancialGoal
 
         # 1. Check for completed transactions
         if account.transaction_count > 0:

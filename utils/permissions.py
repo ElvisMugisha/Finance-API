@@ -13,10 +13,12 @@ class BaseUserPermission(permissions.BasePermission):
         """Common user validation checks."""
         if not request.user or not request.user.is_authenticated:
             self.message = "Authentication credentials were not provided."
+            logger.warning(self.message)
             return False
 
         if not request.user.is_active:
             self.message = "User account is not active."
+            logger.warning(self.message)
             return False
 
         if not getattr(request.user, "is_verified", True):
@@ -108,12 +110,13 @@ class IsOwnerOrAdmin(BaseUserPermission):
 
 class CategoryPermission(BaseUserPermission):
     """
-    Custom permission for Category operations.
+    Permission class for category operations.
 
     Rules:
-    - All authenticated users can list their own categories + system categories
-    - Regular users can only CRUD their own categories
-    - Staff/Admin can CRUD any category (including system categories)
+    - All authenticated users can create/view categories
+    - Users can only modify/delete their own categories
+    - Staff/Admin can modify/delete any category
+    - System categories are read-only for regular users
     """
 
     message = "You do not have permission to perform this action."
@@ -123,25 +126,13 @@ class CategoryPermission(BaseUserPermission):
         if not self._check_user(request):
             return False
 
-        # Everyone can list and retrieve
-        if view.action in ["list", "retrieve", "tree"]:
-            return True
-
-        # Everyone can create (handled in has_object_permission for update/delete)
-        if view.action == "create":
-            return True
-
-        # Bulk operations require staff/admin
-        if view.action == "bulk_update":
-            return request.user.is_staff or request.user.is_superuser
-
         return True
 
     def has_object_permission(self, request, view, obj):
-        """Check permission for specific category object."""
+        """Check object-level permission."""
         user = request.user
 
-        # Staff/Admin can do anything
+        # Staff/Admin have full access
         if user.is_staff or user.is_superuser:
             return True
 
