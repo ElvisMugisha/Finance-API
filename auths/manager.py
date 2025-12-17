@@ -1,103 +1,105 @@
 from django.contrib.auth.models import BaseUserManager
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
-from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
+from django.db import IntegrityError, transaction
+from django.utils.text import slugify
 
 from utils import loggings
 
-# Initialize logger
 logger = loggings.setup_logging()
 
 
 class UserManager(BaseUserManager):
-    """Custom user manager class that extends BaseUserManager to handle
-    user creation and validation for regular users and superusers.
-
-    This class provides custom methods for creating users with email
-    and password validation and includes specialized logic for
-    creating superusers with elevated permissions.
+    """
+    Custom user manager responsible for:
+    - User creation
+    - Superuser creation
+    - Email normalization & validation
     """
 
-    def email_validator(self, email):
-        """Validate the provided email format using Django's validate_email."""
+    def _validate_email(self, email: str) -> str:
+        if not email:
+            raise ValueError(_("Email address is required"))
+
+        email = self.normalize_email(email)
+
         try:
             validate_email(email)
-            logger.debug(f"Email {email} validated successfully")
-        except ValidationError:
-            logger.error(f"Invalid email address: {email}")
-            raise ValueError(_("Please enter a valid email address"))
+        except ValidationError as exc:
+            logger.warning("Invalid email provided", extra={"email": email})
+            raise ValueError(_("Invalid email address")) from exc
 
-    def generate_username(self, first_name, last_name):
-        """Generate a unique username using the user's first and last names.
-        If the username is not unique, append a random number to it.
-        """
-        logger.info(f"Generating username for user: {first_name}")
-        base_username = slugify(f"{first_name}{last_name}")
-        unique_username = base_username
+        return email
+
+    def _generate_unique_username(self, first_name: str, last_name: str) -> str:
+        base = slugify(f"{first_name}.{last_name}") or "user"
+        candidate = base
         counter = 1
-        while self.model.objects.filter(username=unique_username).exists():
-            unique_username = f"{base_username}{counter}"
+
+        while self.model.objects.filter(username=candidate).exists():
+            candidate = f"{base}{counter}"
             counter += 1
-        logger.info(f"Generated username: {unique_username} for user: {first_name}")
-        return unique_username
 
+        return candidate
+
+    @transaction.atomic
     def create_user(self, email, first_name, last_name, password=None, **extra_fields):
-        """Create and return a regular user with the provided details."""
-        if email:
-            logger.info(f"Normalizing the email {email}")
-            email = self.normalize_email(email)
-            logger.info(f"Email {email} normalized, now validating the email")
-            self.email_validator(email)
-        else:
-            logger.error("Email is missing")
-            raise ValueError(_("Please provide an email address"))
+        """
+        Create and persist a regular user.
+        """
+        email = self._validate_email(email)
 
-        if not first_name:
-            logger.error("First name is missing")
-            raise ValueError(_("First name is required"))
-        if not last_name:
-            logger.error("Last name is missing")
-            raise ValueError(_("Last name is required"))
+        if not first_name or not last_name:
+            raise ValueError(_("First name and last name are required"))
 
-        username = self.generate_username(first_name, last_name)
-
-        user = self.model(
-            email=self.normalize_email(email),
-            username=username,
-            first_name=first_name,
-            last_name=last_name,
-            **extra_fields,
+        username = extra_fields.pop(
+            "username",
+            self._generate_unique_username(first_name, last_name),
         )
-        user.set_password(password)
-        user.save(using=self._db)
-        logger.info(f"User {username} created successfully")
+
+        try:
+            user = self.model(
+                email=email,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                **extra_fields,
+            )
+
+            user.set_password(password)
+            user.full_clean()
+            user.save(using=self._db)
+
+        except IntegrityError as exc:
+            logger.error("Failed to create user", exc_info=True)
+            raise ValueError(_("User creation failed")) from exc
+
+        logger.info("User created", extra={"user_id": user.id})
         return user
 
     def create_superuser(
         self, email, first_name, last_name, password=None, **extra_fields
     ):
-        """Create and return a superuser with elevated permissions."""
-        extra_fields.setdefault("is_superuser", True)
-        extra_fields.setdefault("is_staff", True)
-        extra_fields.setdefault("is_active", True)
-        extra_fields.setdefault("is_verified", True)
-
+        """
+        Create and persist a superuser.
+        """
         if not password:
-            logger.error("Superuser password is missing")
-            raise ValueError(_("Superuser must have a password"))
+            raise ValueError(_("Superusers must have a password"))
 
-        if extra_fields.get("is_staff") is not True:
-            logger.error("Superuser must have is_staff set to True")
-            raise ValueError(_("Superuser must have is_staff set to True"))
-        if extra_fields.get("is_superuser") is not True:
-            logger.error("Superuser must have is_superuser set to True")
-            raise ValueError(_("Superuser must have is_superuser set to True"))
-        if extra_fields.get("is_verified") is not True:
-            logger.error("Superuser must have is_verified set to True")
-            raise ValueError(_("Superuser must have is_verified set to True"))
+        extra_fields.update(
+            {
+                "is_staff": True,
+                "is_superuser": True,
+                "is_active": True,
+                "is_verified": True,
+            }
+        )
 
-        user = self.create_user(email, first_name, last_name, password, **extra_fields)
-        user.save(using=self._db)
-        logger.info(f"Superuser {first_name} created successfully")
-        return user
+        return self.create_user(
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+            password=password,
+            **extra_fields,
+        )
