@@ -2,6 +2,7 @@ import uuid
 from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 from django.utils import timezone
+from django.conf import settings
 from django.core.exceptions import ValidationError
 
 from utils import choices, loggings
@@ -229,3 +230,156 @@ class Profile(models.Model):
 
     def __str__(self) -> str:
         return f"Profile({self.user.email})"
+
+
+class DeviceSession(models.Model):
+    """
+    Tracks active sessions and devices for each user.
+
+    Responsibilities:
+    - Record IP address, device info, and last activity.
+    - Supports session management, audit, and security monitoring.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="sessions"
+    )
+
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    device = models.CharField(max_length=255, default="Unknown Device")
+    user_agent = models.TextField(blank=True, default="")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_activity = models.DateTimeField(default=timezone.now)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        verbose_name = "Device Session"
+        verbose_name_plural = "Device Sessions"
+        ordering = ["-created_at"]
+        db_table = "device_sessions"
+        indexes = [
+            models.Index(fields=["user", "ip_address"]),
+            models.Index(fields=["last_activity"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} - {self.device} ({self.ip_address})"
+
+    def update_activity(self):
+        """
+        Update the last_activity timestamp for this session.
+        """
+        try:
+            self.last_activity = timezone.now()
+            self.save(update_fields=["last_activity"])
+            logger.debug(f"Updated last_activity for session {self.id}")
+        except Exception as e:
+            logger.exception(
+                f"Failed to update last_activity for session {self.id}: {str(e)}"
+            )
+
+
+class UserLoginAudit(models.Model):
+    """
+    Stores login audit events.
+
+    Supports:
+    - Authenticated logins
+    - Failed logins (unknown user, wrong password)
+    - Brute-force and security analytics
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="login_audits",
+        null=True,
+        blank=True,
+        help_text="Null for unauthenticated or unknown-user login attempts",
+    )
+
+    email = models.EmailField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Email used during login attempt (even if user not found)",
+    )
+
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    device = models.CharField(max_length=255, default="Unknown Device")
+    user_agent = models.TextField(blank=True, default="")
+    status = models.CharField(
+        max_length=10,
+        choices=choices.LoginStatus.choices,
+        default=choices.LoginStatus.SUCCESS,
+        db_index=True,
+    )
+
+    timestamp = models.DateTimeField(default=timezone.now, db_index=True)
+    failure_reason = models.TextField(blank=True, null=True)
+
+    class Meta:
+        verbose_name = "User Login Audit"
+        verbose_name_plural = "User Login Audits"
+        db_table = "user_login_audits"
+        ordering = ["-timestamp"]
+        indexes = [
+            models.Index(fields=["email", "status"]),
+            models.Index(fields=["user", "status"]),
+            models.Index(fields=["ip_address", "timestamp"]),
+        ]
+
+    def __str__(self) -> str:
+        identity = self.email or getattr(self.user, "email", "unknown")
+        return f"{identity} - {self.status} @ {self.timestamp.isoformat()}"
+
+    @classmethod
+    def log_event(
+        cls,
+        *,
+        user: User | None,
+        email: str | None,
+        status: choices.LoginStatus,
+        ip_address: str | None = None,
+        device: str | None = None,
+        user_agent: str | None = "",
+        failure_reason: str | None = None,
+    ) -> None:
+        """
+        Persist a login audit event.
+
+        This method MUST NEVER raise exceptions to callers.
+        """
+        try:
+            cls.objects.create(
+                user=user,
+                email=email,
+                status=status,
+                ip_address=ip_address,
+                device=(device or "Unknown Device")[:255],
+                user_agent=user_agent or "",
+                failure_reason=failure_reason,
+            )
+            logger.debug(
+                "Login audit event recorded",
+                extra={
+                    "user_id": getattr(user, "id", None),
+                    "email": email,
+                    "status": status,
+                    "ip": ip_address,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record login audit event",
+                extra={
+                    "user_id": getattr(user, "id", None),
+                    "email": email,
+                    "status": status,
+                },
+            )

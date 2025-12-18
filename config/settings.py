@@ -189,8 +189,8 @@ MEDIA_ROOT = BASE_DIR / "media"
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
-        "rest_framework.authentication.TokenAuthentication",
-        "rest_framework.authentication.SessionAuthentication",
+        # "rest_framework.authentication.TokenAuthentication",
+        # "rest_framework.authentication.SessionAuthentication",
         "rest_framework.authentication.BasicAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": ["utils.permissions.IsActiveAndVerified"],
@@ -316,3 +316,5 @@ SIMPLE_JWT = {
 }
 
 MAX_BATCH_SIZE = config("MAX_BATCH_SIZE", default=5, cast=int)
+MAX_FAILED_ATTEMPTS = config("MAX_FAILED_ATTEMPTS", default=5, cast=int)
+LOCKOUT_TIME = config("LOCKOUT_TIME", default=180, cast=int)

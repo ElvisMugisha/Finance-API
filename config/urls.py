@@ -33,8 +33,8 @@ urlpatterns = [
 # Application URLs
 urlpatterns += [
     path("auth/", include("auths.urls")),
-    path("core/", include("core.urls")),
-    path("accounts/", include("accounts.urls")),
+    # path("core/", include("core.urls")),
+    # path("accounts/", include("accounts.urls")),
 ]
 
 # API URLs

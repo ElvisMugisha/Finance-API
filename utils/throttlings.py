@@ -3,7 +3,74 @@ import re
 from decouple import config
 from django.utils.translation import gettext_lazy as _
 from rest_framework.exceptions import Throttled
-from rest_framework.throttling import UserRateThrottle
+from rest_framework.throttling import UserRateThrottle, AnonRateThrottle
+from django.core.cache import cache
+from django.conf import settings
+from datetime import timedelta
+from django.utils import timezone
+
+from utils import loggings
+
+logger = loggings.setup_logging()
+
+
+def check_brute_force(email: str) -> bool:
+    """
+    Check if the user is temporarily locked out due to repeated failed login attempts.
+
+    Uses Django cache to track failed login attempts per email.
+
+    Returns:
+        bool: True if login is allowed, False if account is temporarily locked.
+    """
+    cache_key = f"failed_login:{email}"
+    failed_attempts = cache.get(cache_key, {"count": 0, "last_attempt": None})
+
+    # Check if lockout period is active
+    if failed_attempts["count"] >= settings.MAX_FAILED_ATTEMPTS:
+        last_attempt = failed_attempts.get("last_attempt")
+        if (
+            last_attempt
+            and (timezone.now() - last_attempt).total_seconds() < settings.LOCKOUT_TIME
+        ):
+            logger.warning(
+                f"Brute-force protection active for {email}. Attempts: {failed_attempts['count']}"
+            )
+            return False
+        else:
+            # Lockout expired, reset
+            cache.set(
+                cache_key, {"count": 0, "last_attempt": None}, settings.LOCKOUT_TIME
+            )
+
+    return True
+
+
+def register_failed_login(email: str):
+    """
+    Increment the failed login counter for the given email.
+
+    Used in LoginSerializer when authentication fails.
+    """
+    cache_key = f"failed_login:{email}"
+    failed_attempts = cache.get(cache_key, {"count": 0, "last_attempt": None})
+
+    failed_attempts["count"] += 1
+    failed_attempts["last_attempt"] = timezone.now()
+
+    cache.set(cache_key, failed_attempts, settings.LOCKOUT_TIME)
+    logger.info(
+        f"Registered failed login for {email}. Count: {failed_attempts['count']}"
+    )
+
+
+def reset_failed_logins(email: str):
+    """
+    Reset the failed login counter after a successful login.
+    """
+    cache_key = f"failed_login:{email}"
+    cache.delete(cache_key)
+    logger.debug(f"Reset failed login counter for {email}")
 
 
 class CustomScopedRateThrottle(UserRateThrottle):

@@ -4,4 +4,9 @@ Design Principles:
 - YAGNI (You Ain't Gonna Need It): Remove unnecessary features
 - SoC (Separation of Concerns): Separate concerns appropriately
 - SOLID (Single Responsibility, Open/Closed, Liskov Substitution, Interface Segregation, Dependency Inversion): Follow object-oriented design principles
--
+
+
+1. Session cleanup: Periodically deactivate old DeviceSession entries to avoid DB bloat.
+2. User agent parsing: Optionally parse devices/browsers for better reporting.
+3. Audit all failures: Currently, UserLoginAudit creation is shown only for successes; failed logins should also call UserLoginAudit.log_event.
+4. Refresh token rotation: blacklisting old refresh tokens

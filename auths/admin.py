@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import User, Passcode, Profile
+from .models import User, Passcode, Profile, DeviceSession, UserLoginAudit
 
 
 class ProfileInline(admin.StackedInline):
@@ -12,9 +12,7 @@ class ProfileInline(admin.StackedInline):
     """
 
     model = Profile
-    can_delete = False
     extra = 0
-    show_change_link = True
 
     fieldsets = (
         (
@@ -155,15 +153,67 @@ class UserAdmin(admin.ModelAdmin):
 
 @admin.register(Passcode)
 class PasscodeAdmin(admin.ModelAdmin):
-    list_display = [
+    """
+    Admin configuration for passcodes (OTP).
+    """
+
+    list_display = (
         "user",
         "code",
         "code_type",
         "is_used",
         "expires_at",
         "created_at",
-    ]
+    )
     list_display_links = ["code", "user"]
     list_filter = ["code_type", "is_used"]
-    search_fields = ["user", "code", "code_type"]
+    search_fields = ["user__email", "user__username", "code"]
+    ready_only_fields = ["id", "created_at"]
     ordering = ["-created_at"]
+
+
+@admin.register(DeviceSession)
+class DeviceSessionAdmin(admin.ModelAdmin):
+    """
+    Admin configuration for DeviceSession.
+    """
+    list_display = (
+        "user",
+        "ip_address",
+        "device",
+        "user_agent",
+        "created_at",
+        "last_activity",
+        "is_active",
+    )
+    list_display_links = ["user", "ip_address"]
+    list_filter = ["is_active", "user_agent"]
+    search_fields = ["user__email", "user__username", "ip_address", "device"]
+    ready_only_fields = ["id", "created_at", "last_activity"]
+    ordering = ["-created_at"]
+
+
+@admin.register(UserLoginAudit)
+class UserLoginAuditAdmin(admin.ModelAdmin):
+    """
+    Admin configuration for UserLoginAudit.
+    """
+    list_display = (
+        "user",
+        "email", "ip_address",
+        "device",
+        "user_agent",
+        "status",
+        "timestamp",
+        "failure_reason",
+    )
+    list_display_links = ["ip_address", "user", "email"]
+    list_filter = ["status"]
+    search_fields = [
+        "email",
+        "ip_address",
+        "device",
+        "failure_reason",
+    ]
+    ready_only_fields = ["id", "timestamp"]
+    ordering = ["-timestamp"]

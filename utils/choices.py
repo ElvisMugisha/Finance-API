@@ -4,6 +4,11 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 
+class LoginStatus(models.TextChoices):
+    SUCCESS = "success", _("Success")
+    FAILURE = "failure", _("Failure")
+
+
 class CodeType(models.TextChoices):
     OTP = "OTP", _("One Time Password")
     VERIFICATION = "Email_Verification", _("Email Verification")
