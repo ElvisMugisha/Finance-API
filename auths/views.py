@@ -111,6 +111,7 @@ class UserRegistrationView(APIView):
             status=status.HTTP_201_CREATED,
         )
 
+
 class EmailVerificationView(APIView):
     """
     Verify a user's email address using an OTP.
@@ -297,33 +298,75 @@ class LoginView(APIView):
 
             # Device / Session Tracking
             try:
-                DeviceSession.objects.create(
+                device_str = user_agent[:255] or "Unknown Device"
+
+                # Check for existing session with same user, ip, and device
+                session, created = DeviceSession.objects.get_or_create(
                     user=user,
                     ip_address=ip_address,
-                    device=user_agent[:255] or "Unknown Device",
-                    last_activity=timezone.now(),
+                    device=device_str,
+                    defaults={
+                        "last_activity": timezone.now(),
+                        "user_agent": user_agent,
+                    },
                 )
+
+                if not created:
+                    # Update last_activity if session already exists
+                    session.last_activity = timezone.now()
+                    session.user_agent = (
+                        user_agent  # optionally update user_agent if changed
+                    )
+                    session.save(update_fields=["last_activity", "user_agent"])
+                    logger.debug(
+                        f"Updated last_activity for existing DeviceSession {session.id} for user {user.id}"
+                    )
+                else:
+                    logger.debug(
+                        f"Created new DeviceSession {session.id} for user {user.id}"
+                    )
+
             except Exception:
                 # Device tracking must never block login
                 logger.exception(
-                    "Failed to create device session",
+                    "Failed to create/update device session",
                     extra={"user_id": user.id},
                 )
 
             # Login Audit (SUCCESS)
-            UserLoginAudit.log_event(
-                user=user,
-                email=user.email,
-                status=choices.LoginStatus.SUCCESS,
-                ip_address=ip_address,
-                device=user_agent,
-                user_agent=user_agent,
-            )
+            try:
+                if user:
+                    # Check for existing successful login audit
+                    audit, created = UserLoginAudit.objects.get_or_create(
+                        user=user,
+                        ip_address=ip_address,
+                        device=device_str[:255],
+                        status=choices.LoginStatus.SUCCESS,
+                        defaults={
+                            "user_agent": user_agent,
+                            "timestamp": timezone.now(),
+                        },
+                    )
 
-            logger.info(
-                "User logged in successfully",
-                extra={"user_id": user.id, "ip": ip_address},
-            )
+                    if not created:
+                        # Update timestamp if already exists
+                        audit.timestamp = timezone.now()
+                        audit.user_agent = user_agent
+                        audit.save(update_fields=["timestamp", "user_agent"])
+                        logger.debug(
+                            f"Updated timestamp for existing successful UserLoginAudit {audit.id} for user {user.id}"
+                        )
+                    else:
+                        logger.debug(
+                            f"Created new successful UserLoginAudit {audit.id} for user {user.id}"
+                        )
+
+            except Exception:
+                # Login audit must never block login
+                logger.exception(
+                    "Failed to create/update UserLoginAudit",
+                    extra={"user_id": user.id},
+                )
 
             return Response(
                 {
@@ -390,7 +433,7 @@ class LogoutView(APIView):
 
         logger.info(f"Logout requested by user {user.id} ({user.email})")
 
-        # JWT Blacklisting
+        # JWT Blacklisting and Deletion
         if refresh_token:
             try:
                 token = RefreshToken(refresh_token)
@@ -398,36 +441,52 @@ class LogoutView(APIView):
                 actions_performed.append("JWT refresh token blacklisted")
                 logger.info(f"JWT refresh token blacklisted for user {user.id}")
 
+                # Delete the token from OutstandingToken
+                OutstandingToken.objects.filter(token=token).delete()
+                actions_performed.append(
+                    "Provided JWT refresh token deleted from OutstandingToken"
+                )
+                logger.info(f"Provided JWT refresh token deleted for user {user.id}")
+
             except TokenError as e:
                 warning = f"JWT token blacklisting failed: {str(e)}"
                 warnings.append(warning)
                 logger.warning(f"{warning} for user {user.id}")
 
         else:
-            # Blacklist all outstanding refresh tokens for this user
+            # Blacklist and delete all outstanding refresh tokens for this user
             try:
                 tokens = OutstandingToken.objects.filter(user=user)
                 count_blacklisted = 0
+                count_deleted = 0
+
                 for t in tokens:
                     try:
+                        # Blacklist
                         BlacklistedToken.objects.get_or_create(token=t)
                         count_blacklisted += 1
 
+                        # Delete token
+                        t.delete()
+                        count_deleted += 1
+
                     except Exception as e:
-                        warnings.append(f"Failed to blacklist token {t.id}: {str(e)}")
+                        warnings.append(
+                            f"Failed to blacklist/delete token {t.id}: {str(e)}"
+                        )
                         logger.warning(
-                            f"Failed to blacklist token {t.id} for user {user.id}: {str(e)}"
+                            f"Failed to blacklist/delete token {t.id} for user {user.id}: {str(e)}"
                         )
 
                 actions_performed.append(
-                    f"No refresh token provided: Blacklisted {count_blacklisted} active token(s)"
+                    f"Blacklisted {count_blacklisted} token(s) and deleted {count_deleted} token(s)"
                 )
                 logger.info(
-                    f"Blacklisted {count_blacklisted} outstanding tokens for user {user.id}"
+                    f"Blacklisted {count_blacklisted} and deleted {count_deleted} outstanding tokens for user {user.id}"
                 )
 
             except Exception as e:
-                warning = f"Outstanding token blacklisting failed: {str(e)}"
+                warning = f"Outstanding token blacklisting/deletion failed: {str(e)}"
                 warnings.append(warning)
                 logger.error(f"{warning} for user {user.id}")
 
@@ -461,27 +520,20 @@ class LogoutView(APIView):
             warnings.append(warning)
             logger.error(f"{warning} for user {user.id}")
 
-        # DeviceSession Cleanup
+        # UserLoginAudit Cleanup - delete only failed attempts
         try:
-            deleted_count, _ = user.sessions.all().delete()
-            actions_performed.append(f"Deleted {deleted_count} DeviceSession(s)")
-            logger.info(f"Deleted {deleted_count} DeviceSession(s) for user {user.id}")
+            failed_audits = UserLoginAudit.objects.filter(
+                (models.Q(user=user) | models.Q(email=user.email))
+                & models.Q(status=choices.LoginStatus.FAILURE)
+            )
+            deleted_count = failed_audits.count()
+            failed_audits.delete()
 
-        except Exception as e:
-            warning = f"DeviceSession cleanup failed: {str(e)}"
-            warnings.append(warning)
-            logger.error(f"{warning} for user {user.id}")
-
-        # UserLoginAudit Cleanup
-        try:
-            deleted_count, _ = UserLoginAudit.objects.filter(
-                models.Q(user=user) | models.Q(email=user.email)
-            ).delete()
             actions_performed.append(
-                f"Deleted {deleted_count} UserLoginAudit record(s) (including failed attempts by email)"
+                f"Deleted {deleted_count} failed UserLoginAudit record(s)"
             )
             logger.info(
-                f"Deleted {deleted_count} UserLoginAudit record(s) for user {user.id} ({user.email})"
+                f"Deleted {deleted_count} failed UserLoginAudit record(s) for user {user.id} ({user.email})"
             )
 
         except Exception as e:
