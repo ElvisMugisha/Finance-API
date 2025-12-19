@@ -156,76 +156,41 @@ class EmailVerificationSerializer(serializers.Serializer):
 
 class ResendOTPSerializer(serializers.Serializer):
     """
-    Validate OTP resend requests.
+    Validate resend OTP requests.
 
     Responsibilities:
+    - Normalize email
     - Ensure user exists
     - Ensure user is not already verified
-    - Detect active (unexpired, unused) OTPs
-    - Provide remaining TTL if OTP is still valid
 
     NOTE:
-    This serializer performs validation ONLY.
-    No database mutation occurs here.
+    - No OTP or rate-limit logic here (SoC).
     """
 
     email = serializers.EmailField()
 
-    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
-        email = attrs["email"].strip().lower()
-        logger.info("Validating OTP resend request", extra={"email": email})
+    def validate_email(self, value: str) -> str:
+        email = value.strip().lower()
 
-        # Fetch user
+        logger.debug("Validating resend OTP email", extra={"email": email})
+
         try:
             user = User.objects.get(email=email)
         except User.DoesNotExist:
-            logger.warning("OTP resend failed: user not found", extra={"email": email})
+            logger.warning("Resend OTP failed: user not found", extra={"email": email})
             raise serializers.ValidationError(
-                {"email": "No account found with this email address."}
+                "No account found with this email address."
             )
 
         if user.is_verified:
-            logger.info("OTP resend blocked: already verified", extra={"email": email})
-            raise serializers.ValidationError(
-                {"email": "This account is already verified."}
+            logger.info(
+                "Resend OTP blocked: account already verified",
+                extra={"email": email},
             )
+            raise serializers.ValidationError("This account is already verified.")
 
-        # Check for active OTP
-        active_otp = (
-            Passcode.objects.filter(
-                user=user,
-                code_type=choices.CodeType.VERIFICATION,
-                is_used=False,
-                expires_at__gt=timezone.now(),
-            )
-            .order_by("-expires_at")
-            .first()
-        )
-
-        if active_otp:
-            remaining_seconds = int(
-                (active_otp.expires_at - timezone.now()).total_seconds()
-            )
-
-            logger.warning(
-                "Active OTP still valid",
-                extra={
-                    "email": email,
-                    "remaining_seconds": remaining_seconds,
-                },
-            )
-
-            raise serializers.ValidationError(
-                {
-                    "otp": (
-                        "An active verification code already exists. "
-                        f"Please wait {remaining_seconds} seconds before requesting a new one."
-                    )
-                }
-            )
-
-        attrs["user"] = user
-        return attrs
+        self.context["user"] = user
+        return email
 
 
 class LoginSerializer(serializers.Serializer):
@@ -291,388 +256,324 @@ class LoginSerializer(serializers.Serializer):
         return attrs
 
 
-# class UserSerializer(serializers.ModelSerializer):
-#     """
-#     Serializer for the User model.
+class PasswordChangeSerializer(serializers.Serializer):
+    """
+    Serializer responsible for validating password change requests.
 
-#     This serializer is used to retrieve and update user information.
-#     It includes fields for user identification, profile details, and status.
-#     """
+    Responsibilities:
+    - Verify the current (old) password
+    - Enforce password complexity rules
+    - Ensure new passwords match
+    - Prevent password reuse
 
-#     class Meta:
-#         model = User
-#         fields = [
-#             "id",
-#             "username",
-#             "email",
-#             "first_name",
-#             "last_name",
-#             "is_premium",
-#             "premium_expires",
-#             "is_active",
-#             "is_verified",
-#             "last_activity",
-#             "created_at",
-#             "updated_at",
-#         ]
-#         read_only_fields = [
-#             "id",
-#             "email",
-#             "is_premium",
-#             "premium_expires",
-#             "is_active",
-#             "is_verified",
-#             "last_activity",
-#             "created_at",
-#             "updated_at",
-#         ]
+    This serializer performs validation ONLY.
+    No database mutation occurs here.
+    """
 
-#     def update(self, instance: User, validated_data: Dict[str, Any]) -> User:
-#         """
-#         Update and return an existing `User` instance, given the validated data.
+    old_password = serializers.CharField(
+        write_only=True,
+        style={"input_type": "password"},
+        help_text="Current password for verification.",
+    )
+    new_password = serializers.CharField(
+        write_only=True,
+        style={"input_type": "password"},
+        help_text="New password. Must meet complexity requirements.",
+    )
+    confirm_new_password = serializers.CharField(
+        write_only=True,
+        style={"input_type": "password"},
+        help_text="Confirmation of the new password.",
+    )
 
-#         Args:
-#             instance (User): The user instance to update.
-#             validated_data (Dict[str, Any]): The data to update.
+    def validate_old_password(self, value: str) -> str:
+        """
+        Ensure the provided old password matches the user's current password.
+        """
+        user = self.context["request"].user
 
-#         Returns:
-#             User: The updated user instance.
-#         """
-#         logger.info(f"Updating user [{instance.username}] info")
-#         return super().update(instance, validated_data)
+        if not user.check_password(value):
+            logger.warning(
+                "Password change failed: incorrect current password",
+                extra={"user_id": user.id, "email": user.email},
+            )
+            raise serializers.ValidationError("Current password is incorrect.")
 
+        return value
 
-# class ProfileSerializer(serializers.ModelSerializer):
-#     """
-#     Serializer for the Profile model.
-#     """
+    def validate_new_password(self, value: str) -> str:
+        """
+        Validate password strength using Django's password validators.
+        """
+        try:
+            validate_password(value)
+        except ValidationError as exc:
+            logger.warning(
+                "Password complexity validation failed",
+                extra={"errors": exc.messages},
+            )
+            raise serializers.ValidationError(exc.messages)
 
-#     class Meta:
-#         model = Profile
-#         fields = [
-#             "bio",
-#             "phone_number",
-#             "dob",
-#             "profile_picture",
-#             "gender",
-#             "occupation",
-#             "annual_income",
-#             "monthly_income_target",
-#             "emergency_fund_target",
-#             "currency_preference",
-#             "financial_goals",
-#             "risk_tolerance",
-#             "financial_advisor",
-#             "retirement_goal",
-#             "investment_experience",
-#             "notification_preferences",
-#             "privacy_settings",
-#             "country",
-#             "city",
-#             "street",
-#             "zip_code",
-#         ]
+        return value
 
+    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Cross-field validation:
+        - New passwords must match
+        - New password must differ from old password
+        """
+        old_password = attrs["old_password"]
+        new_password = attrs["new_password"]
+        confirm_password = attrs["confirm_new_password"]
 
-# class UserListSerializer(serializers.ModelSerializer):
-#     """
-#     Serializer for listing users with their profile.
-#     """
+        if new_password != confirm_password:
+            logger.warning("Password change failed: password mismatch")
+            raise serializers.ValidationError(
+                {"confirm_new_password": "New passwords do not match."}
+            )
 
-#     profile = serializers.SerializerMethodField()
+        if old_password == new_password:
+            logger.warning("Password change failed: password reuse attempt")
+            raise serializers.ValidationError(
+                {
+                    "new_password": "New password must be different from the current password."
+                }
+            )
 
-#     class Meta:
-#         model = User
-#         fields = [
-#             "id",
-#             "email",
-#             "username",
-#             "first_name",
-#             "middle_name",
-#             "last_name",
-#             "is_active",
-#             "is_verified",
-#             "is_staff",
-#             "is_superuser",
-#             "last_activity",
-#             "created_at",
-#             "updated_at",
-#             "profile",
-#         ]
-
-#     def get_profile(self, obj: User) -> Optional[Dict[str, Any]]:
-#         """
-#         Retrieve the user's profile if it exists.
-
-#         Args:
-#             obj (User): The user object.
-
-#         Returns:
-#             dict: Profile data or None.
-#         """
-#         if hasattr(obj, "user_profile"):
-#             return ProfileSerializer(obj.user_profile).data
-#         return None
+        return attrs
 
 
-# class PasswordChangeSerializer(serializers.Serializer):
-#     """
-#     Serializer for changing user password.
+class PasswordResetRequestSerializer(serializers.Serializer):
+    """
+    Serializer for initiating a password reset request.
 
-#     Validates old password, ensures new password meets complexity requirements,
-#     and confirms new password matches confirmation.
-#     """
+    Responsibilities:
+    - Normalize email
+    - Validate format only (no existence checks to avoid enumeration)
+    """
 
-#     old_password = serializers.CharField(
-#         required=True,
-#         write_only=True,
-#         style={"input_type": "password"},
-#         help_text="Current password for verification",
-#     )
-#     new_password = serializers.CharField(
-#         required=True,
-#         write_only=True,
-#         style={"input_type": "password"},
-#         help_text="New password. Must meet complexity requirements.",
-#     )
-#     confirm_new_password = serializers.CharField(
-#         required=True,
-#         write_only=True,
-#         style={"input_type": "password"},
-#         help_text="Confirm the new password",
-#     )
+    email = serializers.EmailField(
+        help_text="Email address associated with the account."
+    )
 
-#     def validate_old_password(self, value: str) -> str:
-#         """
-#         Validate that the old password is correct.
-#         """
-#         user = self.context.get("request").user
-
-#         if not user.check_password(value):
-#             logger.warning(f"Incorrect old password attempt for user: {user.email}")
-#             raise serializers.ValidationError("Current password is incorrect.")
-
-#         return value
-
-#     def validate_new_password(self, value: str) -> str:
-#         """
-#         Validate new password complexity.
-#         """
-#         try:
-#             validate_password(value)
-#             return value
-#         except ValidationError as e:
-#             logger.warning(f"Password complexity validation failed: {e}")
-#             raise serializers.ValidationError(list(e.messages))
-
-#     def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
-#         """
-#         Validate that new passwords match and differ from old password.
-#         """
-#         old_password = attrs.get("old_password")
-#         new_password = attrs.get("new_password")
-#         confirm_new_password = attrs.get("confirm_new_password")
-
-#         if new_password != confirm_new_password:
-#             logger.warning("New password and confirmation do not match")
-#             raise serializers.ValidationError(
-#                 {"confirm_new_password": "New passwords do not match."}
-#             )
-
-#         if old_password == new_password:
-#             logger.warning("New password is same as old password")
-#             raise serializers.ValidationError(
-#                 {
-#                     "new_password": "New password must be different from current password."
-#                 }
-#             )
-
-#         return attrs
+    def validate_email(self, value: str) -> str:
+        return value.strip().lower()
 
 
-# class PasswordResetRequestSerializer(serializers.Serializer):
-#     """
-#     Serializer for requesting password reset.
+class PasswordResetVerifySerializer(serializers.Serializer):
+    """
+    Validates a password reset OTP.
+    """
 
-#     Validates email and initiates password reset process by sending OTP.
-#     """
+    email = serializers.EmailField()
+    otp = serializers.CharField(min_length=8, max_length=8)
 
-#     email = serializers.EmailField(
-#         required=True, help_text="Email address of the account to reset password for"
-#     )
+    def validate(self, attrs):
+        email = attrs["email"].lower().strip()
+        otp = attrs["otp"].strip()
 
-#     def validate_email(self, value: str) -> str:
-#         """
-#         Validate and normalize email address.
-#         """
-#         email = value.lower().strip()
+        logger.info("Verifying password reset OTP", extra={"email": email})
 
-#         # Check if user exists just for logging/internal logic,
-#         # but always return email to prevent enumeration in the View if desired.
-#         # However, typically serializers raise error if invalid data.
-#         # Here we follow the previous pattern of checking existence but passing safely.
+        try:
+            user = User.objects.get(email=email)
+            passcode = Passcode.objects.get(
+                user=user,
+                code=otp,
+                code_type=choices.CodeType.PASSWORD_RESET,
+                is_used=False,
+            )
+        except (User.DoesNotExist, Passcode.DoesNotExist):
+            logger.warning("Invalid password reset OTP attempt", extra={"email": email})
+            raise serializers.ValidationError({"otp": "Invalid or expired reset code."})
 
-#         if not User.objects.filter(email=email).exists():
-#             logger.warning(f"Password reset requested for non-existent email: {email}")
-#             # We do NOT raise ValidationError here to prevent user enumeration
-#             # logic will be handled in view (if user is None, don't send email)
-#             pass
+        if passcode.expires_at < timezone.now():
+            passcode.is_used = True
+            passcode.save(update_fields=["is_used"])
 
-#         return email
+            logger.warning("Expired password reset OTP used", extra={"email": email})
+            raise serializers.ValidationError({"otp": "This reset code has expired."})
 
-
-# class PasswordResetVerifySerializer(serializers.Serializer):
-#     """
-#     Serializer for verifying password reset OTP.
-#     """
-
-#     email = serializers.EmailField(
-#         required=True, help_text="Email address of the account"
-#     )
-#     otp = serializers.CharField(
-#         required=True,
-#         min_length=8,
-#         max_length=8,
-#         help_text="8-digit OTP code sent to email",
-#     )
-
-#     def validate_email(self, value: str) -> str:
-#         return value.lower().strip()
-
-#     def validate_otp(self, value: str) -> str:
-#         otp = value.strip()
-#         if not otp.isdigit() or len(otp) != 8:
-#             logger.warning(f"Invalid OTP format: {otp}")
-#             raise serializers.ValidationError("OTP must be exactly 8 digits.")
-#         return otp
-
-#     def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
-#         """
-#         Validate OTP against database.
-#         """
-#         email = attrs.get("email")
-#         otp = attrs.get("otp")
-
-#         logger.info(f"Verifying password reset OTP for: {email}")
-
-#         try:
-#             user = User.objects.get(email=email)
-#         except User.DoesNotExist:
-#             logger.warning(f"OTP verification for non-existent email: {email}")
-#             raise serializers.ValidationError(
-#                 {"email": "No account found with this email address."}
-#             )
-
-#         try:
-#             passcode = Passcode.objects.get(
-#                 user=user,
-#                 code=otp,
-#                 code_type=choices.CodeType.PASSWORD_RESET,
-#                 is_used=False,
-#             )
-#         except Passcode.DoesNotExist:
-#             logger.warning(f"Invalid password reset OTP for {email}")
-#             raise serializers.ValidationError({"otp": "Invalid or expired reset code."})
-
-#         if passcode.expires_at < timezone.now():
-#             logger.warning(f"Expired password reset OTP for {email}")
-#             passcode.is_used = True
-#             passcode.save(update_fields=["is_used"])
-#             raise serializers.ValidationError(
-#                 {"otp": "This reset code has expired. Please request a new one."}
-#             )
-
-#         attrs["user"] = user
-#         attrs["passcode"] = passcode
-#         return attrs
+        attrs["user"] = user
+        attrs["passcode"] = passcode
+        return attrs
 
 
-# class PasswordResetConfirmSerializer(serializers.Serializer):
-#     """
-#     Serializer for confirming password reset with new password.
-#     """
+class PasswordResetSetNewSerializer(serializers.Serializer):
+    """
+    Sets a new password after OTP verification.
+    """
 
-#     email = serializers.EmailField(
-#         required=True, help_text="Email address of the account"
-#     )
-#     otp = serializers.CharField(
-#         required=True, min_length=8, max_length=8, help_text="8-digit OTP code"
-#     )
-#     new_password = serializers.CharField(
-#         required=True,
-#         write_only=True,
-#         style={"input_type": "password"},
-#         help_text="New password",
-#     )
-#     confirm_new_password = serializers.CharField(
-#         required=True,
-#         write_only=True,
-#         style={"input_type": "password"},
-#         help_text="Confirm new password",
-#     )
+    email = serializers.EmailField()
+    otp = serializers.CharField(min_length=8, max_length=8)
+    new_password = serializers.CharField(write_only=True)
+    confirm_new_password = serializers.CharField(write_only=True)
 
-#     def validate_email(self, value: str) -> str:
-#         return value.lower().strip()
+    def validate_new_password(self, value):
+        validate_password(value)
+        return value
 
-#     def validate_otp(self, value: str) -> str:
-#         otp = value.strip()
-#         if not otp.isdigit() or len(otp) != 8:
-#             raise serializers.ValidationError("Invalid OTP format.")
-#         return otp
+    def validate(self, attrs):
+        if attrs["new_password"] != attrs["confirm_new_password"]:
+            raise serializers.ValidationError(
+                {"confirm_new_password": "Passwords do not match."}
+            )
 
-#     def validate_new_password(self, value: str) -> str:
-#         try:
-#             validate_password(value)
-#             return value
-#         except ValidationError as e:
-#             logger.warning("Password reset: weak password provided")
-#             raise serializers.ValidationError(list(e.messages))
+        email = attrs["email"].lower().strip()
+        otp = attrs["otp"].strip()
 
-#     def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
-#         """
-#         Validate OTP and password confirmation.
-#         """
-#         email = attrs.get("email")
-#         otp = attrs.get("otp")
-#         new_password = attrs.get("new_password")
-#         confirm_new_password = attrs.get("confirm_new_password")
+        try:
+            user = User.objects.get(email=email)
+            passcode = Passcode.objects.get(
+                user=user,
+                code=otp,
+                code_type=choices.CodeType.PASSWORD_RESET,
+                is_used=False,
+            )
+        except (User.DoesNotExist, Passcode.DoesNotExist):
+            raise serializers.ValidationError({"otp": "Invalid or expired reset code."})
 
-#         if new_password != confirm_new_password:
-#             logger.warning("Password reset: passwords don't match")
-#             raise serializers.ValidationError(
-#                 {"confirm_new_password": "Passwords do not match."}
-#             )
+        if passcode.expires_at < timezone.now():
+            passcode.is_used = True
+            passcode.save(update_fields=["is_used"])
+            raise serializers.ValidationError({"otp": "This reset code has expired."})
 
-#         logger.info(f"Confirming password reset for: {email}")
+        attrs["user"] = user
+        attrs["passcode"] = passcode
+        return attrs
 
-#         try:
-#             user = User.objects.get(email=email)
-#         except User.DoesNotExist:
-#             logger.warning(f"Password reset confirm for non-existent email: {email}")
-#             raise serializers.ValidationError(
-#                 {"email": "No account found with this email address."}
-#             )
 
-#         try:
-#             passcode = Passcode.objects.get(
-#                 user=user,
-#                 code=otp,
-#                 code_type=choices.CodeType.PASSWORD_RESET,
-#                 is_used=False,
-#             )
-#         except Passcode.DoesNotExist:
-#             logger.warning(f"Invalid password reset OTP for {email}")
-#             raise serializers.ValidationError({"otp": "Invalid or expired reset code."})
+class ProfileSerializer(serializers.ModelSerializer):
+    """
+    Serializer for managing user profile data.
 
-#         if passcode.expires_at < timezone.now():
-#             logger.warning(f"Expired password reset OTP for {email}")
-#             passcode.is_used = True
-#             passcode.save(update_fields=["is_used"])
-#             raise serializers.ValidationError(
-#                 {"otp": "This reset code has expired. Please request a new one."}
-#             )
+    Responsibilities:
+    - Validate API input
+    - Enforce business rules at API boundary
+    """
 
-#         attrs["user"] = user
-#         attrs["passcode"] = passcode
-#         logger.info(f"Password reset validation successful for: {email}")
-#         return attrs
+    annual_income = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        required=False,
+        help_text="Annual income. Must be a non-negative decimal.",
+    )
+
+    currency_preference = serializers.CharField(
+        max_length=3,
+        required=False,
+        help_text="ISO 4217 currency code (e.g. USD, RWF).",
+    )
+
+    class Meta:
+        model = Profile
+        fields = [
+            "bio",
+            "phone_number",
+            "date_of_birth",
+            "profile_picture",
+            "gender",
+            "occupation",
+            "annual_income",
+            "currency_preference",
+            "notification_preferences",
+            "privacy_settings",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ("created_at", "updated_at")
+
+    def validate_annual_income(self, value):
+        """
+        Ensure annual income is non-negative.
+        """
+        if value is not None and value < 0:
+            raise serializers.ValidationError(
+                "Annual income must be a non-negative amount."
+            )
+        return value
+
+    def validate_date_of_birth(self, value):
+        """
+        Ensure date_of_birth is not in the future.
+        """
+        if value and value > timezone.now().date():
+            raise serializers.ValidationError("Date of birth cannot be in the future.")
+        return value
+
+
+class UserListSerializer(serializers.ModelSerializer):
+    """
+    Serializer for listing users with optional profile data.
+
+    Responsibilities:
+    - Serialize user fields
+    - Include profile data if it exists
+    """
+
+    profile = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            "id",
+            "email",
+            "username",
+            "first_name",
+            "middle_name",
+            "last_name",
+            "is_premium",
+            "premium_expires",
+            "is_active",
+            "is_verified",
+            "is_staff",
+            "is_superuser",
+            "last_login",
+            "last_activity_at",
+            "created_at",
+            "updated_at",
+            "profile",
+        ]
+
+    def get_profile(self, obj: User) -> Optional[Dict[str, Any]]:
+        """
+        Safely return serialized profile data if available.
+
+        Args:
+            obj (User): User instance.
+
+        Returns:
+            dict | None: Serialized profile or None if absent.
+        """
+        profile = getattr(obj, "profile", None)
+        if not profile:
+            return None
+
+        return ProfileSerializer(profile).data
+
+
+class UserMeSerializer(serializers.ModelSerializer):
+    """
+    Serializer for the authenticated user's full profile.
+
+    Includes nested profile data if it exists.
+    """
+
+    profile = ProfileSerializer(read_only=True)
+
+    class Meta:
+        model = User
+        fields = [
+            "id",
+            "email",
+            "username",
+            "first_name",
+            "middle_name",
+            "last_name",
+            "is_premium",
+            "premium_expires",
+            "last_login",
+            "last_activity_at",
+            "created_at",
+            "updated_at",
+            "profile",
+        ]

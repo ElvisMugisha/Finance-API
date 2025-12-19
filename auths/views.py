@@ -1,39 +1,46 @@
 from datetime import timedelta
+import datetime
+import os
 
 from django.db import transaction, models
+from django.conf import settings
 from django.utils import timezone
 from django.contrib.auth import logout as django_logout
-from rest_framework import status
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.filters import SearchFilter, OrderingFilter
+from rest_framework import status, generics, serializers
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenRefreshView
-from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 from rest_framework_simplejwt.tokens import (
     RefreshToken,
     OutstandingToken,
     BlacklistedToken,
 )
 
-from drf_spectacular.utils import extend_schema, OpenApiResponse
+from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParameter
 
-from utils import choices, loggings
+from .schema_examples import profile
+from utils import choices, loggings, filters, exporters
 from utils.paginations import CustomPageNumberPagination
-from utils.permissions import IsActiveAndVerified, IsAdminOnly
+from utils.permissions import IsActiveAndVerified, IsStaffOrAdmin
 from utils.services.otp import create_and_send_otp
 
-from .models import User, Passcode, DeviceSession, UserLoginAudit
+from .models import User, Passcode, DeviceSession, UserLoginAudit, Profile
 from .serializers import (
-    # PasswordChangeSerializer,
-    # PasswordResetConfirmSerializer,
-    # PasswordResetRequestSerializer,
-    # PasswordResetVerifySerializer,
-    # ProfileSerializer,
-    # UserListSerializer,
     UserRegistrationSerializer,
     EmailVerificationSerializer,
     ResendOTPSerializer,
     LoginSerializer,
+    PasswordChangeSerializer,
+    PasswordResetRequestSerializer,
+    PasswordResetVerifySerializer,
+    PasswordResetSetNewSerializer,
+    UserListSerializer,
+    ProfileSerializer,
+    UserMeSerializer,
 )
 
 # Initialize logger
@@ -179,12 +186,12 @@ class EmailVerificationView(APIView):
 
 class ResendOTPView(APIView):
     """
-    Resend email verification OTP.
+    Resend verification OTP.
 
-    Responsibilities:
-    - Orchestrate resend flow
-    - Delegate validation to serializer
-    - Trigger OTP generation and async email delivery
+    Guarantees:
+    - Only one active OTP per user
+    - Rate-limited by OTP expiration
+    - Safe retry behavior
     """
 
     permission_classes = [AllowAny]
@@ -192,11 +199,18 @@ class ResendOTPView(APIView):
 
     @extend_schema(
         summary="Resend verification OTP",
-        description="Resend a verification OTP if no active code exists.",
+        description=(
+            "Resend verification OTP to user's email.\n\n"
+            "Rules:\n"
+            "- Verified users are blocked\n"
+            "- Active OTPs must expire before resending\n"
+            "- Expired OTPs are cleaned automatically"
+        ),
         request=ResendOTPSerializer,
         responses={
             200: OpenApiResponse(description="OTP resent successfully"),
             400: OpenApiResponse(description="Invalid request"),
+            404: OpenApiResponse(description="User not found"),
             429: OpenApiResponse(description="Active OTP still valid"),
             500: OpenApiResponse(description="Internal server error"),
         },
@@ -207,47 +221,82 @@ class ResendOTPView(APIView):
         serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        user = serializer.validated_data["user"]
+        user: User = serializer.context["user"]
+        now = timezone.now()
 
         try:
-            otp, error_message, error_status = create_and_send_otp(
+            # Fetch latest unused OTP
+            existing_otp = (
+                Passcode.objects.filter(
+                    user=user,
+                    code_type=choices.CodeType.VERIFICATION,
+                    is_used=False,
+                )
+                .order_by("-expires_at")
+                .first()
+            )
+
+            if existing_otp:
+                if existing_otp.expires_at > now:
+                    remaining_seconds = int(
+                        (existing_otp.expires_at - now).total_seconds()
+                    )
+
+                    logger.warning(
+                        "Resend OTP blocked: active OTP exists",
+                        extra={
+                            "user_id": user.id,
+                            "remaining_seconds": remaining_seconds,
+                        },
+                    )
+
+                    return Response(
+                        {
+                            "error": "An active verification code already exists.",
+                            "expires_in_seconds": remaining_seconds,
+                        },
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    )
+
+                # Expired OTP → cleanup
+                logger.info(
+                    "Expired OTP found, deleting",
+                    extra={"user_id": user.id, "otp_id": existing_otp.id},
+                )
+                existing_otp.delete()
+
+            # Create & send new OTP
+            otp, error_msg, error_status = create_and_send_otp(
                 user=user,
                 code_type=choices.CodeType.VERIFICATION,
                 purpose="verification",
             )
 
-            if error_message:
+            if error_msg:
                 logger.error(
-                    "Failed to resend OTP",
-                    extra={"user_id": user.id, "error": error_message},
+                    "OTP resend failed",
+                    extra={"user_id": user.id, "error": error_msg},
                 )
-                return Response(
-                    {"detail": error_message},
-                    status=error_status or status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
+                return Response({"error": error_msg}, status=error_status)
 
-        except Exception:
-            logger.exception("Unexpected error during OTP resend")
+            logger.info("OTP resent successfully", extra={"user_id": user.id})
             return Response(
-                {"detail": "An unexpected error occurred. Please try again later."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                {
+                    "message": "A new verification code has been sent to your email.",
+                    "email": user.email,
+                },
+                status=status.HTTP_200_OK,
             )
 
-        logger.info(
-            "OTP resent successfully",
-            extra={"user_id": user.id, "email": user.email},
-        )
-
-        return Response(
-            {
-                "message": "A new verification code has been sent to your email.",
-                "data": {
-                    "email": user.email,
-                    "expires_in_minutes": 10,
-                },
-            },
-            status=status.HTTP_200_OK,
-        )
+        except Exception:
+            logger.exception(
+                "Unexpected error during OTP resend",
+                extra={"user_id": user.id},
+            )
+            return Response(
+                {"error": "An unexpected error occurred. Please try again later."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class LoginView(APIView):
@@ -556,842 +605,583 @@ class LogoutView(APIView):
         return Response(response, status=status.HTTP_200_OK)
 
 
-# class CustomTokenRefreshView(TokenRefreshView):
-#     """
-#     API View for Refreshing JWT Tokens.
-
-#     Takes a valid refresh token and returns a new access token.
-#     If 'ROTATE_REFRESH_TOKENS' is True in settings, also returns a new refresh token.
-#     """
-
-#     @extend_schema(
-#         summary="Refresh JWT Access Token",
-#         description="Get a new access token using a valid refresh token.",
-#         responses={
-#             200: OpenApiResponse(description="Token refreshed successfully"),
-#             401: OpenApiResponse(description="Unauthorized - Invalid or expired token"),
-#         },
-#     )
-#     def post(self, request, *args, **kwargs):
-#         """
-#         Handle POST request to refresh token.
-#         """
-#         logger.info("Token refresh requested")
-#         try:
-#             response = super().post(request, *args, **kwargs)
-#             logger.info("Token refreshed successfully")
-#             return response
-#         except Exception as e:
-#             logger.warning(f"Token refresh failed: {str(e)}")
-#             raise e
-
-
-# class UserListView(APIView):
-#     """
-#     API View for listing all users.
-
-#     Only Super Admins and Superusers can access this view.
-#     Returns paginated list of users with their profile information.
-#     """
-
-#     permission_classes = [IsAdminOnly]
-#     serializer_class = UserListSerializer
-#     pagination_class = CustomPageNumberPagination
-
-#     @extend_schema(
-#         summary="List all users",
-#         description="Retrieve a paginated list of all users with their profile \
-#         information. Only accessible by Super Admins and Superusers.",
-#         responses={
-#             200: UserListSerializer(many=True),
-#             403: OpenApiResponse(description="Forbidden - Insufficient permissions"),
-#             500: OpenApiResponse(description="Internal Server Error"),
-#         },
-#     )
-#     def get(self, request):
-#         """
-#         Handle GET request to list all users.
-
-#         Returns:
-#             Paginated list of users with profile data.
-#         """
-#         logger.info(f"User list requested by: {request.user}")
-
-#         try:
-#             # Get all users and prefetch related profile data for optimization
-#             # Use prefetch_related for reverse OneToOne relationship
-#             queryset = (
-#                 User.objects.prefetch_related("user_profile")
-#                 .all()
-#                 .order_by("-created_at")
-#             )
-
-#             # Apply pagination
-#             paginator = self.pagination_class()
-#             paginated_queryset = paginator.paginate_queryset(
-#                 queryset, request, view=self
-#             )
-
-#             # Serialize the data
-#             serializer = self.serializer_class(paginated_queryset, many=True)
-
-#             logger.info(
-#                 f"Successfully retrieved {len(serializer.data)} users for {request.user}"
-#             )
-
-#             # Return paginated response
-#             return paginator.get_paginated_response(serializer.data)
-
-#         except Exception as e:
-#             logger.exception(f"Error retrieving user list: {str(e)}")
-#             return Response(
-#                 {"error": "An error occurred while retrieving users."},
-#                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             )
-
-
-# class UserProfileView(APIView):
-#     """
-#     API View for retrieving the current user's profile.
-
-#     Returns the user's information along with their profile data.
-#     If the profile does not exist, the profile field will be null.
-#     """
-
-#     permission_classes = [IsActiveAndVerified]
-#     serializer_class = UserListSerializer
-
-#     @extend_schema(
-#         summary="Get user profile",
-#         description="Retrieve the authenticated user's information and profile data.",
-#         responses={
-#             200: UserListSerializer,
-#             401: OpenApiResponse(description="Unauthorized"),
-#             500: OpenApiResponse(description="Internal Server Error"),
-#         },
-#     )
-#     def get(self, request):
-#         """
-#         Handle GET request to retrieve user profile.
-
-#         Returns:
-#             User data with profile information.
-#         """
-#         logger.info(f"User profile requested by: {request.user}")
-
-#         try:
-#             # The user is already available in request.user
-#             # We use the serializer to format the response
-#             serializer = self.serializer_class(request.user)
-
-#             logger.info(f"Successfully retrieved profile for {request.user}")
-#             return Response(serializer.data, status=status.HTTP_200_OK)
-
-#         except Exception as e:
-#             logger.exception(f"Error retrieving user profile: {str(e)}")
-#             return Response(
-#                 {"error": "An error occurred while retrieving your profile."},
-#                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             )
-
-
-# class ResendOTPView(APIView):
-#     """
-#     API View for Resending OTP.
-
-#     Handles requests to resend verification OTP to users who didn't receive
-#     the original code or whose code has expired.
-
-#     Rate Limiting Logic:
-#     - Checks if user has an active (unexpired and unused) OTP
-#     - If active OTP exists, returns error with remaining time
-#     - Only creates new OTP if old one is expired or used
-#     """
-
-#     permission_classes = [AllowAny]
-#     serializer_class = ResendOTPSerializer
-
-#     @extend_schema(
-#         summary="Resend verification OTP",
-#         description="Resend a verification OTP to the user's email address.\n\n"
-#         "A new OTP will only be sent if the previous one has expired or been used.",
-#         request=ResendOTPSerializer,
-#         responses={
-#             200: OpenApiResponse(description="OTP resent successfully"),
-#             400: OpenApiResponse(
-#                 description="Bad Request - Invalid email or user already verified"
-#             ),
-#             404: OpenApiResponse(description="User not found"),
-#             429: OpenApiResponse(
-#                 description="Too Many Requests - Active OTP still valid"
-#             ),
-#             500: OpenApiResponse(description="Internal Server Error"),
-#         },
-#     )
-#     def post(self, request):
-#         """
-#         Handle POST request to resend OTP.
-
-#         Steps:
-#         1. Validate email address.
-#         2. Check if user exists and is not verified.
-#         3. Check if user has active (unexpired and unused) OTP.
-#         4. If active OTP exists, return error with remaining time.
-#         5. If OTP is expired or used, delete it and create new one.
-#         6. Send new OTP via email.
-#         7. Return success response.
-
-#         Args:
-#             request: HTTP request containing email.
-
-#         Returns:
-#             Response: Success or error message with appropriate status code.
-#         """
-#         logger.info("Received OTP resend request")
-
-#         serializer = self.serializer_class(data=request.data)
-
-#         if serializer.is_valid():
-#             try:
-#                 email = serializer.validated_data["email"]
-#                 logger.info(f"Processing OTP resend for email: {email}")
-
-#                 # Get the user
-#                 try:
-#                     user = User.objects.get(email=email)
-#                 except User.DoesNotExist:
-#                     logger.error(f"User not found for email: {email}")
-#                     return Response(
-#                         {"error": "User not found."}, status=status.HTTP_404_NOT_FOUND
-#                     )
-
-#                 # Check for existing OTP for this user and code_type
-#                 from django.utils import timezone
-
-#                 from auths.models import Passcode
-
-#                 try:
-#                     existing_otp = Passcode.objects.get(
-#                         user=user,
-#                         code_type=choices.CodeType.VERIFICATION,
-#                         is_used=False,
-#                     )
-
-#                     # Check if OTP is still valid (not expired)
-#                     if existing_otp.expires_at > timezone.now():
-#                         # OTP is still active - don't create new one
-#                         remaining_time = existing_otp.expires_at - timezone.now()
-#                         total_seconds = int(remaining_time.total_seconds())
-#                         minutes_remaining = total_seconds // 60
-#                         seconds_remaining = total_seconds % 60
-
-#                         logger.warning(
-#                             f"Active OTP already exists for {email}. "
-#                             f"Expires in {minutes_remaining}m {seconds_remaining}s"
-#                         )
-
-#                         # Format time remaining message
-#                         if minutes_remaining > 0:
-#                             time_msg = f"{minutes_remaining} minute(s) and {seconds_remaining} second(s)"
-#                         else:
-#                             time_msg = f"{seconds_remaining} second(s)"
-
-#                         return Response(
-#                             {
-#                                 "error": "An active verification code already exists.",
-#                                 "message": f"Please use your existing verification code. It will expire in {time_msg}.",
-#                                 "expires_in_seconds": total_seconds,
-#                                 "expires_in_minutes": minutes_remaining,
-#                             },
-#                             status=status.HTTP_429_TOO_MANY_REQUESTS,
-#                         )
-#                     else:
-#                         # OTP exists but is expired - delete it
-#                         logger.info(f"Found expired OTP for {email}, deleting it")
-#                         existing_otp.delete()
-
-#                 except Passcode.DoesNotExist:
-#                     # No existing OTP found, or it was used - proceed to create new one
-#                     logger.info(f"No active OTP found for {email}, will create new one")
-#                     pass
-
-#                 # Create and send new OTP
-#                 # Note: create_and_send_otp will delete any remaining OTPs (used ones)
-#                 # and create a fresh one
-#                 otp, error_msg, error_status = create_and_send_otp(
-#                     user=user,
-#                     code_type=choices.CodeType.VERIFICATION,
-#                     purpose="verification",
-#                 )
-
-#                 if error_msg:
-#                     logger.error(f"Failed to create/send OTP for {email}: {error_msg}")
-#                     return Response({"error": error_msg}, status=error_status)
-
-#                 logger.info(f"OTP successfully resent to {email}")
-
-#                 return Response(
-#                     {
-#                         "message": "A new verification code has been sent to your email.",
-#                         "data": {"email": email, "expires_in": "10 minutes"},
-#                     },
-#                     status=status.HTTP_200_OK,
-#                 )
-
-#             except Exception as e:
-#                 logger.exception(f"Unexpected error during OTP resend: {str(e)}")
-#                 return Response(
-#                     {"error": "An unexpected error occurred. Please try again later."},
-#                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#                 )
-
-#         # Validation failed
-#         logger.warning(f"OTP resend validation failed: {serializer.errors}")
-
-#         # Check for specific error types
-#         errors = serializer.errors
-
-#         # If user not found
-#         if "email" in errors and any(
-#             "not found" in str(err).lower() for err in errors["email"]
-#         ):
-#             return Response(serializer.errors, status=status.HTTP_404_NOT_FOUND)
-
-#         # Default to bad request
-#         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-# class UserProfileManageView(APIView):
-#     """
-#     API View for managing user profile.
-
-#     Handles both creation and update of the user profile.
-#     - If profile exists: Updates it (Partial update).
-#     - If profile does not exist: Creates it.
-#     """
-
-#     permission_classes = [IsActiveAndVerified]
-#     serializer_class = ProfileSerializer
-
-#     @extend_schema(
-#         summary="Create or Update user profile",
-#         description="Create a profile if it doesn't exist, or update the existing one (partial update).",
-#         request=ProfileSerializer,
-#         responses={
-#             200: OpenApiResponse(description="Profile updated successfully"),
-#             201: OpenApiResponse(description="Profile created successfully"),
-#             400: OpenApiResponse(description="Bad Request - Invalid data"),
-#             401: OpenApiResponse(description="Unauthorized"),
-#             500: OpenApiResponse(description="Internal Server Error"),
-#         },
-#     )
-#     def post(self, request):
-#         """
-#         Handle POST request to create or update user profile.
-
-#         Steps:
-#         1. Check if user has a profile.
-#         2. If exists: Update (partial).
-#         3. If not: Create new.
-
-#         Args:
-#             request: HTTP request containing profile data.
-
-#         Returns:
-#             Response: Profile data and status code (200 or 201).
-#         """
-#         logger.info(f"Profile manage request by user: {request.user}")
-
-#         try:
-#             # Check if profile exists
-#             if hasattr(request.user, "user_profile"):
-#                 # Update existing profile
-#                 profile = request.user.user_profile
-#                 logger.info(f"Updating existing profile for user: {request.user}")
-
-#                 serializer = self.serializer_class(
-#                     instance=profile, data=request.data, partial=True
-#                 )
-
-#                 if serializer.is_valid():
-#                     serializer.save()
-#                     logger.info(
-#                         f"Profile updated successfully for user: {request.user}"
-#                     )
-#                     return Response(serializer.data, status=status.HTTP_200_OK)
-#             else:
-#                 # Create new profile
-#                 logger.info(f"Creating new profile for user: {request.user}")
-
-#                 serializer = self.serializer_class(data=request.data)
-
-#                 if serializer.is_valid():
-#                     serializer.save(user=request.user)
-#                     logger.info(
-#                         f"Profile created successfully for user: {request.user}"
-#                     )
-#                     return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-#             # If validation failed
-#             logger.warning(f"Profile validation failed: {serializer.errors}")
-#             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-#         except Exception as e:
-#             logger.exception(
-#                 f"Error managing profile for user {request.user}: {str(e)}"
-#             )
-#             return Response(
-#                 {"error": "An unexpected error occurred. Please try again later."},
-#                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             )
-
-
-# class PasswordChangeView(APIView):
-#     """
-#     API View for changing user password.
-
-#     Allows authenticated users to change their password by providing
-#     their current password and a new password.
-#     """
-
-#     permission_classes = [IsActiveAndVerified]
-#     serializer_class = PasswordChangeSerializer
-
-#     @extend_schema(
-#         summary="Change user password",
-#         description="Change the authenticated user's password. Requires current password verification.",
-#         request=PasswordChangeSerializer,
-#         responses={
-#             200: OpenApiResponse(description="Password changed successfully"),
-#             400: OpenApiResponse(
-#                 description="Bad Request - Invalid data or incorrect old password"
-#             ),
-#             401: OpenApiResponse(description="Unauthorized"),
-#             500: OpenApiResponse(description="Internal Server Error"),
-#         },
-#     )
-#     def post(self, request):
-#         """
-#         Handle POST request to change user password.
-
-#         Steps:
-#         1. Validate old password is correct.
-#         2. Validate new password meets complexity requirements.
-#         3. Validate new passwords match.
-#         4. Update user password.
-#         5. Return success response.
-
-#         Args:
-#             request: HTTP request containing password data.
-
-#         Returns:
-#             Response: Success message or error details.
-#         """
-#         logger.info(f"Password change requested by user: {request.user}")
-
-#         # Pass request context to serializer for old password validation
-#         serializer = self.serializer_class(
-#             data=request.data, context={"request": request}
-#         )
-
-#         if serializer.is_valid():
-#             try:
-#                 # Extract validated data
-#                 new_password = serializer.validated_data["new_password"]
-
-#                 # Update user password
-#                 request.user.set_password(new_password)
-#                 request.user.save(update_fields=["password"])
-
-#                 logger.info(f"Password changed successfully for user: {request.user}")
-
-#                 return Response(
-#                     {
-#                         "message": "Password changed successfully.",
-#                         "data": {
-#                             "email": request.user.email,
-#                             "changed_at": request.user.updated_at,
-#                         },
-#                     },
-#                     status=status.HTTP_200_OK,
-#                 )
-
-#             except Exception as e:
-#                 logger.exception(
-#                     f"Error changing password for user {request.user}: {str(e)}"
-#                 )
-#                 return Response(
-#                     {
-#                         "error": "An unexpected error occurred while changing password. Please try again later."
-#                     },
-#                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#                 )
-
-#         # Validation failed
-#         logger.warning(
-#             f"Password change validation failed for {request.user}: {serializer.errors}"
-#         )
-
-#         # Check for specific error types
-#         errors = serializer.errors
-
-#         # If old password is incorrect
-#         if "old_password" in errors:
-#             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-#         # Default to bad request
-#         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-# class PasswordResetRequestView(APIView):
-#     """
-#     API View for requesting password reset.
-
-#     Sends OTP to user's email for password reset verification.
-#     """
-
-#     permission_classes = [AllowAny]
-#     serializer_class = PasswordResetRequestSerializer
-
-#     @extend_schema(
-#         summary="Request password reset",
-#         description="Request a password reset by providing email. An OTP will be sent to the email address.",
-#         request=PasswordResetRequestSerializer,
-#         responses={
-#             200: OpenApiResponse(description="Reset code sent successfully"),
-#             400: OpenApiResponse(description="Bad Request - Invalid email"),
-#             500: OpenApiResponse(description="Internal Server Error"),
-#         },
-#     )
-#     def post(self, request):
-#         """
-#         Handle POST request to initiate password reset.
-
-#         Steps:
-#         1. Validate email address.
-#         2. Check if user exists (silently for security).
-#         3. Check if user has active (unexpired and unused) password reset OTP.
-#         4. If active OTP exists, inform user (via email for security).
-#         5. If OTP is expired or used, delete it and create new one.
-#         6. Generate and send OTP.
-#         7. Return success response.
-
-#         Args:
-#             request: HTTP request containing email.
-
-#         Returns:
-#             Response: Success message (always, for security).
-#         """
-#         logger.info("Password reset requested")
-
-#         serializer = self.serializer_class(data=request.data)
-
-#         if serializer.is_valid():
-#             email = serializer.validated_data["email"]
-#             logger.info(f"Processing password reset request for: {email}")
-
-#             try:
-#                 # Try to get user
-#                 try:
-#                     user = User.objects.get(email=email)
-
-#                     # Check for existing password reset OTP
-#                     from django.utils import timezone
-
-#                     from auths.models import Passcode
-
-#                     try:
-#                         existing_otp = Passcode.objects.get(
-#                             user=user,
-#                             code_type=choices.CodeType.PASSWORD_RESET,
-#                             is_used=False,
-#                         )
-
-#                         # Check if OTP is still valid (not expired)
-#                         if existing_otp.expires_at > timezone.now():
-#                             # OTP is still active - resend the same code
-#                             remaining_time = existing_otp.expires_at - timezone.now()
-#                             total_seconds = int(remaining_time.total_seconds())
-#                             minutes_remaining = total_seconds // 60
-
-#                             logger.info(
-#                                 f"Active password reset OTP exists for {email}. "
-#                                 f"Resending same code. Expires in {minutes_remaining}m"
-#                             )
-
-#                             # Resend the existing OTP via email
-#                             try:
-#                                 from utils.utils import (
-#                                     format_expiry_time,
-#                                     send_code_to_user,
-#                                 )
-
-#                                 expiry_text = format_expiry_time(
-#                                     existing_otp.expires_at
-#                                 )
-
-#                                 send_code_to_user(
-#                                     email=user.email,
-#                                     otp_code=existing_otp.code,
-#                                     purpose="password_reset",
-#                                     expiry_text=expiry_text,
-#                                 )
-#                                 logger.info(
-#                                     f"Existing password reset OTP resent to {email}"
-#                                 )
-#                             except Exception as email_error:
-#                                 logger.error(
-#                                     f"Failed to resend existing OTP: {str(email_error)}"
-#                                 )
-#                                 # Don't reveal error to user for security
-
-#                             # Return success (don't reveal that we resent existing code)
-#                             return Response(
-#                                 {
-#                                     "message": "If an account exists with this email, a password reset code has been sent.",
-#                                     "data": {
-#                                         "email": email,
-#                                         "expires_in": "10 minutes",
-#                                     },
-#                                 },
-#                                 status=status.HTTP_200_OK,
-#                             )
-#                         else:
-#                             # OTP exists but is expired - delete it
-#                             logger.info(
-#                                 f"Found expired password reset OTP for {email}, deleting it"
-#                             )
-#                             existing_otp.delete()
-
-#                     except Passcode.DoesNotExist:
-#                         # No existing OTP found, or it was used - proceed to create new one
-#                         logger.info(
-#                             f"No active password reset OTP for {email}, will create new one"
-#                         )
-#                         pass
-
-#                     # Create and send new OTP
-#                     # Note: create_and_send_otp will delete any remaining OTPs (used ones)
-#                     otp, error_msg, error_status = create_and_send_otp(
-#                         user=user,
-#                         code_type=choices.CodeType.PASSWORD_RESET,
-#                         purpose="password_reset",
-#                     )
-
-#                     if error_msg:
-#                         logger.error(
-#                             f"Failed to send password reset OTP to {email}: {error_msg}"
-#                         )
-#                         # Don't reveal error to user for security
-#                     else:
-#                         logger.info(f"New password reset OTP sent to {email}")
-
-#                 except User.DoesNotExist:
-#                     logger.warning(
-#                         f"Password reset requested for non-existent email: {email}"
-#                     )
-#                     # Don't reveal that user doesn't exist (security)
-#                     pass
-
-#                 # Always return success to prevent email enumeration
-#                 return Response(
-#                     {
-#                         "message": "If an account exists with this email, a password reset code has been sent.",
-#                         "data": {"email": email, "expires_in": "10 minutes"},
-#                     },
-#                     status=status.HTTP_200_OK,
-#                 )
-
-#             except Exception as e:
-#                 logger.exception(f"Error processing password reset request: {str(e)}")
-#                 return Response(
-#                     {"error": "An error occurred. Please try again later."},
-#                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#                 )
-
-#         # Validation failed
-#         logger.warning(f"Password reset request validation failed: {serializer.errors}")
-#         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-# class PasswordResetVerifyView(APIView):
-#     """
-#     API View for verifying password reset OTP.
-
-#     Validates the OTP code before allowing password reset.
-#     """
-
-#     permission_classes = [AllowAny]
-#     serializer_class = PasswordResetVerifySerializer
-
-#     @extend_schema(
-#         summary="Verify password reset code",
-#         description="Verify the OTP sent to the user's email for password reset.",
-#         request=PasswordResetVerifySerializer,
-#         responses={
-#             200: OpenApiResponse(description="Code verified successfully"),
-#             400: OpenApiResponse(description="Bad Request - Invalid code or email"),
-#             500: OpenApiResponse(description="Internal Server Error"),
-#         },
-#     )
-#     def post(self, request):
-#         """
-#         Handle POST request to verify password reset OTP.
-
-#         Steps:
-#         1. Validate email and OTP.
-#         2. Verify OTP is valid, not expired, and not used.
-#         3. Return success response.
-
-#         Args:
-#             request: HTTP request containing email and otp.
-
-#         Returns:
-#             Response: Success message.
-#         """
-#         logger.info("Password reset verification requested")
-
-#         serializer = self.serializer_class(data=request.data)
-
-#         if serializer.is_valid():
-#             # If valid, it means OTP is correct and active
-#             # The serializer validation handles all checks
-#             email = serializer.validated_data["email"]
-#             logger.info(f"Password reset OTP verified successfully for: {email}")
-
-#             return Response(
-#                 {
-#                     "message": "Verification code is valid.",
-#                     "data": {"email": email, "status": "verified"},
-#                 },
-#                 status=status.HTTP_200_OK,
-#             )
-
-#         # Validation failed
-#         logger.warning(f"Password reset verification failed: {serializer.errors}")
-#         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-# class PasswordResetConfirmView(APIView):
-#     """
-#     API View for confirming password reset.
-
-#     Resets the user's password using the verified OTP and new password.
-#     """
-
-#     permission_classes = [AllowAny]
-#     serializer_class = PasswordResetConfirmSerializer
-
-#     @extend_schema(
-#         summary="Confirm password reset",
-#         description="Reset the user's password using the OTP and new password.",
-#         request=PasswordResetConfirmSerializer,
-#         responses={
-#             200: OpenApiResponse(description="Password reset successfully"),
-#             400: OpenApiResponse(description="Bad Request - Invalid data"),
-#             500: OpenApiResponse(description="Internal Server Error"),
-#         },
-#     )
-#     def post(self, request):
-#         """
-#         Handle POST request to confirm password reset.
-
-#         Steps:
-#         1. Validate email, OTP, and new password.
-#         2. Verify OTP again (security).
-#         3. Update user password.
-#         4. Mark OTP as used.
-#         5. Return success response.
-
-#         Args:
-#             request: HTTP request containing email, otp, new_password.
-
-#         Returns:
-#             Response: Success message.
-#         """
-#         logger.info("Password reset confirmation requested")
-
-#         serializer = self.serializer_class(data=request.data)
-
-#         if serializer.is_valid():
-#             try:
-#                 validated_data = serializer.validated_data
-#                 user = validated_data["user"]
-#                 passcode = validated_data["passcode"]
-#                 new_password = validated_data["new_password"]
-
-#                 logger.info(f"Processing password reset for user: {user.email}")
-
-#                 # Use transaction
-#                 from django.db import transaction
-
-#                 try:
-#                     with transaction.atomic():
-#                         # Update password
-#                         user.set_password(new_password)
-#                         user.save(update_fields=["password"])
-#                         logger.info(f"Password updated for user {user.email}")
-
-#                         # Mark OTP as used
-#                         passcode.is_used = True
-#                         passcode.save(update_fields=["is_used"])
-#                         logger.info(
-#                             f"Password reset OTP marked as used for {user.email}"
-#                         )
-
-#                 except Exception as db_error:
-#                     logger.exception(
-#                         f"Database error during password reset: {str(db_error)}"
-#                     )
-#                     return Response(
-#                         {"error": "Failed to reset password. Please try again."},
-#                         status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#                     )
-
-#                 # Send confirmation email (optional)
-#                 try:
-#                     from utils.utils import send_normal_email
-
-#                     email_data = {
-#                         "to_email": user.email,
-#                         "email_subject": "Password Reset Successful",
-#                         "email_body": (
-#                             f"Hi {user.first_name},\n\n"
-#                             f"Your password has been successfully reset.\n\n"
-#                             f"You can now log in with your new password.\n\n"
-#                             f"If you didn't perform this action, please contact our support team immediately.\n\n"
-#                             f"Best regards,\n"
-#                             f"Fiance-API Team"
-#                         ),
-#                     }
-#                     send_normal_email(email_data)
-#                     logger.info(
-#                         f"Password reset confirmation email sent to {user.email}"
-#                     )
-#                 except Exception as email_error:
-#                     logger.warning(
-#                         f"Failed to send password reset confirmation email: {str(email_error)}"
-#                     )
-
-#                 return Response(
-#                     {
-#                         "message": "Your password has been reset successfully. You can now log in.",
-#                         "data": {"email": user.email, "updated_at": user.updated_at},
-#                     },
-#                     status=status.HTTP_200_OK,
-#                 )
-
-#             except Exception as e:
-#                 logger.exception(
-#                     f"Unexpected error during password reset confirmation: {str(e)}"
-#                 )
-#                 return Response(
-#                     {"error": "An unexpected error occurred. Please try again later."},
-#                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#                 )
-
-#         # Validation failed
-#         logger.warning(
-#             f"Password reset confirmation validation failed: {serializer.errors}"
-#         )
-#         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+class PasswordChangeView(APIView):
+    """
+    API endpoint for changing the authenticated user's password.
+
+    Access:
+    - Authenticated users only
+    - User must be active and verified
+
+    Flow:
+    1. Validate current password
+    2. Validate new password rules
+    3. Update password securely
+    4. Return success response
+    """
+
+    permission_classes = [IsActiveAndVerified]
+    serializer_class = PasswordChangeSerializer
+
+    @extend_schema(
+        summary="Change user password",
+        description=(
+            "Allows an authenticated, active, and verified user to change their password. "
+            "The current password must be provided for verification."
+        ),
+        request=PasswordChangeSerializer,
+        responses={
+            200: OpenApiResponse(description="Password changed successfully"),
+            400: OpenApiResponse(
+                description="Invalid input or password validation failed"
+            ),
+            401: OpenApiResponse(description="Unauthorized"),
+            500: OpenApiResponse(description="Internal server error"),
+        },
+    )
+    def post(self, request):
+        user = request.user
+        logger.info(
+            "Password change requested",
+            extra={"user_id": user.id, "email": user.email},
+        )
+
+        serializer = self.serializer_class(
+            data=request.data,
+            context={"request": request},
+        )
+
+        if not serializer.is_valid():
+            logger.warning(
+                "Password change validation failed",
+                extra={
+                    "user_id": user.id,
+                    "errors": serializer.errors,
+                },
+            )
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user.set_password(serializer.validated_data["new_password"])
+            user.save(update_fields=["password"])
+
+            logger.info(
+                "Password changed successfully",
+                extra={"user_id": user.id, "email": user.email},
+            )
+
+            return Response(
+                {
+                    "message": "Password changed successfully.",
+                    "data": {
+                        "email": user.email,
+                        "changed_at": timezone.now(),
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Unexpected error during password change",
+                extra={"user_id": user.id},
+            )
+            return Response(
+                {
+                    "error": (
+                        "An unexpected error occurred while changing your password. "
+                        "Please try again later."
+                    )
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class PasswordResetRequestView(APIView):
+    """
+    Initiates the password reset process.
+
+    Always returns a success response to prevent email enumeration.
+    """
+
+    permission_classes = [AllowAny]
+    serializer_class = PasswordResetRequestSerializer
+
+    @extend_schema(
+        summary="Request password reset",
+        request=PasswordResetRequestSerializer,
+        responses={
+            200: OpenApiResponse(description="Reset code sent if account exists")
+        },
+    )
+    def post(self, request):
+        logger.info("Password reset request received")
+
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data["email"]
+        logger.info(f"Processing password reset request for: {email}")
+
+        try:
+            user = User.objects.filter(email=email).first()
+            if not user:
+                logger.warning(
+                    "Password reset requested for non-existent email",
+                    extra={"email": email},
+                )
+                return self._success_response(email)
+
+            # Check for existing password reset OTP
+            try:
+                existing_otp = Passcode.objects.get(
+                    user=user,
+                    code_type=choices.CodeType.PASSWORD_RESET,
+                    is_used=False,
+                )
+
+                # Check if OTP is still valid (not expired)
+                if existing_otp.expires_at > timezone.now():
+                    # OTP is still valid - remind user to use it
+                    logger.info(
+                        "Password reset OTP is still valid",
+                        extra={"user_id": user.id, "email": email},
+                    )
+                    return self._success_response(email)
+
+                else:
+                    # OTP exists but is expired - delete it
+                    logger.info(
+                        "Password reset OTP is expired",
+                        extra={"user_id": user.id, "email": email},
+                    )
+                    existing_otp.delete()
+
+            except Passcode.DoesNotExist:
+                # No existing OTP - create and send new one
+                logger.info(
+                    "No existing password reset OTP found",
+                    extra={"user_id": user.id, "email": email},
+                )
+                pass
+
+            # Create and send new OTP
+            # Note: create_and_send_otp will delete any remaining OTPs (used ones)
+            create_and_send_otp(
+                user=user,
+                code_type=choices.CodeType.PASSWORD_RESET,
+                purpose="password_reset",
+            )
+
+            logger.info(
+                "Password reset OTP sent",
+                extra={"user_id": user.id, "email": email},
+            )
+
+        except Exception:
+            logger.exception("Password reset request failed")
+            # Intentionally silent for security
+
+        return self._success_response(email)
+
+    @staticmethod
+    def _success_response(email: str) -> Response:
+        return Response(
+            {
+                "message": (
+                    "If an account exists with this email, "
+                    "a password reset code has been sent."
+                ),
+                "data": {"email": email},
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class PasswordResetVerifyView(APIView):
+    """
+    Verifies a password reset OTP.
+    """
+
+    permission_classes = [AllowAny]
+    serializer_class = PasswordResetVerifySerializer
+
+    @extend_schema(
+        summary="Verify password reset code",
+        request=PasswordResetVerifySerializer,
+        responses={200: OpenApiResponse(description="Code verified")},
+    )
+    def post(self, request):
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data["user"].email
+        logger.info("Password reset OTP verified", extra={"email": email})
+
+        return Response(
+            {
+                "message": "Verification code is valid.",
+                "data": {"email": email},
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class PasswordResetSetNewView(APIView):
+    """
+    Resets the user's password after OTP verification.
+    """
+
+    permission_classes = [AllowAny]
+    serializer_class = PasswordResetSetNewSerializer
+
+    @extend_schema(
+        summary="Set new password",
+        request=PasswordResetSetNewSerializer,
+        responses={200: OpenApiResponse(description="Password reset successful")},
+    )
+    def post(self, request):
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user = serializer.validated_data["user"]
+        passcode = serializer.validated_data["passcode"]
+        new_password = serializer.validated_data["new_password"]
+
+        logger.info("Resetting password", extra={"email": user.email})
+
+        try:
+            with transaction.atomic():
+                user.set_password(new_password)
+                user.save(update_fields=["password"])
+
+                passcode.is_used = True
+                passcode.save(update_fields=["is_used"])
+
+        except Exception:
+            logger.exception("Password reset failed")
+            return Response(
+                {"error": "Failed to reset password. Please try again."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        return Response(
+            {
+                "message": "Your password has been reset successfully.",
+                "data": {"email": user.email},
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class TokenRefreshAPIView(TokenRefreshView):
+    """
+    Refresh JWT access tokens.
+
+    Delegates token validation and rotation entirely to SimpleJWT.
+    Adds structured logging and preserves default error semantics.
+
+    Design Principles:
+    - KISS: No custom token logic
+    - DRY: No duplicated JWT handling
+    - SoC: Authentication logic remains in SimpleJWT
+    - Security-first: No token data logged
+    """
+
+    @extend_schema(
+        summary="Refresh JWT access token",
+        description=(
+            "Obtain a new access token using a valid refresh token. "
+            "If refresh rotation is enabled, a new refresh token is also issued."
+        ),
+        responses={
+            200: OpenApiResponse(description="Token refreshed successfully"),
+            401: OpenApiResponse(description="Invalid or expired refresh token"),
+        },
+    )
+    def post(self, request, *args, **kwargs):
+        """
+        Handle refresh token requests.
+
+        This method intentionally avoids custom token validation logic
+        and relies on SimpleJWT for correctness and security.
+        """
+        client_ip = request.META.get("REMOTE_ADDR")
+        logger.info(
+            "Token refresh requested",
+            extra={"ip": client_ip},
+        )
+
+        try:
+            response = super().post(request, *args, **kwargs)
+
+            logger.info(
+                "Token refreshed successfully",
+                extra={"ip": client_ip},
+            )
+
+            return response
+
+        except (InvalidToken, TokenError) as exc:
+            # Expected authentication failure
+            logger.warning(
+                "Token refresh failed: invalid or expired token",
+                extra={
+                    "ip": client_ip,
+                    "error": exc.__class__.__name__,
+                },
+            )
+            raise
+
+        except Exception:
+            # Unexpected failure (misconfiguration, runtime error, etc.)
+            logger.exception(
+                "Unexpected error during token refresh",
+                extra={"ip": client_ip},
+            )
+            return Response(
+                {"detail": "Unable to refresh token at this time."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+@extend_schema(
+    parameters=[
+        # Basic filters
+        OpenApiParameter(
+            "is_active", str, description="Filter by active status (true/false)"
+        ),
+        OpenApiParameter(
+            "is_staff", str, description="Filter by staff status (true/false)"
+        ),
+        OpenApiParameter(
+            "is_superuser", str, description="Filter by superuser status (true/false)"
+        ),
+        OpenApiParameter(
+            "is_verified", str, description="Filter by verified status (true/false)"
+        ),
+        OpenApiParameter(
+            "is_premium", str, description="Filter by premium status (true/false)"
+        ),
+        # Search
+        OpenApiParameter(
+            "search", str, description="Search by username, email, or name"
+        ),
+        # Ordering
+        OpenApiParameter(
+            "ordering",
+            str,
+            description="Order by fields (e.g., -created_at, last_login, email, -first_name, last_name)",
+        ),
+        # Export
+        OpenApiParameter(
+            "export",
+            str,
+            description="Export format, use 'excel' to generate Excel file",
+        ),
+    ],
+    responses={
+        200: UserListSerializer(many=True),
+        403: OpenApiResponse(description="Forbidden – insufficient permissions"),
+        500: OpenApiResponse(description="Internal server error"),
+    },
+)
+class UserListView(generics.ListAPIView):
+    """
+    List all users with advanced filtering, search, ordering, and optional CSV export.
+
+    Access restricted to staff/admin users.
+
+    Excel Export:
+    - When `export=excel` query param is set, a Excel file is saved to `media/excel/`
+      with all filtered user data, including flattened profile fields.
+    - Paginated JSON response is returned regardless.
+    """
+
+    queryset = User.objects.select_related("profile").all()
+    serializer_class = UserListSerializer
+    permission_classes = [IsStaffOrAdmin]
+    pagination_class = CustomPageNumberPagination
+
+    @extend_schema(
+        summary="List all users",
+        description=(
+            "Retrieve a paginated list of users. Supports advanced filtering, "
+            "search, ordering, and Excel export. Restricted to staff/admin users."
+        ),
+        responses={
+            200: UserListSerializer(many=True),
+            403: OpenApiResponse(description="Forbidden – insufficient permissions"),
+            500: OpenApiResponse(description="Internal server error"),
+        },
+    )
+    def list(self, request, *args, **kwargs):
+        logger.info("User list requested", extra={"requested_by": request.user.id})
+
+        try:
+            # Apply filters/search/ordering
+            user_filter = filters.UserFilter(request, queryset=self.queryset)
+            filtered_queryset = user_filter.apply()
+
+            # Handle Excel export: save file locally
+            excel_url = None
+            if request.query_params.get("export") == "excel":
+                # Serialize and flatten data
+                serializer = self.get_serializer(filtered_queryset, many=True)
+                flattened_data = exporters.flatten_user_data(serializer.data)
+
+                # Save Excel locally
+                excel_dir = os.path.join(settings.MEDIA_ROOT, "exports")
+                os.makedirs(excel_dir, exist_ok=True)
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                excel_filename = f"users_export_{timestamp}.xlsx"
+                excel_path = os.path.join(excel_dir, excel_filename)
+
+                exporters.export_to_excel(flattened_data, file_path=excel_path)
+
+                excel_url = request.build_absolute_uri(
+                    settings.MEDIA_URL + f"exports/users_export_{timestamp}.xlsx"
+                )
+                logger.info(
+                    f"Excel export completed",
+                    extra={
+                        "requested_by": request.user.id,
+                        "record_count": len(flattened_data),
+                        "excel_url": excel_url,
+                    },
+                )
+
+            # Paginate JSON response
+            page = self.paginate_queryset(filtered_queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                response_data = self.get_paginated_response(serializer.data).data
+
+                if excel_url:
+                    response_data["excel_url"] = excel_url
+
+                logger.info(
+                    "User list retrieved successfully",
+                    extra={
+                        "requested_by": request.user.id,
+                        "returned_count": len(serializer.data),
+                    },
+                )
+                return Response(response_data, status=status.HTTP_200_OK)
+
+            # Fallback: no pagination
+            serializer = self.get_serializer(filtered_queryset, many=True)
+            response_data = serializer.data
+            if excel_url:
+                response_data = {"results": response_data, "excel_url": excel_url}
+            return Response(response_data, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception(
+                "Failed to retrieve user list",
+                extra={"requested_by": request.user.id, "error": str(e)},
+            )
+            return Response(
+                {"detail": "Unable to retrieve users at this time."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class UserProfileManageView(generics.GenericAPIView):
+    """
+    Create or update the authenticated user's profile.
+
+    Behavior:
+    - If profile exists → partial update
+    - If profile does not exist → create
+    """
+
+    serializer_class = ProfileSerializer
+    permission_classes = [IsActiveAndVerified]
+
+    @extend_schema(
+        summary="Create or update profile",
+        description=(
+            "Create a profile if it does not exist, "
+            "or partially update the existing profile."
+        ),
+        request=ProfileSerializer,
+        responses={
+            200: ProfileSerializer,
+            400: OpenApiResponse(
+                description="Validation error",
+                examples=[profile.PROFILE_VALIDATION_ERROR_EXAMPLE],
+            ),
+        },
+        examples=[
+            profile.PROFILE_REQUEST_EXAMPLE,
+            profile.PROFILE_RESPONSE_EXAMPLE,
+        ],
+    )
+    def patch(self, request):
+        user = request.user
+
+        logger.info(
+            "Profile upsert requested",
+            extra={"user_id": user.id},
+        )
+
+        try:
+            profile, created = Profile.objects.get_or_create(user=user)
+
+            serializer = self.get_serializer(
+                profile,
+                data=request.data,
+                partial=True,
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+
+            logger.info(
+                "Profile upsert successful",
+                extra={
+                    "user_id": user.id,
+                    "profile_was_created": created,
+                },
+            )
+
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except serializers.ValidationError:
+            logger.warning(
+                "Profile validation failed",
+                extra={"user_id": user.id},
+            )
+            raise
+
+        except Exception as exc:
+            logger.exception(
+                "Unexpected error during profile upsert",
+                extra={"user_id": user.id},
+            )
+            return Response(
+                {"detail": "Unable to update profile at this time."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class UserMeView(generics.RetrieveAPIView):
+    """
+    Retrieve the authenticated user's account and profile data.
+    """
+
+    serializer_class = UserMeSerializer
+    permission_classes = [IsActiveAndVerified]
+
+    @extend_schema(
+        summary="Get logged-in user profile",
+        description="Retrieve the authenticated user's account and profile details.",
+        responses={200: UserMeSerializer},
+        examples=[profile.USER_PROFILE_RESPONSE_EXAMPLE],
+    )
+    def get_object(self):
+        logger.info(
+            "User profile retrieved",
+            extra={"user_id": self.request.user.id},
+        )
+        return self.request.user

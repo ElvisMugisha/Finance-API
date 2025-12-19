@@ -1,12 +1,100 @@
 import django_filters
 from django.db.models import Q
 from django.db import models
+from django.contrib.auth import get_user_model
+from rest_framework.request import Request
+
 from accounts.models import Transaction
 
 from utils import loggings
 
-# Initialize logger
 logger = loggings.setup_logging()
+User = get_user_model()
+
+
+class UserFilter:
+    """
+    Encapsulates advanced user filtering logic for API endpoints.
+
+    Supports:
+    - Filtering by active status, staff, superuser, verified, premium
+    - Searching by email, username, or full name
+    - Ordering if needed
+    - Safe for production: logs errors without exposing sensitive info
+    """
+
+    def __init__(self, request: Request, queryset=None):
+        self.request = request
+        self.queryset = queryset if queryset is not None else User.objects.all()
+        self.user = request.user
+
+    def apply(self):
+        """
+        Apply all filters, search, and ordering to the queryset.
+        Returns a filtered queryset.
+        """
+        try:
+            self._apply_basic_filters()
+            self._apply_search()
+            self._apply_ordering()
+            return self.queryset
+
+        except Exception as e:
+            logger.exception(f"UserFilter.apply failed: {str(e)}")
+            return self.queryset.none()  # Safe fallback
+
+    def _apply_basic_filters(self):
+        """Filter by standard query params like is_active, is_staff, etc."""
+        for field in [
+            "is_active",
+            "is_staff",
+            "is_superuser",
+            "is_verified",
+            "is_premium",
+        ]:
+            value = self.request.query_params.get(field)
+            if value is not None:
+                if value.lower() in ["true", "1"]:
+                    self.queryset = self.queryset.filter(**{field: True})
+                elif value.lower() in ["false", "0"]:
+                    self.queryset = self.queryset.filter(**{field: False})
+                logger.debug(f"Applied filter {field}={value}")
+
+    def _apply_search(self):
+        """Apply search across email, username, first/middle/last name."""
+        search_query = self.request.query_params.get("search")
+        if search_query:
+            self.queryset = self.queryset.filter(
+                Q(username__icontains=search_query)
+                | Q(email__icontains=search_query)
+                | Q(first_name__icontains=search_query)
+                | Q(middle_name__icontains=search_query)
+                | Q(last_name__icontains=search_query)
+            )
+            logger.debug(f"Applied search filter: {search_query}")
+
+    def _apply_ordering(self):
+        """Apply ordering from query params, default by -created_at."""
+        ordering = self.request.query_params.get("ordering")
+        allowed_fields = [
+            "created_at",
+            "last_login",
+            "email",
+            "first_name",
+            "last_name",
+        ]
+
+        if ordering:
+            orders = []
+            for field in ordering.split(","):
+                field_name = field.lstrip("-")
+                if field_name in allowed_fields:
+                    orders.append(field)
+            if orders:
+                self.queryset = self.queryset.order_by(*orders)
+                logger.debug(f"Applied ordering: {orders}")
+        else:
+            self.queryset = self.queryset.order_by("-created_at")
 
 
 class TransactionFilter(django_filters.FilterSet):

@@ -1,4 +1,5 @@
 import uuid
+from decimal import Decimal
 from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 from django.utils import timezone
@@ -176,10 +177,6 @@ class Passcode(models.Model):
 class Profile(models.Model):
     """
     User profile storing non-auth, non-security personal data.
-
-    Intentionally separated from User for:
-    - Security isolation
-    - Optional loading
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -227,6 +224,29 @@ class Profile(models.Model):
         verbose_name_plural = "Profiles"
         ordering = ["-created_at"]
         db_table = "profiles"
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(annual_income__gte=Decimal("0.00"))
+                | models.Q(annual_income__isnull=True),
+                name="annual_income_non_negative",
+            ),
+        ]
+
+    def clean(self):
+        """
+        Enforce domain invariants.
+        """
+        if self.annual_income is not None and self.annual_income < 0:
+            raise ValidationError(
+                {"annual_income": "Annual income cannot be negative."}
+            )
+
+    def save(self, *args, **kwargs):
+        """
+        Ensure full validation on save.
+        """
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
     def __str__(self) -> str:
         return f"Profile({self.user.email})"
@@ -243,9 +263,7 @@ class DeviceSession(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
-    user = models.ForeignKey(
-        User, on_delete=models.CASCADE, related_name="sessions"
-    )
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="sessions")
 
     ip_address = models.GenericIPAddressField(null=True, blank=True)
     device = models.CharField(max_length=255, default="Unknown Device")
