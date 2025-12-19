@@ -1,13 +1,13 @@
 import re
+from datetime import timedelta
 
 from decouple import config
+from django.conf import settings
+from django.core.cache import cache
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from rest_framework.exceptions import Throttled
-from rest_framework.throttling import UserRateThrottle, AnonRateThrottle
-from django.core.cache import cache
-from django.conf import settings
-from datetime import timedelta
-from django.utils import timezone
+from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 
 from utils import loggings
 

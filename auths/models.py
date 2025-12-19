@@ -1,12 +1,14 @@
 import uuid
 from decimal import Decimal
-from django.db import models
-from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
-from django.utils import timezone
+
 from django.conf import settings
+from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 from django.core.exceptions import ValidationError
+from django.db import models
+from django.utils import timezone
 
 from utils import choices, loggings
+
 from .manager import UserManager
 
 logger = loggings.setup_logging()

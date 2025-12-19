@@ -1,5 +1,6 @@
-from typing import Any, Dict, Optional
 from datetime import timedelta
+from typing import Any, Dict, Optional
+
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError

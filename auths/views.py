@@ -1,46 +1,45 @@
-from datetime import timedelta
 import datetime
 import os
+from datetime import timedelta
 
-from django.db import transaction, models
 from django.conf import settings
-from django.utils import timezone
 from django.contrib.auth import logout as django_logout
+from django.db import models, transaction
+from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework.filters import SearchFilter, OrderingFilter
-from rest_framework import status, generics, serializers
+from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
+from rest_framework import generics, serializers, status
+from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.views import TokenRefreshView
-from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework_simplejwt.tokens import (
-    RefreshToken,
-    OutstandingToken,
     BlacklistedToken,
+    OutstandingToken,
+    RefreshToken,
 )
+from rest_framework_simplejwt.views import TokenRefreshView
 
-from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParameter
-
-from .schema_examples import profile
-from utils import choices, loggings, filters, exporters
+from utils import choices, exporters, filters, loggings
 from utils.paginations import CustomPageNumberPagination
 from utils.permissions import IsActiveAndVerified, IsStaffOrAdmin
 from utils.services.otp import create_and_send_otp
 
-from .models import User, Passcode, DeviceSession, UserLoginAudit, Profile
+from .models import DeviceSession, Passcode, Profile, User, UserLoginAudit
+from .schema_examples import profile
 from .serializers import (
-    UserRegistrationSerializer,
     EmailVerificationSerializer,
-    ResendOTPSerializer,
     LoginSerializer,
     PasswordChangeSerializer,
     PasswordResetRequestSerializer,
-    PasswordResetVerifySerializer,
     PasswordResetSetNewSerializer,
-    UserListSerializer,
+    PasswordResetVerifySerializer,
     ProfileSerializer,
+    ResendOTPSerializer,
+    UserListSerializer,
     UserMeSerializer,
+    UserRegistrationSerializer,
 )
 
 # Initialize logger

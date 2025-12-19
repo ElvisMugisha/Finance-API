@@ -1,22 +1,23 @@
-import pytest
 import uuid
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
+
+import pytest
 from django.utils import timezone
 from rest_framework.serializers import ValidationError as DRFValidationError
 
 from core.models import Category, Currency
 from core.serializers import (
-    CurrencySerializer,
-    CurrencyConversionSerializer,
-    ExchangeRateUpdateSerializer,
-    CurrencyListSerializer,
-    CurrencyDetailSerializer,
-    CategoryListSerializer,
+    CategoryBulkUpdateSerializer,
     CategoryDetailSerializer,
+    CategoryListSerializer,
     CategorySerializer,
     CategoryTreeSerializer,
-    CategoryBulkUpdateSerializer,
+    CurrencyConversionSerializer,
+    CurrencyDetailSerializer,
+    CurrencyListSerializer,
+    CurrencySerializer,
+    ExchangeRateUpdateSerializer,
     get_category_serializer,
 )
 from utils import choices

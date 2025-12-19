@@ -1,5 +1,6 @@
-from rest_framework import permissions
 from django.utils.translation import gettext_lazy as _
+from rest_framework import permissions
+
 from utils import loggings
 
 # Initialize logger

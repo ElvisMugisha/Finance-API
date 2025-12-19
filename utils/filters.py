@@ -1,11 +1,10 @@
 import django_filters
-from django.db.models import Q
-from django.db import models
 from django.contrib.auth import get_user_model
+from django.db import models
+from django.db.models import Q
 from rest_framework.request import Request
 
 from accounts.models import Transaction
-
 from utils import loggings
 
 logger = loggings.setup_logging()

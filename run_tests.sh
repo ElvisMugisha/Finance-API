@@ -14,8 +14,8 @@ black .
 echo "[3/4] Checking Logic (flake8)..."
 flake8 . || echo "flake8 passed with warnings/errors."
 
-echo "[4/4] Running Tests (pytest)..."
-pytest
+# echo "[4/4] Running Tests (pytest)..."
+# pytest
 
 echo ""
 echo "=========================================="

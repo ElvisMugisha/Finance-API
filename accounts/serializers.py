@@ -1,13 +1,14 @@
 from datetime import date
-from typing import Dict, Any, Optional, List
 from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional
 
-from drf_spectacular.utils import extend_schema_field
-from rest_framework import serializers, exceptions
-from django.utils.translation import gettext_lazy as _
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import models
+from django.db import transaction as db_transaction
 from django.utils import timezone
-from django.db import models, transaction as db_transaction
+from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema_field
+from rest_framework import exceptions, serializers
 
 from core.models import Category, Currency
 from core.serializers import CurrencySerializer
@@ -619,8 +620,9 @@ class AccountDetailSerializer(AccountSerializer):
 
     def get_transaction_stats(self, obj: Account) -> Dict[str, Any]:
         """Get transaction statistics for this account."""
-        from .models import Transaction
         from django.db.models import Count, Sum
+
+        from .models import Transaction
 
         try:
             stats = Transaction.objects.filter(

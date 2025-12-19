@@ -1,9 +1,9 @@
 from django.contrib.auth.models import BaseUserManager
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
-from django.utils.translation import gettext_lazy as _
 from django.db import IntegrityError, transaction
 from django.utils.text import slugify
+from django.utils.translation import gettext_lazy as _
 
 from utils import loggings
 
@@ -22,7 +22,11 @@ class UserManager(BaseUserManager):
         if not email:
             raise ValueError(_("Email address is required"))
 
+        # Normalize the email using Django's built-in
         email = self.normalize_email(email)
+
+        # Also lowercase the entire email if desired
+        email = email.lower()
 
         try:
             validate_email(email)
@@ -33,7 +37,15 @@ class UserManager(BaseUserManager):
         return email
 
     def _generate_unique_username(self, first_name: str, last_name: str) -> str:
-        base = slugify(f"{first_name}.{last_name}") or "user"
+        base = f"{first_name.lower().strip()}.{last_name.lower().strip()}".replace(
+            " ", ""
+        )
+
+        # Remove any characters that aren't alphanumeric, dot, dash, or underscore
+        import re
+
+        base = re.sub(r"[^\w\.\-]", "", base)
+
         candidate = base
         counter = 1
 

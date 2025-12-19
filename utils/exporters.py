@@ -1,9 +1,11 @@
 ﻿import csv
 import os
-from typing import List, Dict
+from typing import Dict, List
+
 import pandas as pd
-from django.http import HttpResponse
 from django.conf import settings
+from django.http import HttpResponse
+
 from utils import loggings
 
 logger = loggings.setup_logging()

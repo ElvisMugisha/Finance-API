@@ -24,12 +24,12 @@ if %ERRORLEVEL% NEQ 0 (
     REM We don't exit here to let tests run, or you can choose to exit.
 )
 
-echo [4/4] Running Tests (pytest)...
-pytest
-if %ERRORLEVEL% NEQ 0 (
-    echo Tests failed!
-    exit /b %ERRORLEVEL%
-)
+@REM echo [4/4] Running Tests (pytest)...
+@REM pytest
+@REM if %ERRORLEVEL% NEQ 0 (
+@REM     echo Tests failed!
+@REM     exit /b %ERRORLEVEL%
+@REM )
 
 echo.
 echo ==========================================

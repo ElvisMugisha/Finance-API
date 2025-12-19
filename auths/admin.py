@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import User, Passcode, Profile, DeviceSession, UserLoginAudit
+from .models import DeviceSession, Passcode, Profile, User, UserLoginAudit
 
 
 class ProfileInline(admin.StackedInline):
@@ -177,6 +177,7 @@ class DeviceSessionAdmin(admin.ModelAdmin):
     """
     Admin configuration for DeviceSession.
     """
+
     list_display = (
         "user",
         "ip_address",
@@ -198,9 +199,11 @@ class UserLoginAuditAdmin(admin.ModelAdmin):
     """
     Admin configuration for UserLoginAudit.
     """
+
     list_display = (
         "user",
-        "email", "ip_address",
+        "email",
+        "ip_address",
         "device",
         "user_agent",
         "status",

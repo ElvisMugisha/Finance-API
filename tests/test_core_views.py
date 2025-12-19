@@ -1,12 +1,12 @@
-import pytest
 import uuid
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
-from rest_framework import status
-from rest_framework.test import APIClient
+import pytest
 from django.db import models
 from django.utils import timezone
+from rest_framework import status
+from rest_framework.test import APIClient
 
 from core.models import Category, Currency
 from utils import choices

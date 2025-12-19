@@ -1,6 +1,6 @@
 import uuid
 from datetime import date
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from django.conf import settings
@@ -10,8 +10,8 @@ from django.db import models, transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
-from utils.models import BaseModel
 from utils import choices, loggings, utils
+from utils.models import BaseModel
 
 # Initialize logger
 logger = loggings.setup_logging()

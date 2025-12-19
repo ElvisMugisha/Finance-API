@@ -1,5 +1,5 @@
 from datetime import date, datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Dict
 from unittest.mock import Mock, patch
 
