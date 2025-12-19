@@ -318,3 +318,14 @@ SIMPLE_JWT = {
 MAX_BATCH_SIZE = config("MAX_BATCH_SIZE", default=5, cast=int)
 MAX_FAILED_ATTEMPTS = config("MAX_FAILED_ATTEMPTS", default=5, cast=int)
 LOCKOUT_TIME = config("LOCKOUT_TIME", default=180, cast=int)
+
+PASSWORD_HISTORY = 5  # Prevent password reuse
+SESSION_TIMEOUT = timedelta(hours=24)  # Session expiration
+MAX_SESSIONS_PER_USER = 10  # Limit concurrent sessions
+
+AUTH_CONFIG = {
+    "OTP_EXPIRY_MINUTES": 15,
+    "REFRESH_TOKEN_EXPIRY_DAYS": 7,
+    "MAX_LOGIN_ATTEMPTS": 5,
+    "PASSWORD_MIN_LENGTH": 12,
+}

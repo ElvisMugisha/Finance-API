@@ -17,4 +17,30 @@ OTP Resend:
 3. Safe retry behavior
 4. Safe failure handling
 
-User List View:
+AUTHS:
+1. 2FA/MFA support for high-privilege operations
+2. Password expiration policy
+3. Account lockout after X failed attempts (temporary)
+4. Suspicious activity detection (new device/IP alerts)
+5. Consent management (GDPR compliance)
+6. Terms of Service acceptance tracking
+
+Token Management Improvements:
+# Consider adding token invalidation on:
+# - Password change (currently missing)
+# - Email change
+# - Suspicious activity
+# - Account deactivation
+
+Audit Trail Gaps:
+1. No audit for profile updates
+2. No audit for password changes
+3. No audit for email changes
+4. Consider adding request/response logging for sensitive operations
+
+Needs Before Full Production:
+1. 2FA/MFA implementation
+2. Password change token invalidation
+3. Comprehensive rate limiting
+4. Security monitoring integration
+5. GDPR compliance features
