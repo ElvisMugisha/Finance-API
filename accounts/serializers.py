@@ -1277,18 +1277,10 @@ class TransactionSerializer(serializers.ModelSerializer):
         return representation
 
 
-class TransactionCreateSerializer(serializers.ModelSerializer):
+class TransactionCreateSerializer(TransactionSerializer):
     """Serializer for creating transactions with strict validation."""
 
-    transfer_account = serializers.PrimaryKeyRelatedField(
-        queryset=Account.objects.all(),
-        required=False,
-        allow_null=True,
-        help_text=_("Account to transfer to (for transfer transactions only)"),
-    )
-
-    class Meta:
-        model = Transaction
+    class Meta(TransactionSerializer.Meta):
         fields = [
             "account",
             "category",
@@ -1311,11 +1303,10 @@ class TransactionCreateSerializer(serializers.ModelSerializer):
         }
 
 
-class TransactionUpdateSerializer(serializers.ModelSerializer):
+class TransactionUpdateSerializer(TransactionSerializer):
     """Serializer for updating transactions with business rules."""
 
-    class Meta:
-        model = Transaction
+    class Meta(TransactionSerializer.Meta):
         fields = [
             "name",
             "amount",
@@ -1328,15 +1319,6 @@ class TransactionUpdateSerializer(serializers.ModelSerializer):
             "attachments",
         ]
         read_only_fields = ["transaction_type", "is_transfer"]
-
-
-class TransactionBulkCreateSerializer(serializers.Serializer):
-    """Serializer for bulk transaction creation."""
-
-    transactions = serializers.ListField(
-        child=TransactionCreateSerializer(),
-        max_length=1000,  # Prevent excessive bulk operations
-    )
 
 
 class TransactionVerificationSerializer(serializers.ModelSerializer):

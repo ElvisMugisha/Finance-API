@@ -3,6 +3,7 @@ from django.db import models
 from decimal import Decimal
 from django.db import transaction as db_transaction
 from django.db.models import Count, Q, Sum, Avg, Min, Max
+from django.db.models.functions import TruncMonth, TruncWeek, TruncDay
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.core.exceptions import ValidationError
@@ -14,6 +15,10 @@ from drf_spectacular.utils import (
     inline_serializer,
 )
 from rest_framework import mixins, serializers, status, viewsets
+from rest_framework.exceptions import (
+    PermissionDenied,
+    ValidationError as DRFValidationError,
+)
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
@@ -29,7 +34,6 @@ from .serializers import (
     AccountListSerializer,
     AccountReconcileSerializer,
     AccountSerializer,
-    TransactionBulkCreateSerializer,
     TransactionCreateSerializer,
     TransactionSerializer,
     TransactionUpdateSerializer,
@@ -1509,10 +1513,6 @@ class TransactionViewSet(viewsets.ModelViewSet):
             return TransactionCreateSerializer
         elif self.action == "partial_update":
             return TransactionUpdateSerializer
-        elif self.action == "bulk_create":
-            return TransactionBulkCreateSerializer
-        elif self.action == "bulk_update":
-            return TransactionBulkUpdateSerializer
         elif self.action == "verify":
             return TransactionVerificationSerializer
         elif self.action == "reconcile":
@@ -1539,15 +1539,12 @@ class TransactionViewSet(viewsets.ModelViewSet):
             page = self.paginate_queryset(queryset)
             if page is not None:
                 serializer = self.get_serializer(page, many=True)
-                response = self.get_paginated_response(serializer.data)
-                response.data["analytics"] = self._get_analytics_summary(queryset)
-                return response
+                return self.get_paginated_response(serializer.data)
 
             serializer = self.get_serializer(queryset, many=True)
             return Response(
                 {
                     "transactions": serializer.data,
-                    "analytics": self._get_analytics_summary(queryset),
                     "count": queryset.count(),
                 }
             )
@@ -1597,7 +1594,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
 
             # Atomic creation to ensure data consistency
             with db_transaction.atomic():
-                transaction = serializer.save()
+                transaction = serializer.save(user=request.user)
 
             logger.info(
                 f"Transaction created: {transaction.id}",
@@ -1614,13 +1611,15 @@ class TransactionViewSet(viewsets.ModelViewSet):
                 TransactionSerializer(transaction).data, status=status.HTTP_201_CREATED
             )
 
-        except ValidationError as e:
+        except (DRFValidationError, ValidationError) as e:
+            # Handle both DRF and Django validation errors
+            error_details = getattr(e, "detail", getattr(e, "message_dict", str(e)))
             logger.warning(
-                f"Transaction creation validation failed: {e}",
+                f"Transaction validation failed: {e}",
                 extra={"user_id": request.user.id, "data": request.data},
             )
             return Response(
-                {"error": _("Validation failed"), "details": e.detail},
+                {"error": _("Validation failed"), "details": error_details},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         except PermissionDenied as e:
@@ -1735,7 +1734,8 @@ class TransactionViewSet(viewsets.ModelViewSet):
 
             return Response(TransactionSerializer(transaction).data)
 
-        except ValidationError as e:
+        except (DRFValidationError, ValidationError) as e:
+            error_details = getattr(e, "detail", getattr(e, "message_dict", str(e)))
             logger.warning(
                 f"Transaction update validation failed: {e}",
                 extra={
@@ -1745,7 +1745,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
                 },
             )
             return Response(
-                {"error": _("Validation failed"), "details": e.detail},
+                {"error": _("Validation failed"), "details": error_details},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         except Exception as e:
@@ -1826,104 +1826,6 @@ class TransactionViewSet(viewsets.ModelViewSet):
             logger.exception(f"Error deleting transaction {kwargs.get('id')}: {e}")
             return Response(
                 {"error": _("Failed to delete transaction. Please try again later.")},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-    @extend_schema(
-        summary="Bulk Create Transactions",
-        description="""
-        Create multiple transactions in a single request.
-
-        Features:
-        - Atomic operation (all or nothing)
-        - Validation for each transaction
-        - Batch processing with progress tracking
-        - Background processing for large batches
-        """,
-        request=TransactionBulkCreateSerializer,
-        responses={
-            201: inline_serializer(
-                name="BulkCreateResponse",
-                fields={
-                    "created": serializers.IntegerField(),
-                    "failed": serializers.IntegerField(),
-                    "errors": serializers.ListField(child=serializers.DictField()),
-                    "transaction_ids": serializers.ListField(
-                        child=serializers.UUIDField()
-                    ),
-                },
-            ),
-        },
-    )
-    @action(detail=False, methods=["post"], url_path="bulk-create")
-    def bulk_create(self, request, *args, **kwargs):
-        """
-        Create multiple transactions in bulk.
-
-        Performance:
-        - Uses bulk_create for database efficiency
-        - Processes in configurable batch sizes
-        - Returns summary with success/failure counts
-
-        Returns:
-            Summary of bulk creation results
-        """
-        try:
-            serializer = self.get_serializer(data=request.data)
-            serializer.is_valid(raise_exception=True)
-
-            transactions_data = serializer.validated_data["transactions"]
-            results = {"created": 0, "failed": 0, "errors": [], "transaction_ids": []}
-
-            # Process in batches for performance
-            batch_size = 100
-            for i in range(0, len(transactions_data), batch_size):
-                batch = transactions_data[i : i + batch_size]
-
-                with db_transaction.atomic():
-                    for transaction_data in batch:
-                        try:
-                            transaction_serializer = TransactionCreateSerializer(
-                                data=transaction_data, context={"request": request}
-                            )
-                            transaction_serializer.is_valid(raise_exception=True)
-                            transaction = transaction_serializer.save()
-
-                            results["created"] += 1
-                            results["transaction_ids"].append(str(transaction.id))
-
-                        except Exception as e:
-                            results["failed"] += 1
-                            results["errors"].append(
-                                {
-                                    "index": i + batch.index(transaction_data),
-                                    "error": str(e),
-                                    "data": transaction_data,
-                                }
-                            )
-
-            logger.info(
-                f"Bulk transaction creation completed",
-                extra={
-                    "user_id": request.user.id,
-                    "created": results["created"],
-                    "failed": results["failed"],
-                },
-            )
-
-            return Response(results, status=status.HTTP_201_CREATED)
-
-        except Exception as e:
-            logger.exception(
-                f"Bulk transaction creation failed: {e}",
-                extra={"user_id": request.user.id},
-            )
-            return Response(
-                {
-                    "error": _(
-                        "Bulk creation failed. Please check your data and try again."
-                    )
-                },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
@@ -2071,55 +1973,60 @@ class TransactionViewSet(viewsets.ModelViewSet):
 
     def _get_analytics_summary(self, queryset) -> Dict[str, Any]:
         """
-        Calculate analytics summary for a queryset.
-
-        Args:
-            queryset: Filtered transaction queryset
-
-        Returns:
-            Dictionary with analytics summary
+        Calculate comprehensive analytics summary for a queryset.
         """
         try:
-            # Basic aggregates
             aggregates = queryset.aggregate(
                 total_count=Count("id"),
                 total_amount=Sum("amount"),
                 avg_amount=Avg("amount"),
-                min_amount=Min("amount"),
-                max_amount=Max("amount"),
                 total_income=Sum(
                     "amount", filter=Q(transaction_type=choices.TransactionType.INCOME)
                 ),
                 total_expense=Sum(
                     "amount", filter=Q(transaction_type=choices.TransactionType.EXPENSE)
                 ),
+                tax_deductible=Sum("amount", filter=Q(is_tax_deductible=True)),
+                latest_date=Max("transaction_date"),
+                earliest_date=Min("transaction_date"),
             )
 
-            # Calculate net flow
             total_income = aggregates["total_income"] or Decimal("0.00")
             total_expense = aggregates["total_expense"] or Decimal("0.00")
-            net_flow = total_income - total_expense
+            net_savings = total_income - total_expense
+
+            # Calculate daily average
+            days = 1
+            if aggregates["latest_date"] and aggregates["earliest_date"]:
+                delta = aggregates["latest_date"] - aggregates["earliest_date"]
+                days = max(delta.days, 1)
 
             return {
                 "summary": {
                     "total_transactions": aggregates["total_count"] or 0,
-                    "total_amount": aggregates["total_amount"] or Decimal("0.00"),
-                    "average_amount": aggregates["avg_amount"] or Decimal("0.00"),
-                    "min_amount": aggregates["min_amount"] or Decimal("0.00"),
-                    "max_amount": aggregates["max_amount"] or Decimal("0.00"),
-                    "total_income": total_income,
-                    "total_expense": total_expense,
-                    "net_flow": net_flow,
-                    "income_expense_ratio": (
-                        (total_income / total_expense * 100) if total_expense > 0 else 0
+                    "total_income": str(total_income),
+                    "total_expense": str(total_expense),
+                    "net_savings": str(net_savings),
+                    "savings_rate": (
+                        round((float(net_savings) / float(total_income)) * 100, 2)
+                        if total_income > 0
+                        else 0
+                    ),
+                    "daily_avg_spend": str(round(total_expense / days, 2)),
+                    "tax_deductible_total": str(
+                        aggregates["tax_deductible"] or Decimal("0.00")
                     ),
                 },
-                "counts": {
-                    status_choice[0]: queryset.filter(status=status_choice[0]).count()
-                    for status_choice in choices.TransactionStatus.choices
+                "meta": {
+                    "period_days": days,
+                    "status_counts": {
+                        status_choice[0]: queryset.filter(
+                            status=status_choice[0]
+                        ).count()
+                        for status_choice in choices.TransactionStatus.choices
+                    },
                 },
             }
-
         except Exception as e:
             logger.error(f"Error calculating analytics summary: {e}")
             return {}
@@ -2127,102 +2034,104 @@ class TransactionViewSet(viewsets.ModelViewSet):
     def _calculate_analytics(self, queryset, group_by: str) -> Dict[str, Any]:
         """
         Calculate detailed analytics with grouping.
-
-        Args:
-            queryset: Filtered transaction queryset
-            group_by: Field to group by
-
-        Returns:
-            Detailed analytics data
         """
-        analytics = {
+        return {
             "summary": self._get_analytics_summary(queryset),
-            "trends": [],
-            "breakdown": [],
+            "trends": self._get_time_based_trends(queryset, group_by),
+            "breakdowns": {
+                "categories": self._get_breakdown_by_field(queryset, "category"),
+                "merchants": self._get_breakdown_by_field(queryset, "merchant"),
+                "accounts": self._get_breakdown_by_field(queryset, "account"),
+            },
         }
-
-        # Add time-based trends
-        if group_by in ["month", "week", "day"]:
-            analytics["trends"] = self._get_time_based_trends(queryset, group_by)
-
-        # Add category/account breakdown
-        if group_by in ["category", "account"]:
-            analytics["breakdown"] = self._get_breakdown_by_field(queryset, group_by)
-
-        return analytics
 
     def _get_time_based_trends(self, queryset, interval: str) -> List[Dict[str, Any]]:
         """
-        Get transaction trends over time.
-
-        Args:
-            queryset: Filtered transaction queryset
-            interval: Time interval (month, week, day)
-
-        Returns:
-            List of trend data points
+        Get transaction trends (Income vs Expense) over time.
         """
-        # Implementation depends on your database and requirements
-        # This is a simplified version
-        trends = []
+        trunc_func = TruncMonth
+        if interval == "week":
+            trunc_func = TruncWeek
+        elif interval == "day":
+            trunc_func = TruncDay
 
-        # Group by date truncation (implementation varies by DB)
-        # For PostgreSQL:
-        # from django.db.models.functions import TruncMonth, TruncWeek, TruncDay
+        trends = (
+            queryset.annotate(period=trunc_func("transaction_date"))
+            .values("period")
+            .annotate(
+                income=Sum(
+                    "amount", filter=Q(transaction_type=choices.TransactionType.INCOME)
+                ),
+                expense=Sum(
+                    "amount", filter=Q(transaction_type=choices.TransactionType.EXPENSE)
+                ),
+            )
+            .order_by("period")
+        )
 
-        return trends
+        return [
+            {
+                "period": t["period"].strftime("%Y-%m-%d") if t["period"] else None,
+                "income": str(t["income"] or 0),
+                "expense": str(t["expense"] or 0),
+                "net": str((t["income"] or 0) - (t["expense"] or 0)),
+            }
+            for t in trends
+        ]
 
     def _get_breakdown_by_field(self, queryset, field: str) -> List[Dict[str, Any]]:
         """
-        Get transaction breakdown by field.
-
-        Args:
-            queryset: Filtered transaction queryset
-            field: Field to break down by
-
-        Returns:
-            List of breakdown items
+        Enhanced breakdown by Category, Merchant, or Account.
         """
-        breakdown = []
-
         if field == "category":
-            # Group by category with aggregates
-            categories = (
+            items = (
                 queryset.values(
-                    "category__id",
-                    "category__name",
-                    "category__category_type",
+                    "category__id", "category__name", "category__category_type"
                 )
-                .annotate(
-                    total_amount=Sum("amount"),
-                    transaction_count=Count("id"),
-                    avg_amount=Avg("amount"),
-                )
-                .order_by("-total_amount")
+                .annotate(count=Count("id"), total=Sum("amount"))
+                .order_by("-total")[:10]
             )
-
-            for category in categories:
-                breakdown.append(
-                    {
-                        "id": category["category__id"],
-                        "name": category["category__name"],
-                        "type": category["category__category_type"],
-                        "total_amount": category["total_amount"],
-                        "transaction_count": category["transaction_count"],
-                        "avg_amount": category["avg_amount"],
-                        "percentage": (
-                            (
-                                category["total_amount"]
-                                / queryset.aggregate(Sum("amount"))["amount__sum"]
-                                * 100
-                            )
-                            if queryset.aggregate(Sum("amount"))["amount__sum"]
-                            else 0
-                        ),
-                    }
-                )
-
-        return breakdown
+            return [
+                {
+                    "id": i["category__id"],
+                    "name": i["category__name"],
+                    "type": i["category__category_type"],
+                    "total": str(i["total"]),
+                    "count": i["count"],
+                }
+                for i in items
+            ]
+        elif field == "merchant":
+            items = (
+                queryset.filter(merchant__isnull=False)
+                .values("merchant")
+                .annotate(count=Count("id"), total=Sum("amount"))
+                .order_by("-total")[:10]
+            )
+            return [
+                {
+                    "merchant": i["merchant"],
+                    "total": str(i["total"]),
+                    "count": i["count"],
+                }
+                for i in items
+            ]
+        elif field == "account":
+            items = (
+                queryset.values("account__id", "account__name")
+                .annotate(count=Count("id"), total=Sum("amount"))
+                .order_by("-total")
+            )
+            return [
+                {
+                    "id": i["account__id"],
+                    "name": i["account__name"],
+                    "total": str(i["total"]),
+                    "count": i["count"],
+                }
+                for i in items
+            ]
+        return []
 
     def _export_transactions(self, queryset, format: str) -> Response:
         """
