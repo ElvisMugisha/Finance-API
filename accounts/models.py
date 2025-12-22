@@ -156,10 +156,12 @@ class Account(utils_models.BaseModel):
                 name=utils.get_index_name("accounts", ["user", "name"]),
             ),
             models.CheckConstraint(
-                condition=models.Q(
-                    current_balance__gte=Decimal("-1000000000")
-                ),  # Reasonable minimum
-                name=utils.get_index_name("accounts", ["current_balance"]),
+                condition=models.Q(initial_balance__gte=Decimal("0.00")),
+                name=utils.get_index_name("accounts", ["initial_balance_non_negative"]),
+            ),
+            models.CheckConstraint(
+                condition=models.Q(current_balance__gte=Decimal("-1000000000")),
+                name=utils.get_index_name("accounts", ["current_balance_limit"]),
             ),
         ]
 
@@ -181,10 +183,47 @@ class Account(utils_models.BaseModel):
         if self.account_type == choices.AccountType.BANK and not self.account_number:
             logger.warning(f"Bank account missing account number: {self.name}")
 
-        # Balance validation
-        if self.current_balance < Decimal("-1000000"):  # Arbitrary large negative
+        # Initial balance validation
+        if self.initial_balance < 0:
             raise ValidationError(
-                {"current_balance": _("Balance cannot be less than -1,000,000.")}
+                {"initial_balance": _("Initial balance cannot be negative.")}
+            )
+
+        # Protect initial_balance on updates
+        if self.pk:
+            try:
+                # Use .get() to compare with database state
+                original = Account.objects.get(pk=self.pk)
+                if original.initial_balance != self.initial_balance:
+                    logger.warning(
+                        f"Attempt to change initial_balance on account {self.id} "
+                        f"from {original.initial_balance} to {self.initial_balance}"
+                    )
+                    raise ValidationError(
+                        {
+                            "initial_balance": _(
+                                "Initial balance cannot be changed after creation."
+                            )
+                        }
+                    )
+            except Account.DoesNotExist:
+                pass
+
+        # Primary account validation
+        if self.is_primary:
+            if not self.is_active:
+                raise ValidationError(
+                    {"is_primary": _("Inactive account cannot be primary.")}
+                )
+            if self.is_locked:
+                raise ValidationError(
+                    {"is_primary": _("Locked account cannot be primary.")}
+                )
+
+        # Balance validation
+        if self.current_balance < Decimal("-1000000000"):
+            raise ValidationError(
+                {"current_balance": _("Balance cannot be less than -1,000,000,000.")}
             )
 
         # Institution validation
@@ -202,6 +241,16 @@ class Account(utils_models.BaseModel):
         """
         Override save to handle primary account logic and balance updates.
         """
+        # Handle creation logic
+        is_new = self._state.adding
+        if is_new:
+            # Initialize current_balance to initial_balance on creation
+            self.current_balance = self.initial_balance
+            self.balance_updated_at = timezone.now()
+            logger.info(
+                f"Creating new account {self.name} with initial balance {self.initial_balance}"
+            )
+
         # Handle primary account logic
         if self.is_primary and self.is_active:
             try:
@@ -210,15 +259,10 @@ class Account(utils_models.BaseModel):
                     Account.objects.filter(user=self.user, is_primary=True).exclude(
                         id=self.id
                     ).update(is_primary=False)
-
                     logger.debug(f"Set account as primary: {self.name}")
             except Exception as e:
                 logger.error(f"Error setting primary account: {e}")
                 raise
-
-        # Update balance timestamp
-        if "current_balance" in self.get_deferred_fields():
-            self.balance_updated_at = timezone.now()
 
         super().save(*args, **kwargs)
 

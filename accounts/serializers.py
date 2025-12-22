@@ -45,8 +45,8 @@ class BaseAccountSerializer(serializers.ModelSerializer):
             max_limit = Decimal("1000000000")  # +1 billion
 
             if value < min_limit or value > max_limit:
-                self._log_validation_warning(f"Unusual {field_name} value: {value}")
-                # Still allow, but log it
+                self._log_validation_warning(f"Extreme {field_name} value: {value}")
+                # Log but allow if within database constraints
 
             return value
 
@@ -234,6 +234,11 @@ class AccountSerializer(BaseAccountSerializer):
 
     def validate_initial_balance(self, value: Decimal) -> Decimal:
         """Validate initial balance."""
+        if value < 0:
+            raise serializers.ValidationError(
+                _("Initial balance cannot be negative."),
+                code="negative_balance",
+            )
         return self._validate_balance("initial_balance", value)
 
     def validate_current_balance(self, value: Decimal) -> Decimal:
@@ -307,10 +312,19 @@ class AccountSerializer(BaseAccountSerializer):
                 attrs["bank_code"] = None
 
         # Validate primary account logic
-        if is_primary and not is_active:
-            raise serializers.ValidationError(
-                {"is_primary": _("Primary account must be active.")}
+        if is_primary:
+            if not is_active:
+                raise serializers.ValidationError(
+                    {"is_primary": _("Primary account must be active.")}
+                )
+            # We check instance for is_locked if not in attrs
+            is_locked = attrs.get(
+                "is_locked", getattr(self.instance, "is_locked", False)
             )
+            if is_locked:
+                raise serializers.ValidationError(
+                    {"is_primary": _("Locked account cannot be primary.")}
+                )
 
         # Check currency is active (handled by PrimaryKeyRelatedField)
 
@@ -346,11 +360,6 @@ class AccountSerializer(BaseAccountSerializer):
             validated_data["current_balance"] = validated_data.get(
                 "initial_balance", Decimal("0.00")
             )
-
-            # Handle primary account logic
-            is_primary = validated_data.get("is_primary", False)
-            if is_primary:
-                self._handle_primary_account_logic(user, validated_data)
 
             # Create account within transaction
             with db_transaction.atomic():
@@ -424,11 +433,6 @@ class AccountSerializer(BaseAccountSerializer):
                         f"due to initial balance update"
                     )
 
-            # Handle primary account logic
-            is_primary = validated_data.get("is_primary", instance.is_primary)
-            if is_primary and not instance.is_primary:
-                self._handle_primary_account_logic(user, validated_data, instance)
-
             # Update fields
             for attr, value in validated_data.items():
                 setattr(instance, attr, value)
@@ -453,46 +457,6 @@ class AccountSerializer(BaseAccountSerializer):
                 _("An unexpected error occurred while updating the account."),
                 code="update_error",
             )
-
-    def _handle_primary_account_logic(
-        self, user, validated_data: Dict[str, Any], instance: Optional[Account] = None
-    ) -> None:
-        """
-        Handle primary account logic when creating or updating.
-
-        Args:
-            user: User instance
-            validated_data: Validated data
-            instance: Existing instance (if updating)
-        """
-        try:
-            with db_transaction.atomic():
-                # Get current primary account
-                current_primary = (
-                    Account.objects.filter(user=user, is_primary=True, is_active=True)
-                    .exclude(id=instance.id if instance else None)
-                    .first()
-                )
-
-                if current_primary:
-                    # Demote current primary
-                    current_primary.is_primary = False
-                    current_primary.save(update_fields=["is_primary", "updated_at"])
-
-                    logger.info(
-                        f"Demoted existing primary account: {current_primary.id}"
-                    )
-
-                # Ensure new primary account is active
-                if "is_active" in validated_data and not validated_data["is_active"]:
-                    validated_data["is_active"] = True
-                    logger.info("Forced is_active=True for primary account")
-
-                logger.info(f"Setting account as primary")
-
-        except Exception as e:
-            logger.error(f"Error handling primary account logic: {e}")
-            raise
 
 
 class AccountListSerializer(BaseAccountSerializer):

@@ -1,8 +1,11 @@
 from django.conf import settings
 from django.db import models
+from decimal import Decimal
 from django.db import transaction as db_transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Q, Sum, Avg, Min, Max
 from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from django.core.exceptions import ValidationError
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
     OpenApiParameter,
@@ -428,12 +431,11 @@ class AccountViewSet(
         1. No completed transactions allowed
         2. Account must not be locked
         3. No pending transactions
-        4. No linked budget categories
-        5. No linked recurring transactions
-        6. No linked financial goals
-        7. No active sub-accounts (if hierarchical accounts exist)
-        8. Account must be inactive for minimum period (configurable)
-        9. No open banking connections
+        4. No linked financial goals
+        5. No linked recurring transactions (if applicable)
+        6. No active sub-accounts (if hierarchical accounts exist)
+        7. Account must be inactive for minimum period (configurable)
+        8. No open banking connections
 
         Args:
             account: Account instance to validate
@@ -473,25 +475,6 @@ class AccountViewSet(
                 f"Error checking pending transactions for account {account.id}: {e}"
             )
             # Fail-safe: if we can't check, assume there might be pending transactions
-            return False
-
-        # Check for linked budget categories
-        try:
-            from .models import Budget
-
-            budget_count = Budget.objects.filter(
-                models.Q(linked_account=account)
-                | models.Q(accounts=account)  # If using ManyToMany
-            ).count()
-
-            if budget_count > 0:
-                logger.info(
-                    f"Account {account.id} is linked to {budget_count} budgets, cannot delete"
-                )
-                return False
-        except Exception as e:
-            logger.error(f"Error checking budget links for account {account.id}: {e}")
-            # Fail-safe: if we can't check, assume there might be linked budgets
             return False
 
         # Check for linked financial goals
@@ -646,21 +629,7 @@ class AccountViewSet(
         except Exception:
             pass  # Continue with other checks
 
-        # 4. Check for linked budgets
-        try:
-            budget_count = Budget.objects.filter(
-                models.Q(linked_account=account) | models.Q(accounts=account)
-            ).count()
-
-            if budget_count > 0:
-                return (
-                    f"Cannot delete account '{account.name}' because it is linked to "
-                    f"{budget_count} budget(s). Please unlink from budgets first."
-                )
-        except Exception:
-            pass
-
-        # 6. Check for financial goals
+        # 4. Check for financial goals
         try:
             goal_count = FinancialGoal.objects.filter(
                 linked_account=account, is_active=True, is_achieved=False
@@ -670,12 +639,12 @@ class AccountViewSet(
                 return (
                     f"Cannot delete account '{account.name}' because it is linked to "
                     f"{goal_count} active financial goal(s). "
-                    f"Please unlink from goals or mark goals as achieved first."
+                    f"Please unlink from goals first."
                 )
         except Exception:
             pass
 
-        # 7. Check for recent transfers
+        # 5. Check for recent transfers
         try:
             transfer_count = Transaction.objects.filter(
                 transfer_account=account,
@@ -979,137 +948,127 @@ class AccountViewSet(
 
     @extend_schema(
         summary="Get account summary",
-        description="Get summary statistics for user's accounts.",
+        description="Get a comprehensive summary of all user accounts, including active, inactive, and locked status.",
         responses={
-            200: OpenApiResponse(description="Account summary"),
+            200: OpenApiResponse(description="Detailed account summary"),
             500: OpenApiResponse(description="Internal Server Error"),
         },
     )
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):
-        """Get account summary for the user."""
+        """
+        Get a comprehensive account summary for the user.
+
+        Provides:
+        - Overall balance (active accounts)
+        - Status breakdown (active, inactive, locked)
+        - Currency and Type distributions
+        - Detailed lists of locked and inactive accounts
+        """
         try:
             user = request.user
-            accounts = self.get_queryset().filter(is_active=True)
+            # Fetch all accounts associated with the user
+            all_accounts = self.get_queryset().select_related("currency")
 
-            # Calculate summary statistics
-            total_balance = Decimal("0.00")
+            # Initialize summary containers
+            total_active_balance = Decimal("0.00")
             currency_summary = {}
             type_summary = {}
-
-            for account in accounts:
-                total_balance += account.current_balance
-
-                # Currency summary
-                currency_code = account.currency.code
-                if currency_code not in currency_summary:
-                    currency_summary[currency_code] = {
-                        "balance": Decimal("0.00"),
-                        "account_count": 0,
-                        "currency_symbol": account.currency.symbol or currency_code,
-                    }
-                currency_summary[currency_code]["balance"] += account.current_balance
-                currency_summary[currency_code]["account_count"] += 1
-
-                # Account type summary
-                if account.account_type not in type_summary:
-                    type_summary[account.account_type] = {
-                        "balance": Decimal("0.00"),
-                        "account_count": 0,
-                    }
-                type_summary[account.account_type]["balance"] += account.current_balance
-                type_summary[account.account_type]["account_count"] += 1
-
-            # Convert Decimal to string for JSON serialization
-            for currency in currency_summary.values():
-                currency["balance"] = str(currency["balance"])
-
-            for acc_type in type_summary.values():
-                acc_type["balance"] = str(acc_type["balance"])
-
-            summary = {
-                "total_balance": str(total_balance),
-                "account_count": accounts.count(),
-                "primary_account": Account.get_user_primary_account(user.id),
-                "currency_summary": currency_summary,
-                "type_summary": type_summary,
-                "has_locked_accounts": accounts.filter(is_locked=True).exists(),
+            status_summary = {
+                "active": {"count": 0, "balance": Decimal("0.00")},
+                "inactive": {"count": 0, "balance": Decimal("0.00")},
+                "locked": {"count": 0, "balance": Decimal("0.00")},
             }
 
-            logger.debug(f"Account summary generated for user {user.id}")
+            locked_accounts_list = []
+            inactive_accounts_list = []
+
+            for account in all_accounts:
+                curr_balance = account.current_balance
+
+                # 1. Update status tracking
+                if account.is_active:
+                    status_summary["active"]["count"] += 1
+                    status_summary["active"]["balance"] += curr_balance
+                    total_active_balance += curr_balance
+                else:
+                    status_summary["inactive"]["count"] += 1
+                    status_summary["inactive"]["balance"] += curr_balance
+                    inactive_accounts_list.append(account)
+
+                if account.is_locked:
+                    status_summary["locked"]["count"] += 1
+                    status_summary["locked"]["balance"] += curr_balance
+                    locked_accounts_list.append(account)
+
+                # 2. Currency summary (only for active accounts to avoid skewing liquid net worth)
+                if account.is_active:
+                    currency_code = account.currency.code
+                    if currency_code not in currency_summary:
+                        currency_summary[currency_code] = {
+                            "balance": Decimal("0.00"),
+                            "count": 0,
+                            "symbol": account.currency.symbol or currency_code,
+                        }
+                    currency_summary[currency_code]["balance"] += curr_balance
+                    currency_summary[currency_code]["count"] += 1
+
+                    # 3. Account type summary
+                    if account.account_type not in type_summary:
+                        type_summary[account.account_type] = {
+                            "balance": Decimal("0.00"),
+                            "count": 0,
+                        }
+                    type_summary[account.account_type]["balance"] += curr_balance
+                    type_summary[account.account_type]["count"] += 1
+
+            # Format Decimals for JSON serialization
+            def format_decimal_data(data_dict):
+                for key, value in data_dict.items():
+                    if isinstance(value, Decimal):
+                        data_dict[key] = str(value)
+                    elif isinstance(value, dict):
+                        format_decimal_data(value)
+
+            format_decimal_data(currency_summary)
+            format_decimal_data(type_summary)
+            format_decimal_data(status_summary)
+
+            primary_account = Account.objects.get_user_primary_account(user.id)
+
+            summary = {
+                "overall": {
+                    "total_accounts": all_accounts.count(),
+                    "total_active_balance": str(total_active_balance),
+                    "status_breakdown": status_summary,
+                },
+                "primary_account": (
+                    AccountListSerializer(primary_account).data
+                    if primary_account
+                    else None
+                ),
+                "currency_breakdown": currency_summary,
+                "type_breakdown": type_summary,
+                "inactive_accounts": AccountListSerializer(
+                    inactive_accounts_list, many=True
+                ).data,
+                "locked_accounts": AccountListSerializer(
+                    locked_accounts_list, many=True
+                ).data,
+            }
+
+            logger.info(f"Generated comprehensive summary for user {user.id}")
             return Response(summary)
 
         except Exception as e:
             return self._handle_api_error(
                 e,
-                "Failed to generate account summary.",
+                "Failed to generate comprehensive account summary.",
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
     @extend_schema(
-        summary="Set primary account",
-        description="Set an account as the user's primary account.",
-        responses={
-            200: AccountSerializer,
-            400: OpenApiResponse(description="Cannot set as primary"),
-            403: OpenApiResponse(description="Permission denied"),
-            404: OpenApiResponse(description="Account not found"),
-        },
-    )
-    @action(detail=True, methods=["post"], url_path="set-primary")
-    def set_primary(self, request, id=None):
-        """Set account as primary."""
-        try:
-            account = self.get_object()
-            user = request.user
-
-            # Check permissions
-            if account.user != user and not (user.is_staff or user.is_superuser):
-                return Response(
-                    {"error": "Cannot set another user's account as primary."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-
-            # Check if account can be primary
-            if not account.is_active:
-                return Response(
-                    {"error": "Cannot set inactive account as primary."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            if account.is_locked:
-                return Response(
-                    {"error": "Cannot set locked account as primary."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            with db_transaction.atomic():
-                # Demote existing primary account
-                Account.objects.filter(
-                    user=user, is_primary=True, is_active=True
-                ).exclude(id=account.id).update(is_primary=False)
-
-                # Set new primary
-                account.is_primary = True
-                account.save(update_fields=["is_primary", "updated_at"])
-
-            logger.info(
-                f"Account set as primary: id={account.id}, "
-                f"name='{account.name}', "
-                f"by user={user.id}"
-            )
-
-            serializer = self.get_serializer(account)
-            return Response(serializer.data)
-
-        except Exception as e:
-            return self._handle_api_error(
-                e, "Failed to set account as primary.", status.HTTP_400_BAD_REQUEST
-            )
-
-    @extend_schema(
         summary="Get balance history",
-        description="Get historical balance data for an account.",
         parameters=[
             OpenApiParameter(
                 name="start_date",
@@ -1488,38 +1447,46 @@ class TransactionViewSet(viewsets.ModelViewSet):
         user = self.request.user
 
         # Base queryset with all necessary prefetches
-        queryset = (
-            Transaction.objects.select_related(
-                "user",
-                "account",
-                "category",
-                "original_currency",
-            )
-            .prefetch_related(
-                "tags",
-            )
-            .only(
-                "id",
-                "user_id",
-                "account_id",
-                "category_id",
-                "name",
-                "transaction_type",
-                "amount",
-                "original_amount",
-                "original_currency_id",
-                "exchange_rate",
-                "description",
-                "status",
-                "transaction_date",
-                "created_at",
-                "updated_at",
-                "is_transfer",
-                "transfer_account_id",
-                "transfer_reference",
-            )
+        queryset = Transaction.objects.select_related(
+            "user",
+            "account",
+            "account__currency",
+            "category",
+            "original_currency",
+            "transfer_account",
+        ).only(
+            "id",
+            "user_id",
+            "account_id",
+            "category_id",
+            "name",
+            "transaction_type",
+            "amount",
+            "original_amount",
+            "original_currency_id",
+            "exchange_rate",
+            "description",
+            "status",
+            "transaction_date",
+            "created_at",
+            "updated_at",
+            "is_transfer",
+            "transfer_account_id",
+            "transfer_reference",
+            "tags",
+            "attachments",
+            "is_recurring",
+            "is_tax_deductible",
+            "merchant",
+            "reference_number",
+            # Include essentials from related models to prevent deferred queries
+            "user__username",
+            "account__name",
+            "account__currency_id",
+            "category__name",
+            "original_currency__code",
+            "transfer_account__name",
         )
-
         # Filter by user ownership (unless admin)
         if not (user.is_staff or user.is_superuser):
             queryset = queryset.filter(user=user)
@@ -1824,9 +1791,9 @@ class TransactionViewSet(viewsets.ModelViewSet):
                 if instance.status == TransactionStatus.COMPLETED and instance.account:
                     # Reverse the transaction amount
                     reverse_type = (
-                        TransactionType.EXPENSE
-                        if instance.transaction_type == TransactionType.INCOME
-                        else TransactionType.INCOME
+                        choices.TransactionType.EXPENSE
+                        if instance.transaction_type == choices.TransactionType.INCOME
+                        else choices.TransactionType.INCOME
                     )
                     instance.account.update_balance(instance.amount, reverse_type)
 
@@ -1987,7 +1954,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
             instance = self.get_object()
 
             # Check if transaction can be verified
-            if instance.status != TransactionStatus.PENDING:
+            if instance.status != choices.TransactionStatus.PENDING:
                 return Response(
                     {
                         "error": _(
@@ -2095,8 +2062,8 @@ class TransactionViewSet(viewsets.ModelViewSet):
 
         # Users cannot modify completed or reconciled transactions
         if transaction.status in [
-            TransactionStatus.COMPLETED,
-            TransactionStatus.RECONCILED,
+            choices.TransactionStatus.COMPLETED,
+            choices.TransactionStatus.RECONCILED,
         ]:
             return False
 
@@ -2121,10 +2088,10 @@ class TransactionViewSet(viewsets.ModelViewSet):
                 min_amount=Min("amount"),
                 max_amount=Max("amount"),
                 total_income=Sum(
-                    "amount", filter=Q(transaction_type=TransactionType.INCOME)
+                    "amount", filter=Q(transaction_type=choices.TransactionType.INCOME)
                 ),
                 total_expense=Sum(
-                    "amount", filter=Q(transaction_type=TransactionType.EXPENSE)
+                    "amount", filter=Q(transaction_type=choices.TransactionType.EXPENSE)
                 ),
             )
 
@@ -2149,7 +2116,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
                 },
                 "counts": {
                     status_choice[0]: queryset.filter(status=status_choice[0]).count()
-                    for status_choice in TransactionStatus.choices
+                    for status_choice in choices.TransactionStatus.choices
                 },
             }
 
