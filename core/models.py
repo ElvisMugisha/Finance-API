@@ -1,5 +1,5 @@
 import uuid
-from datetime import date
+from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,6 +12,7 @@ from django.utils.translation import gettext_lazy as _
 
 from utils import choices, loggings, utils
 from utils.models import BaseModel
+from .managers import CategoryManager, CurrencyManager
 
 # Initialize logger
 logger = loggings.setup_logging()
@@ -29,6 +30,8 @@ class Currency(BaseModel):
     """
 
     id = models.BigAutoField(primary_key=True, editable=False)
+
+    objects = CurrencyManager()
 
     code = models.CharField(
         max_length=3,
@@ -132,6 +135,34 @@ class Currency(BaseModel):
 
         logger.debug(f"Currency validation passed: {self.code}")
 
+    def save(self, *args, **kwargs):
+        """
+        Save currency with automatic base currency management.
+
+        Ensures:
+        - Only one base currency exists (demotes others).
+        - Base currency always has exchange rate 1.0.
+        """
+        if self.is_base_currency:
+            # Enforce rate 1.0 for base currency
+            if self.exchange_rate != Decimal("1.0"):
+                logger.info(
+                    f"Resetting exchange rate for base currency {self.code} to 1.0"
+                )
+                self.exchange_rate = Decimal("1.0")
+
+            # Demote other base currencies
+            # Use filter().update() for efficiency and atomicity
+            demoted_count = (
+                Currency.objects.filter(is_base_currency=True)
+                .exclude(pk=self.pk)
+                .update(is_base_currency=False, updated_at=timezone.now())
+            )
+            if demoted_count > 0:
+                logger.info(f"Demoted {demoted_count} previous base currency(ies)")
+
+        super().save(*args, **kwargs)
+
     def convert_amount(
         self, amount: Decimal, target_currency: "Currency", date: Optional[date] = None
     ) -> Optional[Decimal]:
@@ -181,43 +212,60 @@ class Currency(BaseModel):
     def _get_exchange_rate(
         self, target_currency: "Currency", date: Optional[date] = None
     ) -> Optional[Decimal]:
-        """Get exchange rate between two currencies."""
-        # TODO: Implement historical rate lookup
-        # For now, use current rates
-        if self.is_base_currency:
-            # Base (1.0) -> Target (Rate).
-            # If Target Rate is "Value in Base", then 1 Base = 1/Rate Target?
-            # Standard: Rate is "How many units of this currency match 1 Base"
-            # OR Rate is "How much is 1 unit of this currency in Base".
-            #
-            # Based on Test Expectation:
-            # 100 EUR (0.85) -> 85 USD (1.0). (0.85 USD per EUR).
-            # So Rate = Value in Base.
-            #
-            # If Self is Base (1.0):
-            # 100 USD -> EUR?
-            # 1 EUR = 0.85 USD.
-            # 1 USD = 1/0.85 EUR.
-            # So Rate = 1 / TargetRate.
-            if target_currency.exchange_rate == 0:
-                return None
-            return Decimal("1.0") / target_currency.exchange_rate
+        """
+        Get exchange rate between two currencies (supports historical).
 
-        elif target_currency.is_base_currency:
-            # Self (Rate) -> Base (1.0).
-            # 100 EUR -> USD.
-            # Rate is 0.85 (USD per EUR).
-            # So Rate = Self.Rate.
-            return self.exchange_rate
+        Args:
+            target_currency: Currency to convert to.
+            date: date object for historical lookup.
 
-        else:
-            # EUR (0.85) -> GBP (0.75).
-            # EUR -> Base -> GBP.
-            # Rate = Self.Rate (to Base) * (1/Target.Rate) (Base to Target).
-            # Rate = Self.Rate / Target.Rate.
-            if target_currency.exchange_rate == 0:
-                return None
-            return self.exchange_rate / target_currency.exchange_rate
+        Returns:
+            Decimal exchange rate or None.
+        """
+        # Optimization: If both are base standard or same
+        if self.id == target_currency.id:
+            return Decimal("1.0")
+
+        def get_rate(currency: "Currency") -> Optional[Decimal]:
+            if currency.is_base_currency:
+                return Decimal("1.0")
+
+            if not date or date >= timezone.now().date():
+                return currency.exchange_rate
+
+            # Historical lookup: Find latest rate <= date
+            best_rate = None
+            closest_date = None
+
+            for entry in currency.historical_rates:
+                try:
+                    # entry['date'] is ISO format datetime string
+                    entry_dt = datetime.fromisoformat(entry["date"])
+                    entry_date = entry_dt.date()
+
+                    if entry_date <= date:
+                        if closest_date is None or entry_date > closest_date:
+                            closest_date = entry_date
+                            best_rate = Decimal(entry["rate"])
+                except (ValueError, KeyError, InvalidOperation):
+                    continue
+
+            if best_rate is not None:
+                return best_rate
+
+            logger.warning(
+                f"No historical rate found for {currency.code} on {date}. Using current rate."
+            )
+            return currency.exchange_rate
+
+        source_rate = get_rate(self)
+        target_rate = get_rate(target_currency)
+
+        if source_rate is None or target_rate is None or target_rate == 0:
+            return None
+
+        # Rate = Source / Target (relative to base)
+        return source_rate / target_rate
 
     @classmethod
     def get_base_currency(cls) -> Optional["Currency"]:
@@ -317,6 +365,8 @@ class Category(BaseModel):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    objects = CategoryManager()
 
     # User ownership (null for system categories)
     user = models.ForeignKey(

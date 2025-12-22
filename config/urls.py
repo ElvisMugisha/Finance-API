@@ -33,7 +33,7 @@ urlpatterns = [
 # Application URLs
 urlpatterns += [
     path("auth/", include("auths.urls")),
-    # path("core/", include("core.urls")),
+    path("core/", include("core.urls")),
     # path("accounts/", include("accounts.urls")),
 ]
 

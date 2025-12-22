@@ -178,7 +178,27 @@ class CategoryFilter:
         if not self.request.query_params.get("include_inactive"):
             self.queryset = self.queryset.filter(is_active=True)
 
-        return self.queryset.order_by("name")
+        self._apply_ordering()
+        return self.queryset
+
+    def _apply_ordering(self):
+        """Apply ordering from query params."""
+        ordering = self.request.query_params.get("ordering")
+        allowed_fields = ["name", "transaction_count", "created_at", "updated_at"]
+
+        if ordering:
+            orders = []
+            for field in ordering.split(","):
+                field_name = field.lstrip("-")
+                if field_name in allowed_fields:
+                    orders.append(field)
+            if orders:
+                self.queryset = self.queryset.order_by(*orders)
+                logger.debug(f"Applied category ordering: {orders}")
+                return
+
+        # Default ordering
+        self.queryset = self.queryset.order_by("name")
 
     def _apply_search(self) -> None:
         """Apply search by name."""
@@ -236,3 +256,70 @@ class CategoryFilter:
             models.Q(user=self.user) | models.Q(is_system_category=True)
         )
         logger.debug(f"Regular user {self.user.id} viewing filtered categories")
+
+
+class CurrencyFilter:
+    """
+    Encapsulates currency filtering logic, mirroring UserFilter.
+
+    Supports:
+    - Filtering by active status and base currency status
+    - Searching by code, name, or symbol
+    - Ordering
+    """
+
+    def __init__(self, request: Request, queryset=None):
+        from core.models import Currency  # Lazy import to avoid circular dependency
+
+        self.request = request
+        self.queryset = queryset if queryset is not None else Currency.objects.all()
+
+    def apply(self):
+        """
+        Apply all filters, search, and ordering to the queryset.
+        """
+        try:
+            self._apply_basic_filters()
+            self._apply_search()
+            self._apply_ordering()
+            return self.queryset
+
+        except Exception as e:
+            logger.exception(f"CurrencyFilter.apply failed: {str(e)}")
+            return self.queryset.none()
+
+    def _apply_basic_filters(self):
+        """Filter by boolean fields."""
+        for field in ["is_active", "is_base_currency"]:
+            value = self.request.query_params.get(field)
+            if value is not None:
+                if value.lower() in ["true", "1"]:
+                    self.queryset = self.queryset.filter(**{field: True})
+                elif value.lower() in ["false", "0"]:
+                    self.queryset = self.queryset.filter(**{field: False})
+                logger.debug(f"Applied currency filter {field}={value}")
+
+    def _apply_search(self):
+        """Apply search across code, name, and symbol."""
+        search_query = self.request.query_params.get("search")
+        if search_query:
+            self.queryset = self.queryset.filter(
+                Q(code__icontains=search_query)
+                | Q(name__icontains=search_query)
+                | Q(symbol__icontains=search_query)
+            )
+            logger.debug(f"Applied currency search: {search_query}")
+
+    def _apply_ordering(self):
+        """Apply ordering."""
+        ordering = self.request.query_params.get("ordering")
+        allowed_fields = ["code", "name", "exchange_rate", "updated_at"]
+
+        if ordering:
+            orders = []
+            for field in ordering.split(","):
+                field_name = field.lstrip("-")
+                if field_name in allowed_fields:
+                    orders.append(field)
+            if orders:
+                self.queryset = self.queryset.order_by(*orders)

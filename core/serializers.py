@@ -71,22 +71,22 @@ class CurrencySerializer(serializers.ModelSerializer):
             },
             "exchange_rate": {
                 "help_text": _("Current exchange rate to base currency"),
-                "max_digits": 18,
-                "decimal_places": 8,
+                "max_digits": 20,
+                "decimal_places": 10,
                 "min_value": 0,
             },
             "decimal_places": {
-                "help_text": _("Number of decimal places (0-6)"),
+                "help_text": _("Number of decimal places (0-10)"),
                 "min_value": 0,
-                "max_value": 6,
+                "max_value": 10,
             },
         }
 
     def get_formatted_exchange_rate(self, obj: Currency) -> str:
         """Get formatted exchange rate for display."""
         try:
-            # Format with appropriate decimal places
-            return f"{obj.exchange_rate:.{min(6, obj.decimal_places)}f}"
+            # Format with appropriate decimal places (up to 10)
+            return f"{obj.exchange_rate:.{min(10, obj.decimal_places)}f}"
         except (AttributeError, ValueError, TypeError) as e:
             logger.warning(f"Error formatting exchange rate for {obj.code}: {e}")
             return str(obj.exchange_rate)
@@ -102,113 +102,22 @@ class CurrencySerializer(serializers.ModelSerializer):
     def validate_code(self, value: str) -> str:
         """
         Validate currency code according to ISO 4217 standards.
-
-        Args:
-            value: Currency code to validate
-
-        Returns:
-            Uppercase validated currency code
-
-        Raises:
-            serializers.ValidationError: If code is invalid
         """
-        logger.debug(f"Validating currency code: {value}")
-
         if not value:
-            raise serializers.ValidationError(
-                _("Currency code cannot be empty."), code="empty_currency_code"
-            )
+            raise serializers.ValidationError(_("Currency code cannot be empty."))
 
         value = value.strip().upper()
-
-        # ISO 4217 validation
-        if len(value) != 3:
+        if len(value) != 3 or not value.isalpha():
             raise serializers.ValidationError(
-                _("Currency code must be exactly 3 characters."), code="invalid_length"
-            )
-
-        if not value.isalpha():
-            raise serializers.ValidationError(
-                _("Currency code must contain only letters."), code="invalid_characters"
-            )
-
-        logger.debug(f"Currency code validation passed: {value}")
-        return value
-
-    def validate_exchange_rate(self, value: Decimal) -> Decimal:
-        """
-        Validate exchange rate is positive and reasonable.
-
-        Args:
-            value: Exchange rate to validate
-
-        Returns:
-            Validated exchange rate
-
-        Raises:
-            serializers.ValidationError: If rate is invalid
-        """
-        logger.debug(f"Validating exchange rate: {value}")
-
-        try:
-            if value <= Decimal("0"):
-                raise serializers.ValidationError(
-                    _("Exchange rate must be positive."), code="non_positive_rate"
-                )
-
-            # Optional: Add business logic constraints
-            # Example: Prevent unrealistically large rates
-            if value > Decimal("1000000"):  # Arbitrary limit
-                logger.warning(f"Unusually high exchange rate: {value}")
-                # Not an error, just a warning
-
-        except (InvalidOperation, TypeError) as e:
-            logger.error(f"Invalid exchange rate format: {value}, error: {e}")
-            raise serializers.ValidationError(
-                _("Exchange rate must be a valid decimal number."),
-                code="invalid_decimal",
-            )
-
-        logger.debug(f"Exchange rate validation passed: {value}")
-        return value
-
-    def validate_decimal_places(self, value: int) -> int:
-        """
-        Validate decimal places are within reasonable range.
-
-        Args:
-            value: Number of decimal places
-
-        Returns:
-            Validated decimal places
-
-        Raises:
-            serializers.ValidationError: If value is out of range
-        """
-        if not 0 <= value <= 6:
-            raise serializers.ValidationError(
-                _("Decimal places must be between 0 and 6."),
-                code="invalid_decimal_places",
+                _("Currency code must be exactly 3 uppercase letters.")
             )
         return value
 
     def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
         """
         Perform cross-field validation.
-
-        Args:
-            attrs: Dictionary of validated attributes
-
-        Returns:
-            Validated attributes with any modifications
-
-        Raises:
-            serializers.ValidationError: If cross-field validation fails
         """
-        logger.debug(f"Performing cross-field validation for currency")
-
-        # Check for base currency conflict
-        is_base_currency = attrs.get(
+        is_base = attrs.get(
             "is_base_currency",
             (
                 getattr(self.instance, "is_base_currency", False)
@@ -217,168 +126,52 @@ class CurrencySerializer(serializers.ModelSerializer):
             ),
         )
 
-        if is_base_currency:
-            # If this is being set as base currency, validate no other base exists
-            code = attrs.get("code", getattr(self.instance, "code", ""))
-
-            existing_base = (
-                Currency.objects.filter(is_base_currency=True)
-                .exclude(code=code)
-                .first()
+        if is_base:
+            # For base currency, we enforce 1.0.
+            # Model save() also does this, but serializer handles it for API feedback.
+            attrs["exchange_rate"] = Decimal("1.0")
+            logger.debug(
+                f"Ensuring exchange_rate=1.0 for base currency {attrs.get('code')}"
             )
 
-            if existing_base and self.instance and self.instance.id != existing_base.id:
-                # Allow update of existing base currency
-                pass
-            elif existing_base and not self.instance:
-                # Creating new base when one already exists
-                raise serializers.ValidationError(
-                    {
-                        "is_base_currency": _(
-                            f"Cannot set {code} as base currency. "
-                            f"{existing_base.code} is already the base currency."
-                        )
-                    },
-                    code="multiple_base_currencies",
-                )
-
-        # Ensure exchange rate is 1.0 for base currency
-        if is_base_currency:
-            exchange_rate = attrs.get(
-                "exchange_rate", getattr(self.instance, "exchange_rate", Decimal("1.0"))
-            )
-
-            if exchange_rate != Decimal("1.0"):
-                logger.warning(
-                    f"Base currency {attrs.get('code')} has exchange rate != 1.0: {exchange_rate}"
-                )
-                # Auto-correct to 1.0
-                attrs["exchange_rate"] = Decimal("1.0")
-
-        logger.debug("Cross-field validation passed")
         return attrs
 
     def create(self, validated_data: Dict[str, Any]) -> Currency:
         """
-        Create a new currency with proper error handling and logging.
-
-        Args:
-            validated_data: Validated data for currency creation
-
-        Returns:
-            Created Currency instance
-
-        Raises:
-            serializers.ValidationError: If creation fails
+        Create a new currency.
         """
         logger.info(f"Creating new currency: {validated_data.get('code')}")
-
         try:
-            # Ensure code is uppercase
-            validated_data["code"] = validated_data["code"].upper()
-
-            # Handle base currency logic
-            if validated_data.get("is_base_currency", False):
-                self._handle_base_currency_creation(validated_data)
-
-            # Create the currency
-            currency = Currency.objects.create(**validated_data)
-
-            logger.info(f"Successfully created currency: {currency.code}")
-            return currency
+            return Currency.objects.create(**validated_data)
 
         except DjangoValidationError as e:
-            logger.error(f"Model validation failed creating currency: {e}")
             raise serializers.ValidationError(e.message_dict)
 
         except Exception as e:
-            logger.error(f"Unexpected error creating currency: {e}")
+            logger.error(f"Error creating currency: {e}")
             raise serializers.ValidationError(
-                _("An unexpected error occurred while creating the currency."),
-                code="creation_error",
+                _("Could not create currency."), code="creation_error"
             )
 
     def update(self, instance: Currency, validated_data: Dict[str, Any]) -> Currency:
         """
-        Update an existing currency with proper error handling.
-
-        Args:
-            instance: Existing Currency instance
-            validated_data: Validated data for update
-
-        Returns:
-            Updated Currency instance
-
-        Raises:
-            serializers.ValidationError: If update fails
+        Update an existing currency.
         """
         logger.info(f"Updating currency: {instance.code}")
-
         try:
-            # Handle base currency changes
-            new_is_base = validated_data.get(
-                "is_base_currency", instance.is_base_currency
-            )
-
-            if new_is_base and not instance.is_base_currency:
-                self._handle_base_currency_update(instance, validated_data)
-
-            # Update fields
             for attr, value in validated_data.items():
                 setattr(instance, attr, value)
-
-            # Save with validation
             instance.save()
-
-            logger.info(f"Successfully updated currency: {instance.code}")
             return instance
 
         except DjangoValidationError as e:
-            logger.error(
-                f"Model validation failed updating currency {instance.code}: {e}"
-            )
             raise serializers.ValidationError(e.message_dict)
 
         except Exception as e:
-            logger.error(f"Unexpected error updating currency {instance.code}: {e}")
+            logger.error(f"Error updating currency {instance.code}: {e}")
             raise serializers.ValidationError(
-                _("An unexpected error occurred while updating the currency."),
-                code="update_error",
+                _("Could not update currency."), code="update_error"
             )
-
-    def _handle_base_currency_creation(self, validated_data: Dict[str, Any]) -> None:
-        """Handle logic for creating a new base currency."""
-        existing_base = Currency.get_base_currency()
-
-        if existing_base:
-            raise serializers.ValidationError(
-                {
-                    "is_base_currency": _(
-                        f"Cannot create new base currency {validated_data['code']}. "
-                        f"{existing_base.code} is already the base currency."
-                    )
-                }
-            )
-
-        # Ensure exchange rate is 1.0 for base currency
-        validated_data["exchange_rate"] = Decimal("1.0")
-        logger.info(f"Creating new base currency: {validated_data['code']}")
-
-    def _handle_base_currency_update(
-        self, instance: Currency, validated_data: Dict[str, Any]
-    ) -> None:
-        """Handle logic for updating a currency to become base currency."""
-        existing_base = Currency.get_base_currency()
-
-        if existing_base and existing_base.id != instance.id:
-            # Demote existing base currency
-            existing_base.is_base_currency = False
-            existing_base.save(update_fields=["is_base_currency", "updated_at"])
-            logger.info(f"Demoted existing base currency: {existing_base.code}")
-
-        # Set exchange rate to 1.0 for new base
-        validated_data["exchange_rate"] = Decimal("1.0")
-        logger.info(f"Promoting currency to base: {instance.code}")
 
 
 class CurrencyConversionSerializer(serializers.Serializer):
@@ -905,10 +698,12 @@ class CategoryCreateUpdateSerializer(BaseCategorySerializer):
 
         user = self._get_request_user()
 
-        # Check if parent belongs to same user
-        if value.user != user:
+        # Check if parent belongs to same user (or is a system category)
+        if value.user and value.user != user:
             raise serializers.ValidationError(
-                _("Parent category must belong to the same user."),
+                _(
+                    "Parent category must belong to the same user or be a system category."
+                ),
                 code="invalid_parent_user",
             )
 
@@ -995,51 +790,38 @@ class CategoryCreateUpdateSerializer(BaseCategorySerializer):
 
     def create(self, validated_data: Dict[str, Any]) -> Category:
         """Create a new category."""
-        logger.info(f"Creating category with validated data: {validated_data}")
+        user = self._get_request_user()
+        is_staff = user.is_staff or user.is_superuser
+
+        # Automated logic: staff create system categories, others create personal
+        if is_staff:
+            validated_data["is_system_category"] = True
+            validated_data["user"] = None
+        else:
+            validated_data["is_system_category"] = False
+            validated_data["user"] = user
 
         try:
-            # Extract user from validated_data
-            user = validated_data.pop("user", None)
-
-            # Create category instance
-            category = Category.objects.create(**validated_data)
-
-            # If user is provided (not None), assign it
-            if user is not None:
-                category.user = user
-                category.save()
-
-            logger.info(
-                f"Category created successfully in serializer: id={category.id}, "
-                f"name='{category.name}', user={category.user.id if category.user else 'system'}"
-            )
-
-            return category
-
+            return super().create(validated_data)
         except Exception as e:
-            logger.exception(f"Error in serializer.create(): {e}")
-            raise serializers.ValidationError(f"Failed to create category: {str(e)}")
+            logger.exception(f"Category creation failed: {e}")
+            raise serializers.ValidationError(_("Failed to create category."))
 
     def update(self, instance: Category, validated_data: Dict[str, Any]) -> Category:
         """Update an existing category."""
-        logger.info(f"Updating category: id={instance.id}, name='{instance.name}'")
-
-        # Prevent modification of system categories for regular users
         user = self._get_request_user()
-        if instance.is_system_category and not (user.is_staff or user.is_superuser):
-            raise serializers.ValidationError(
-                _("System categories cannot be modified."),
-                code="system_category_readonly",
-            )
+        is_staff = user.is_staff or user.is_superuser
 
-        # Update fields
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
+        # Security: protect system categories from regular users
+        if instance.is_system_category and not is_staff:
+            raise PermissionDenied(_("System categories are read-only."))
 
-        instance.save()
+        # Security: protect critical fields from regular users
+        if not is_staff:
+            validated_data.pop("is_system_category", None)
+            validated_data.pop("user", None)
 
-        logger.info(f"Category updated: name='{instance.name}'")
-        return instance
+        return super().update(instance, validated_data)
 
 
 class CategoryTreeSerializer(BaseCategorySerializer):
@@ -1073,11 +855,4 @@ class CategoryTreeSerializer(BaseCategorySerializer):
     # @extend_schema_field(serializers.IntegerField)
     def get_depth(self, obj: Category) -> int:
         """Calculate category depth in hierarchy."""
-        depth = 0
-        current = obj.parent
-
-        while current:
-            depth += 1
-            current = current.parent
-
-        return depth
+        return len(obj.get_ancestors())

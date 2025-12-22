@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 
 from .models import DeviceSession, Passcode, Profile, User, UserLoginAudit
 
@@ -58,7 +59,7 @@ class ProfileInline(admin.StackedInline):
 
 
 @admin.register(User)
-class UserAdmin(admin.ModelAdmin):
+class UserAdmin(BaseUserAdmin):
     """
     Admin configuration for the User model.
     """
@@ -168,7 +169,7 @@ class PasscodeAdmin(admin.ModelAdmin):
     list_display_links = ["code", "user"]
     list_filter = ["code_type", "is_used"]
     search_fields = ["user__email", "user__username", "code"]
-    ready_only_fields = ["id", "created_at"]
+    readonly_fields = ["id", "created_at"]
     ordering = ["-created_at"]
 
 
@@ -190,7 +191,7 @@ class DeviceSessionAdmin(admin.ModelAdmin):
     list_display_links = ["user", "ip_address"]
     list_filter = ["is_active", "user_agent"]
     search_fields = ["user__email", "user__username", "ip_address", "device"]
-    ready_only_fields = ["id", "created_at", "last_activity"]
+    readonly_fields = ["id", "created_at", "last_activity"]
     ordering = ["-created_at"]
 
 
@@ -218,5 +219,5 @@ class UserLoginAuditAdmin(admin.ModelAdmin):
         "device",
         "failure_reason",
     ]
-    ready_only_fields = ["id", "timestamp"]
+    readonly_fields = ["id", "timestamp"]
     ordering = ["-timestamp"]
