@@ -127,6 +127,10 @@ class AccountViewSet(
     mixins.UpdateModelMixin,
     mixins.DestroyModelMixin,
 ):
+    filterset_class = AccountFilter
+    search_fields = ["name", "bank_name", "account_number"]
+    ordering_fields = ["name", "current_balance", "created_at"]
+    ordering = ["-created_at"]
     """
     Account ViewSet for comprehensive financial account management.
 
@@ -158,53 +162,6 @@ class AccountViewSet(
             "Regular users see only their accounts. "
             "Staff/Admin see all accounts."
         ),
-        parameters=[
-            OpenApiParameter(
-                name="search",
-                description="Search by account name or bank name",
-                required=False,
-                type=str,
-            ),
-            OpenApiParameter(
-                name="account_type",
-                description="Filter by account type",
-                required=False,
-                type=str,
-                enum=[choice[0] for choice in choices.AccountType.choices],
-            ),
-            OpenApiParameter(
-                name="currency_code",
-                description="Filter by currency code",
-                required=False,
-                type=str,
-            ),
-            OpenApiParameter(
-                name="is_active",
-                description="Filter by active status",
-                required=False,
-                type=bool,
-            ),
-            OpenApiParameter(
-                name="is_primary",
-                description="Filter by primary status",
-                required=False,
-                type=bool,
-            ),
-            OpenApiParameter(
-                name="ordering",
-                description="Order results by field",
-                required=False,
-                type=str,
-                enum=[
-                    "name",
-                    "-name",
-                    "created_at",
-                    "-created_at",
-                    "current_balance",
-                    "-current_balance",
-                ],
-            ),
-        ],
         responses={
             200: AccountListSerializer(many=True),
             500: OpenApiResponse(description="Internal Server Error"),
@@ -214,7 +171,7 @@ class AccountViewSet(
         """List accounts with advanced filtering and pagination."""
         try:
             queryset = self.get_queryset()
-            queryset = AccountFilter(request, queryset).apply()
+            queryset = self.filter_queryset(queryset)
 
             page = self.paginate_queryset(queryset)
             if page is not None:
@@ -1430,7 +1387,10 @@ class TransactionViewSet(viewsets.ModelViewSet):
     pagination_class = CustomPageNumberPagination
     permission_classes = [IsOwnerOrAdmin]
     throttle_classes = [throttlings.TransactionThrottle]
-    # filterset_class = filters.TransactionFilter  # Replaced by manual TransactionFilter in list()
+    filterset_class = TransactionFilter
+    search_fields = ["name", "description", "merchant", "reference_number"]
+    ordering_fields = ["transaction_date", "amount", "created_at"]
+    ordering = ["-transaction_date"]
     lookup_field = "id"
 
     # Disable PUT method (use PATCH for partial updates)
@@ -1528,7 +1488,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
             queryset = self.get_queryset()
 
             # Apply advanced filtering
-            queryset = TransactionFilter(request, queryset).apply()
+            queryset = self.filter_queryset(queryset)
 
             # Check for export request (if needed)
             # export_format = request.query_params.get("export")
