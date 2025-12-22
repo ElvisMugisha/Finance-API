@@ -14,6 +14,13 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
+from .managers import (
+    AccountManager,
+    BudgetManager,
+    FinancialGoalManager,
+    ReportManager,
+    TransactionManager,
+)
 from core.models import Category, Currency
 from utils import choices, loggings
 from utils import models as utils_models
@@ -31,6 +38,7 @@ class Account(utils_models.BaseModel):
     id = models.UUIDField(
         primary_key=True, default=uuid.uuid4, editable=False, unique=True
     )
+    objects = AccountManager()
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -364,52 +372,6 @@ class Account(utils_models.BaseModel):
             logger.error(f"Error getting balance history for account {self.id}: {e}")
             return []
 
-    @classmethod
-    def get_user_primary_account(cls, user_id: uuid.UUID) -> Optional["Account"]:
-        """Get user's primary account."""
-        return cls.objects.filter(
-            user_id=user_id, is_primary=True, is_active=True
-        ).first()
-
-    @classmethod
-    def get_user_accounts_summary(cls, user_id: uuid.UUID) -> Dict[str, Any]:
-        """Get summary of all user accounts."""
-        try:
-            accounts = cls.objects.filter(user_id=user_id, is_active=True)
-
-            total_balance = Decimal("0.00")
-            currency_balances = {}
-
-            for account in accounts:
-                total_balance += account.current_balance
-                currency_code = account.currency.code
-                if currency_code not in currency_balances:
-                    currency_balances[currency_code] = {
-                        "balance": Decimal("0.00"),
-                        "currency": account.currency,
-                        "accounts": [],
-                    }
-                currency_balances[currency_code]["balance"] += account.current_balance
-                currency_balances[currency_code]["accounts"].append(
-                    {
-                        "id": str(account.id),
-                        "name": account.name,
-                        "balance": account.current_balance,
-                        "type": account.account_type,
-                    }
-                )
-
-            return {
-                "total_balance": total_balance,
-                "currency_balances": currency_balances,
-                "account_count": accounts.count(),
-                "primary_account": cls.get_user_primary_account(user_id),
-            }
-
-        except Exception as e:
-            logger.error(f"Error getting accounts summary for user {user_id}: {e}")
-            return {}
-
 
 class Transaction(utils_models.BaseModel):
     """
@@ -424,6 +386,7 @@ class Transaction(utils_models.BaseModel):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    objects = TransactionManager()
 
     # Ownership
     user = models.ForeignKey(
@@ -451,15 +414,6 @@ class Transaction(utils_models.BaseModel):
         help_text=_("Transaction category"),
     )
 
-    # Recurring transaction link (if applicable)
-    # recurring_transaction = models.ForeignKey(
-    #     "RecurringTransaction",
-    #     on_delete=models.SET_NULL,
-    #     null=True,
-    #     blank=True,
-    #     related_name="generated_transactions",
-    #     help_text=_("Recurring transaction that generated this transaction"),
-    # )
     recurrence_metadata = models.JSONField(
         default=dict,
         blank=True,
@@ -768,8 +722,9 @@ class Transaction(utils_models.BaseModel):
                         amount_diff = current_amount - previous_amount
 
             if amount_diff != 0:
-                print(
-                    f"DEBUG: Balance update for Tx {self.id}. Diff: {amount_diff}. Old Status: {old_status}, New Status: {self.status}"
+                logger.debug(
+                    f"Balance update for Tx {self.id}. Diff: {amount_diff}. "
+                    f"Old Status: {old_status}, New Status: {self.status}"
                 )
                 # Apply update manually to support negative diffs (reversals)
                 if self.transaction_type == choices.TransactionType.INCOME:
@@ -805,7 +760,7 @@ class Transaction(utils_models.BaseModel):
         transfer_amount = self._calculate_transfer_amount()
 
         if not transfer_amount:
-            print(f"DEBUG: Cannot calculate transfer amount for {self.id}")
+            logger.warning(f"Cannot calculate transfer amount for {self.id}")
             return
 
         # Determine paired type
@@ -815,8 +770,8 @@ class Transaction(utils_models.BaseModel):
             else choices.TransactionType.EXPENSE
         )
 
-        print(
-            f"DEBUG: Creating transfer pair for {self.id} -> {self.transfer_account.id}"
+        logger.debug(
+            f"Creating transfer pair for {self.id} -> {self.transfer_account.id}"
         )
 
         # Create the paired transaction
@@ -870,7 +825,7 @@ class Transaction(utils_models.BaseModel):
                 return amount_in_base * self.transfer_account.currency.exchange_rate
 
         except Exception as e:
-            print(f"DEBUG: Error calculating transfer amount: {e}")
+            logger.error(f"Error calculating transfer amount: {e}")
             return None
 
     @property
@@ -931,73 +886,6 @@ class Transaction(utils_models.BaseModel):
         logger.info(f"Transaction {self.id} reconciled")
         return True
 
-    @classmethod
-    def get_user_transactions_summary(
-        cls,
-        user_id: uuid.UUID,
-        start_date: Optional[date] = None,
-        end_date: Optional[date] = None,
-    ) -> Dict[str, Any]:
-        """
-        Get transaction summary for a user.
-
-        Args:
-            user_id: User UUID
-            start_date: Start date
-            end_date: End date
-
-        Returns:
-            Transaction summary
-        """
-        query = cls.objects.filter(
-            user_id=user_id, status=choices.TransactionStatus.COMPLETED
-        )
-
-        if start_date:
-            query = query.filter(transaction_date__gte=start_date)
-        if end_date:
-            query = query.filter(transaction_date__lte=end_date)
-
-        summary = query.aggregate(
-            total_income=Coalesce(
-                Sum(
-                    Case(
-                        When(
-                            transaction_type=choices.TransactionType.INCOME,
-                            then="amount",
-                        ),
-                        default=Value(0),
-                        output_field=models.DecimalField(),
-                    )
-                ),
-                Decimal("0.00"),
-            ),
-            total_expense=Coalesce(
-                Sum(
-                    Case(
-                        When(
-                            transaction_type=choices.TransactionType.EXPENSE,
-                            then="amount",
-                        ),
-                        default=Value(0),
-                        output_field=models.DecimalField(),
-                    )
-                ),
-                Decimal("0.00"),
-            ),
-            transaction_count=Count("id"),
-        )
-
-        net_flow = summary["total_income"] - summary["total_expense"]
-
-        return {
-            "total_income": summary["total_income"],
-            "total_expense": summary["total_expense"],
-            "net_flow": net_flow,
-            "transaction_count": summary["transaction_count"],
-            "period": {"start": start_date, "end": end_date},
-        }
-
 
 class Budget(utils_models.BaseModel):
     """
@@ -1018,6 +906,7 @@ class Budget(utils_models.BaseModel):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    objects = BudgetManager()
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -1437,6 +1326,7 @@ class FinancialGoal(utils_models.BaseModel):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    objects = FinancialGoalManager()
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -1746,6 +1636,7 @@ class Report(utils_models.BaseModel):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    objects = ReportManager()
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -1914,7 +1805,7 @@ class Report(utils_models.BaseModel):
     def mark_as_processing(self) -> bool:
         """Mark report as processing."""
         try:
-            self.status = self.ReportStatus.PROCESSING
+            self.status = choices.ReportStatus.PROCESSING
             self.save(update_fields=["status", "updated_at"])
             logger.info(f"Report {self.id} marked as processing")
             return True
@@ -1942,7 +1833,7 @@ class Report(utils_models.BaseModel):
         logger.info(f"Marking report {self.id} as completed")
 
         try:
-            self.status = self.ReportStatus.COMPLETED
+            self.status = choices.ReportStatus.COMPLETED
             self.generated_at = timezone.now()
 
             if data is not None:
@@ -1965,14 +1856,14 @@ class Report(utils_models.BaseModel):
 
         except Exception as e:
             logger.error(f"Error marking report {self.id} as completed: {e}")
-            self.status = self.ReportStatus.FAILED
+            self.status = choices.ReportStatus.FAILED
             self.error_message = str(e)
             self.save(update_fields=["status", "error_message", "updated_at"])
             return False
 
     def mark_as_failed(self, error: str) -> None:
         """Mark report as failed with error message."""
-        self.status = self.ReportStatus.FAILED
+        self.status = choices.ReportStatus.FAILED
         self.error_message = error[:1000]  # Limit error message length
         self.save(update_fields=["status", "error_message", "updated_at"])
         logger.error(f"Report {self.id} marked as failed: {error}")

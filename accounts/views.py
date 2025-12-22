@@ -14,9 +14,11 @@ from rest_framework import mixins, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from utils import choices, filters, loggings, throttlings
+from utils import choices, loggings, throttlings
 from utils.paginations import CustomPageNumberPagination
 from utils.permissions import IsOwnerOrAdmin
+
+from .filters import AccountFilter, BudgetFilter, FinancialGoalFilter, TransactionFilter
 
 from .models import Account, Transaction
 from .serializers import (
@@ -140,6 +142,7 @@ class AccountViewSet(
 
     queryset = Account.objects.all()
     lookup_field = "id"
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     @extend_schema(
         summary="List accounts",
@@ -204,26 +207,13 @@ class AccountViewSet(
         """List accounts with advanced filtering and pagination."""
         try:
             queryset = self.get_queryset()
-            user = request.user
+            queryset = AccountFilter(request, queryset).apply()
 
-            # Apply filters
-            queryset = self._apply_filters(queryset, request)
-
-            # Apply ordering
-            ordering = self._get_ordering(request)
-            if ordering:
-                queryset = queryset.order_by(*ordering)
-            else:
-                # Default ordering
-                queryset = queryset.order_by("-is_primary", "-created_at")
-
-            # Paginate
             page = self.paginate_queryset(queryset)
             if page is not None:
                 serializer = self.get_serializer(page, many=True)
                 return self.get_paginated_response(serializer.data)
 
-            # Return all if no pagination
             serializer = self.get_serializer(queryset, many=True)
             return Response(serializer.data)
 
@@ -233,82 +223,6 @@ class AccountViewSet(
                 "An error occurred while retrieving accounts.",
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-
-    def _apply_filters(self, queryset, request):
-        """Apply query filters to account queryset."""
-        # Search filter
-        search_query = request.query_params.get("search")
-        if search_query:
-            queryset = queryset.filter(
-                models.Q(name__icontains=search_query)
-                | models.Q(bank_name__icontains=search_query)
-            )
-
-        # Account type filter
-        account_type = request.query_params.get("account_type")
-        if account_type:
-            queryset = queryset.filter(account_type=account_type)
-
-        # Currency filter
-        currency_code = request.query_params.get("currency_code")
-        if currency_code:
-            queryset = queryset.filter(currency__code__iexact=currency_code)
-
-        # Status filters
-        is_active = request.query_params.get("is_active")
-        if is_active is not None:
-            queryset = queryset.filter(is_active=is_active.lower() == "true")
-
-        is_primary = request.query_params.get("is_primary")
-        if is_primary is not None:
-            queryset = queryset.filter(is_primary=is_primary.lower() == "true")
-
-        # Balance filters (optional)
-        min_balance = request.query_params.get("min_balance")
-        if min_balance:
-            try:
-                queryset = queryset.filter(current_balance__gte=Decimal(min_balance))
-            except (InvalidOperation, ValueError):
-                logger.warning(f"Invalid min_balance filter: {min_balance}")
-
-        max_balance = request.query_params.get("max_balance")
-        if max_balance:
-            try:
-                queryset = queryset.filter(current_balance__lte=Decimal(max_balance))
-            except (InvalidOperation, ValueError):
-                logger.warning(f"Invalid max_balance filter: {max_balance}")
-
-        return queryset
-
-    def _get_ordering(self, request):
-        """Get ordering parameters from request."""
-        ordering = request.query_params.get("ordering")
-
-        if not ordering:
-            return None
-
-        # Validate ordering fields
-        valid_fields = {
-            "name",
-            "-name",
-            "created_at",
-            "-created_at",
-            "current_balance",
-            "-current_balance",
-            "account_type",
-            "-account_type",
-        }
-
-        order_fields = ordering.split(",")
-        validated_fields = []
-
-        for field in order_fields:
-            if field.strip() in valid_fields:
-                validated_fields.append(field.strip())
-            else:
-                logger.warning(f"Invalid ordering field: {field}")
-
-        return validated_fields if validated_fields else None
 
     @extend_schema(
         summary="Retrieve account",
@@ -384,53 +298,6 @@ class AccountViewSet(
                 e,
                 "Failed to create account. Please check your data.",
                 status.HTTP_400_BAD_REQUEST,
-            )
-
-    @extend_schema(
-        summary="Update account",
-        description="Update all fields of an account.",
-        request=AccountSerializer,
-        responses={
-            200: AccountSerializer,
-            400: OpenApiResponse(description="Validation error"),
-            403: OpenApiResponse(description="Permission denied"),
-            404: OpenApiResponse(description="Account not found"),
-        },
-    )
-    def update(self, request, *args, **kwargs):
-        """Update account (PUT)."""
-        try:
-            instance = self.get_object()
-            self._check_account_modification_permission(instance, request.user)
-
-            serializer = self.get_serializer(
-                instance, data=request.data, partial=False, context={"request": request}
-            )
-            serializer.is_valid(raise_exception=True)
-
-            with db_transaction.atomic():
-                updated_instance = serializer.save()
-
-            logger.info(
-                f"Account updated: id={updated_instance.id}, "
-                f"name='{updated_instance.name}', "
-                f"by user={request.user.id}"
-            )
-
-            return Response(serializer.data)
-
-        except PermissionError as e:
-            logger.warning(f"Permission denied updating account: {e}")
-            return Response({"error": str(e)}, status=status.HTTP_403_FORBIDDEN)
-        except serializers.ValidationError as e:
-            logger.warning(f"Account update validation failed: {e}")
-            return Response(
-                {"error": "Validation failed.", "details": e.detail},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        except Exception as e:
-            return self._handle_api_error(
-                e, "Failed to update account.", status.HTTP_400_BAD_REQUEST
             )
 
     @extend_schema(
@@ -1600,7 +1467,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
     pagination_class = CustomPageNumberPagination
     permission_classes = [IsOwnerOrAdmin]
     throttle_classes = [throttlings.TransactionThrottle]
-    filterset_class = filters.TransactionFilter
+    # filterset_class = filters.TransactionFilter  # Replaced by manual TransactionFilter in list()
     lookup_field = "id"
 
     # Disable PUT method (use PATCH for partial updates)
@@ -1688,42 +1555,27 @@ class TransactionViewSet(viewsets.ModelViewSet):
     def list(self, request, *args, **kwargs):
         """
         List transactions with filtering, pagination, and analytics.
-
-        Features:
-        - Advanced filtering via query parameters
-        - Search across multiple fields
-        - Ordering by any field
-        - Analytics summary in response
-        - Export capabilities
-
-        Returns:
-            Paginated response with transactions and analytics
         """
         try:
-            # Apply filtering
-            queryset = self.filter_queryset(self.get_queryset())
+            # Get optimized queryset
+            queryset = self.get_queryset()
 
-            # Check for export request
-            export_format = request.query_params.get("export")
-            if export_format and (request.user.is_staff or request.user.is_superuser):
-                return self._export_transactions(queryset, export_format)
+            # Apply advanced filtering
+            queryset = TransactionFilter(request, queryset).apply()
 
-            # Apply ordering (default: most recent first)
-            ordering = request.query_params.get("ordering", "-transaction_date")
-            if ordering:
-                queryset = queryset.order_by(ordering)
+            # Check for export request (if needed)
+            # export_format = request.query_params.get("export")
+            # if export_format and (request.user.is_staff or request.user.is_superuser):
+            #     return self._export_transactions(queryset, export_format)
 
             # Paginate
             page = self.paginate_queryset(queryset)
             if page is not None:
                 serializer = self.get_serializer(page, many=True)
-
-                # Include analytics in paginated response
                 response = self.get_paginated_response(serializer.data)
                 response.data["analytics"] = self._get_analytics_summary(queryset)
                 return response
 
-            # Non-paginated response (if pagination is disabled)
             serializer = self.get_serializer(queryset, many=True)
             return Response(
                 {
@@ -1733,16 +1585,8 @@ class TransactionViewSet(viewsets.ModelViewSet):
                 }
             )
 
-        except ValidationError as e:
-            logger.warning(
-                f"Transaction list validation error: {e}",
-                extra={"user_id": request.user.id},
-            )
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.exception(
-                f"Error listing transactions for user {request.user.id}: {e}"
-            )
+            logger.exception(f"Error listing transactions: {e}")
             return Response(
                 {
                     "error": _(

@@ -1007,6 +1007,18 @@ class TransactionSerializer(serializers.ModelSerializer):
         ]
 
     # Computed Field Helpers
+    @extend_schema_field(serializers.CharField())
+    def get_currency(self, obj: Transaction) -> str:
+        """
+        Get the currency code for the transaction.
+        Priority: Account currency > original currency > default 'USD'.
+        """
+        if obj.account and obj.account.currency:
+            return obj.account.currency.code
+        if obj.original_currency:
+            return obj.original_currency.code
+        return "USD"
+
     @extend_schema_field(serializers.DecimalField(max_digits=18, decimal_places=2))
     def get_currency_converted_amount(self, obj: Transaction) -> Optional[Decimal]:
         """
@@ -1057,8 +1069,9 @@ class TransactionSerializer(serializers.ModelSerializer):
             Formatted display string
         """
         try:
-            return f"{obj.name} - {obj.amount} {obj.currency} ({obj.transaction_type})"
-        except AttributeError as e:
+            currency_code = self.get_currency(obj)
+            return f"{obj.name} - {obj.amount} {currency_code} ({obj.transaction_type})"
+        except Exception as e:
             logger.error(f"Failed to generate display name: {e}")
             return str(obj.id)
 
@@ -1268,13 +1281,6 @@ class TransactionSerializer(serializers.ModelSerializer):
                 # Save the instance
                 instance.save()
 
-                # Update account balance if status changed to COMPLETED
-                if (
-                    old_status != choices.TransactionStatus.COMPLETED
-                    and instance.status == choices.TransactionStatus.COMPLETED
-                ):
-                    self._update_account_balance(instance, old_amount)
-
                 logger.info(
                     f"Transaction updated: {instance.id}",
                     extra={
@@ -1290,44 +1296,6 @@ class TransactionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"error": _("Failed to update transaction. Please try again.")}
             )
-
-    def _update_account_balance(
-        self, transaction: Transaction, old_amount: Optional[Decimal] = None
-    ) -> None:
-        """
-        Update account balance based on transaction.
-
-        Args:
-            transaction: The transaction affecting the balance
-            old_amount: Previous amount (for updates)
-        """
-        try:
-            if transaction.account:
-                if old_amount:
-                    # For updates, reverse old amount and apply new amount
-                    reverse_type = (
-                        choices.TransactionType.EXPENSE
-                        if transaction.transaction_type
-                        == choices.TransactionType.INCOME
-                        else choices.TransactionType.INCOME
-                    )
-
-                    # Reverse old amount
-                    transaction.account.update_balance(old_amount, reverse_type)
-
-                # Apply new amount
-                success = transaction.account.update_balance(
-                    transaction.amount, transaction.transaction_type
-                )
-
-                if not success:
-                    logger.error(
-                        f"Failed to update balance for account {transaction.account.id}",
-                        extra={"transaction_id": transaction.id},
-                    )
-
-        except Exception as e:
-            logger.error(f"Error updating account balance: {e}")
 
     def to_representation(self, instance: Transaction) -> Dict[str, Any]:
         """
