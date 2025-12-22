@@ -94,6 +94,7 @@ class CurrencyViewSet(
 
     queryset = Currency.objects.all()
     lookup_field = "pk"
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_permissions(self):
         """Set permissions per action."""
@@ -179,31 +180,6 @@ class CurrencyViewSet(
                 {"detail": _("Failed to create currencies. Please check the data.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-    @extend_schema(
-        summary="Update currency",
-        description="Update currency fields. Admin only.",
-        request=CurrencySerializer,
-        responses={200: CurrencySerializer},
-    )
-    def update(self, request, *args, **kwargs):
-        """Update currency - admin only."""
-        try:
-            instance = self.get_object()
-            serializer = self.get_serializer(instance, data=request.data, partial=False)
-            serializer.is_valid(raise_exception=True)
-
-            with db_transaction.atomic():
-                serializer.save()
-
-            logger.info(
-                f"Currency '{instance.code}' updated by admin {request.user.email}"
-            )
-            return Response(serializer.data)
-
-        except Exception as e:
-            logger.exception(f"Error updating currency: {e}")
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @extend_schema(
         summary="Update currency",
@@ -462,6 +438,7 @@ class CategoryViewSet(
     permission_classes = [CategoryPermission]
     pagination_class = CustomPageNumberPagination
     lookup_field = "pk"
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     # Serializer mapping
     serializer_action_map = {
