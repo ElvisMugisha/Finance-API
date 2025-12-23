@@ -1911,18 +1911,30 @@ class BudgetDetailSerializer(BudgetSerializer):
         ]
 
     def get_spending_by_category(self, obj: Budget) -> List[Dict[str, Any]]:
-        """Get spending breakdown by category."""
+        """
+        Get spending breakdown by category for this budget.
+
+        For CATEGORY budgets: Only shows spending for that specific category
+        For OVERALL budgets: Shows all expense categories
+        """
         from django.db.models import Sum
 
         try:
+            # Base query for transactions within budget period
+            query = models.Q(
+                user=obj.user,
+                transaction_type=choices.TransactionType.EXPENSE,
+                transaction_date__gte=obj.start_date,
+                transaction_date__lte=obj.end_date,
+                status=choices.TransactionStatus.COMPLETED,
+            )
+
+            # CRITICAL FIX: Filter by budget category if it exists (regardless of budget type)
+            if obj.category:
+                query &= models.Q(category=obj.category)
+
             spending = (
-                Transaction.objects.filter(
-                    user=obj.user,
-                    transaction_type=choices.TransactionType.EXPENSE,
-                    transaction_date__gte=obj.start_date,
-                    transaction_date__lte=obj.end_date,
-                    status=choices.TransactionStatus.COMPLETED,
-                )
+                Transaction.objects.filter(query)
                 .values("category__name")
                 .annotate(total=Sum("amount"))
                 .order_by("-total")[:10]
@@ -2080,6 +2092,7 @@ class BudgetRecalculateSerializer(serializers.Serializer):
 
             return {
                 "budget_id": str(budget.id),
+                "total_budget": str(budget.total_budget),
                 "total_spent": str(budget.total_spent),
                 "total_remaining": str(budget.total_remaining),
                 "utilization_percentage": budget.get_utilization_percentage(),

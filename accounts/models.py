@@ -714,6 +714,8 @@ class Transaction(utils_models.BaseModel):
         is_new = self.pk is None
         old_status = None
         old_amount = None
+        old_category = None
+        old_date = None
 
         # Check update_fields to avoid unnecessary balance processing
         update_fields = kwargs.get("update_fields")
@@ -728,6 +730,8 @@ class Transaction(utils_models.BaseModel):
                 old_instance = Transaction.objects.get(pk=self.pk)
                 old_status = old_instance.status
                 old_amount = old_instance.amount
+                old_category = old_instance.category
+                old_date = old_instance.transaction_date
             except Transaction.DoesNotExist:
                 pass
 
@@ -797,6 +801,78 @@ class Transaction(utils_models.BaseModel):
         # Update category usage stats
         if is_new:
             self.category.update_usage_stats()
+
+        # CRITICAL FIX: Auto-recalculate affected budgets
+        self._recalculate_affected_budgets(
+            is_new=is_new,
+            old_status=old_status,
+            old_category=old_category,
+            old_date=old_date,
+        )
+
+    def _recalculate_affected_budgets(
+        self, is_new: bool, old_status: str = None, old_category=None, old_date=None
+    ) -> None:
+        """
+        Recalculate budgets affected by this transaction.
+
+        Args:
+            is_new: Whether this is a new transaction
+            old_status: Previous status (for updates)
+            old_category: Previous category (for updates)
+            old_date: Previous transaction date (for updates)
+        """
+        # Only recalculate for expense transactions
+        if self.transaction_type != choices.TransactionType.EXPENSE:
+            return
+
+        # Skip if not completed
+        completed_states = [
+            choices.TransactionStatus.COMPLETED,
+            choices.TransactionStatus.RECONCILED,
+        ]
+        if self.status not in completed_states and (
+            not old_status or old_status not in completed_states
+        ):
+            return
+
+        try:
+            from .models import Budget
+
+            # Find affected budgets
+            affected_budgets = set()
+
+            # Current transaction's budgets
+            if self.status in completed_states:
+                current_budgets = Budget.objects.filter(
+                    user=self.user,
+                    is_active=True,
+                    start_date__lte=self.transaction_date,
+                    end_date__gte=self.transaction_date,
+                ).filter(Q(category=self.category) | Q(category__isnull=True))
+                affected_budgets.update(current_budgets)
+
+            # Old transaction's budgets (if category or date changed)
+            if not is_new and old_status in completed_states:
+                if old_category != self.category or old_date != self.transaction_date:
+                    old_budgets = Budget.objects.filter(
+                        user=self.user,
+                        is_active=True,
+                        start_date__lte=old_date,
+                        end_date__gte=old_date,
+                    ).filter(Q(category=old_category) | Q(category__isnull=True))
+                    affected_budgets.update(old_budgets)
+
+            # Recalculate all affected budgets
+            for budget in affected_budgets:
+                budget.calculate_spending()
+                logger.debug(
+                    f"Auto-recalculated budget {budget.id} due to transaction {self.id}"
+                )
+
+        except Exception as e:
+            logger.error(f"Error recalculating budgets for transaction {self.id}: {e}")
+            # Don't raise - budget recalculation shouldn't block transaction save
 
     def _create_transfer_pair(self) -> None:
         """Create paired transaction for transfers."""
@@ -1145,7 +1221,7 @@ class Budget(utils_models.BaseModel):
 
     def calculate_spending(self) -> Decimal:
         """
-        Calculate actual spending for this budget period.
+        Calculate total spending for this budget period.
 
         Returns:
             Total spending as Decimal
@@ -1162,7 +1238,7 @@ class Budget(utils_models.BaseModel):
                 status=choices.TransactionStatus.COMPLETED,
             )
 
-            if self.budget_type == choices.BudgetType.CATEGORY and self.category:
+            if self.category:
                 query &= Q(category=self.category)
 
             # Calculate spending
@@ -1170,14 +1246,22 @@ class Budget(utils_models.BaseModel):
                 total=Coalesce(Sum("amount"), Decimal("0.00"))
             )["total"]
 
-            # Convert to budget currency if needed
-            # Note: This is simplified - you might need actual currency conversion
+            # Update if changed
             if spending != self.total_spent:
                 logger.info(f"Spending recalculated for budget {self.id}: {spending}")
                 self.total_spent = spending
+                # CRITICAL FIX: Also update total_remaining
+                self.total_remaining = (
+                    self.total_budget - self.total_spent + self.rollover_amount
+                )
                 self.last_recalculated_at = timezone.now()
                 self.save(
-                    update_fields=["total_spent", "last_recalculated_at", "updated_at"]
+                    update_fields=[
+                        "total_spent",
+                        "total_remaining",
+                        "last_recalculated_at",
+                        "updated_at",
+                    ]
                 )
 
             return spending
@@ -1194,7 +1278,9 @@ class Budget(utils_models.BaseModel):
 
             total_available = self.total_budget + self.rollover_amount
             percentage = (self.total_spent / total_available) * 100
-            return float(min(percentage, 100.0))
+            return float(
+                percentage
+            )  # Don't cap - show actual utilization even if > 100%
 
         except Exception as e:
             logger.error(f"Error calculating utilization for budget {self.id}: {e}")
