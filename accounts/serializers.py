@@ -3,18 +3,21 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import models
-from django.db import transaction as db_transaction
+from django.db import models, transaction as db_transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import exceptions, serializers
 
 from core.models import Category, Currency
-from core.serializers import CurrencySerializer
+from core.serializers import (
+    CurrencySerializer,
+    CategoryListSerializer,
+    CurrencyListSerializer,
+)
 from utils import choices, loggings
 
-from .models import Account, Transaction
+from .models import Account, Budget, BudgetCategory, Transaction
 
 logger = loggings.setup_logging()
 
@@ -1339,3 +1342,754 @@ class TransactionVerificationSerializer(serializers.ModelSerializer):
         # when status changes to COMPLETED.
 
         return instance
+
+
+class BaseBudgetSerializer(serializers.ModelSerializer):
+    """Base serializer with common budget functionality."""
+
+    def _get_request_user(self):
+        """Safely get request user from context."""
+        request = self.context.get("request")
+        return request.user if request and request.user.is_authenticated else None
+
+    def _log_validation_warning(self, message: str, **kwargs) -> None:
+        """Log validation warnings consistently."""
+        user = self._get_request_user()
+        user_id = user.id if user else "anonymous"
+        logger.warning(f"User {user_id}: {message}", **kwargs)
+
+    def _validate_amount(self, field_name: str, value: Decimal) -> Decimal:
+        """Common amount validation logic."""
+        try:
+            # Ensure it's a valid Decimal
+            if not isinstance(value, Decimal):
+                value = Decimal(str(value))
+
+            # Check reasonable bounds
+            min_limit = Decimal("0.01")  # Minimum budget
+            max_limit = Decimal("1000000000")  # 1 billion max
+
+            if value < min_limit:
+                raise serializers.ValidationError(
+                    _(f"{field_name.replace('_', ' ').title()} must be at least 0.01."),
+                    code=f"invalid_{field_name}_min",
+                )
+
+            if value > max_limit:
+                self._log_validation_warning(f"Extreme {field_name} value: {value}")
+
+            return value
+
+        except (InvalidOperation, TypeError, ValueError) as e:
+            logger.error(f"Invalid {field_name} value: {value}, error: {e}")
+            raise serializers.ValidationError(
+                _(
+                    f"{field_name.replace('_', ' ').title()} must be a valid decimal number."
+                ),
+                code=f"invalid_{field_name}",
+            )
+
+
+class BudgetCategorySerializer(serializers.ModelSerializer):
+    """
+    Serializer for BudgetCategory model.
+
+    Handles category allocations within budgets.
+    Provides calculated fields for spending tracking.
+    """
+
+    # Nested category details (read-only)
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    category_type = serializers.CharField(
+        source="category.category_type", read_only=True
+    )
+
+    # Calculated fields
+    utilization_percentage = serializers.SerializerMethodField()
+    is_over_budget = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BudgetCategory
+        fields = [
+            "id",
+            "budget",
+            "category",
+            "category_name",
+            "category_type",
+            "allocated_amount",
+            "spent_amount",
+            "remaining_amount",
+            "percentage_used",
+            "utilization_percentage",
+            "is_over_budget",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "spent_amount",
+            "remaining_amount",
+            "percentage_used",
+            "utilization_percentage",
+            "is_over_budget",
+            "created_at",
+            "updated_at",
+        ]
+        extra_kwargs = {
+            "allocated_amount": {
+                "help_text": _("Amount allocated to this category"),
+                "min_value": Decimal("0.01"),
+            },
+            "category": {
+                "help_text": _("Category for this allocation"),
+            },
+        }
+
+    def get_utilization_percentage(self, obj: BudgetCategory) -> float:
+        """Calculate utilization percentage."""
+        try:
+            if obj.allocated_amount > 0:
+                return float((obj.spent_amount / obj.allocated_amount) * 100)
+            return 0.0
+        except Exception as e:
+            logger.error(
+                f"Error calculating utilization for budget category {obj.id}: {e}"
+            )
+            return 0.0
+
+    def get_is_over_budget(self, obj: BudgetCategory) -> bool:
+        """Check if category allocation is exceeded."""
+        return obj.spent_amount > obj.allocated_amount
+
+    def validate_allocated_amount(self, value: Decimal) -> Decimal:
+        """Validate allocated amount."""
+        if value <= 0:
+            raise serializers.ValidationError(
+                _("Allocated amount must be greater than zero."),
+                code="invalid_allocated_amount",
+            )
+        return value
+
+    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        """Cross-field validation."""
+        logger.debug("Validating budget category")
+
+        # Validate category type (must be expense)
+        category = attrs.get("category")
+        if category and category.category_type != choices.TransactionType.EXPENSE:
+            raise serializers.ValidationError(
+                {"category": _("Budget categories must be expense categories.")}
+            )
+
+        return attrs
+
+
+class BudgetSerializer(BaseBudgetSerializer):
+    """
+    Primary serializer for Budget CRUD operations.
+
+    Responsibilities:
+    - Handles creation and updates of budgets
+    - Validates budget type-specific rules
+    - Manages currency and category relationships
+    - Calculates spending and remaining amounts
+    - Supports budget categories for multi-category budgets
+
+    Security:
+    - Users can only manage their own budgets
+    - Currency and category must be active
+    - Amount validations
+    """
+
+    # Currency handling: write with ID, read with full details
+    currency_id = serializers.PrimaryKeyRelatedField(
+        queryset=Currency.objects.filter(is_active=True),
+        source="currency",
+        write_only=True,
+        help_text=_("ID of the currency for this budget"),
+    )
+    currency = serializers.SerializerMethodField(read_only=True)
+
+    # Category handling (for category budgets)
+    category_id = serializers.PrimaryKeyRelatedField(
+        queryset=Category.objects.filter(
+            is_active=True, category_type=choices.TransactionType.EXPENSE
+        ),
+        source="category",
+        write_only=True,
+        required=False,
+        allow_null=True,
+        help_text=_("ID of the category for category budgets"),
+    )
+    category_details = serializers.SerializerMethodField(read_only=True)
+
+    # Budget categories (for multi-category budgets)
+    budget_categories = BudgetCategorySerializer(many=True, read_only=True)
+
+    # Calculated fields
+    utilization_percentage = serializers.SerializerMethodField()
+    available_amount = serializers.SerializerMethodField()
+    is_over_budget_flag = serializers.SerializerMethodField()
+    days_left = serializers.SerializerMethodField()
+    should_alert = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Budget
+        fields = [
+            "id",
+            "name",
+            "budget_type",
+            "category_id",
+            "category_details",
+            "total_budget",
+            "currency_id",
+            "currency",
+            "total_spent",
+            "total_remaining",
+            "period_type",
+            "start_date",
+            "end_date",
+            "rollover_unused",
+            "rollover_amount",
+            "is_active",
+            "description",
+            "notification_threshold",
+            "last_recalculated_at",
+            "budget_categories",
+            "utilization_percentage",
+            "available_amount",
+            "is_over_budget_flag",
+            "days_left",
+            "should_alert",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "total_spent",
+            "total_remaining",
+            "last_recalculated_at",
+            "budget_categories",
+            "utilization_percentage",
+            "available_amount",
+            "is_over_budget_flag",
+            "days_left",
+            "should_alert",
+            "created_at",
+            "updated_at",
+        ]
+        extra_kwargs = {
+            "name": {
+                "help_text": _('Budget name (e.g., "Monthly Groceries")'),
+                "max_length": 255,
+                "trim_whitespace": True,
+            },
+            "total_budget": {
+                "help_text": _("Total budgeted amount"),
+                "min_value": Decimal("0.01"),
+            },
+            "notification_threshold": {
+                "help_text": _("Percentage threshold for notifications (0-100)"),
+                "min_value": Decimal("0"),
+                "max_value": Decimal("100"),
+            },
+            "rollover_amount": {
+                "help_text": _("Amount rolled over from previous period"),
+                "min_value": Decimal("0"),
+            },
+        }
+
+    def get_currency(self, obj: Budget) -> Dict[str, Any]:
+        """Get currency details."""
+
+        return CurrencyListSerializer(obj.currency).data
+
+    def get_category_details(self, obj: Budget) -> Optional[Dict[str, Any]]:
+        """Get category details for category budgets."""
+        if obj.category:
+            return CategoryListSerializer(obj.category).data
+        return None
+
+    def get_utilization_percentage(self, obj: Budget) -> float:
+        """Get budget utilization percentage."""
+        return obj.get_utilization_percentage()
+
+    def get_available_amount(self, obj: Budget) -> str:
+        """Get available budget amount."""
+        return str(obj.total_budget + obj.rollover_amount)
+
+    def get_is_over_budget_flag(self, obj: Budget) -> bool:
+        """Check if budget is exceeded."""
+        return obj.is_over_budget
+
+    def get_days_left(self, obj: Budget) -> int:
+        """Get days remaining in budget period."""
+        return obj.days_remaining
+
+    def get_should_alert(self, obj: Budget) -> bool:
+        """Check if notification should be sent."""
+        return obj.should_notify()
+
+    def validate_name(self, value: str) -> str:
+        """Validate budget name."""
+        value = value.strip()
+
+        if not value:
+            raise serializers.ValidationError(
+                _("Budget name cannot be empty."), code="empty_name"
+            )
+
+        if len(value) > 255:
+            raise serializers.ValidationError(
+                _("Budget name cannot exceed 255 characters."), code="name_too_long"
+            )
+
+        # Check for uniqueness per user (for active budgets)
+        user = self._get_request_user()
+        if user and self.instance is None:  # Only on creation
+            if Budget.objects.filter(user=user, name=value, is_active=True).exists():
+                raise serializers.ValidationError(
+                    _("An active budget with this name already exists."),
+                    code="duplicate_name",
+                )
+
+        logger.debug(f"Budget name validation passed: {value}")
+        return value
+
+    def validate_total_budget(self, value: Decimal) -> Decimal:
+        """Validate total budget amount."""
+        return self._validate_amount("total_budget", value)
+
+    def validate_notification_threshold(self, value: Decimal) -> Decimal:
+        """Validate notification threshold."""
+        if not (Decimal("0") <= value <= Decimal("100")):
+            raise serializers.ValidationError(
+                _("Notification threshold must be between 0 and 100."),
+                code="invalid_threshold",
+            )
+        return value
+
+    def validate_rollover_amount(self, value: Decimal) -> Decimal:
+        """Validate rollover amount."""
+        if value < 0:
+            raise serializers.ValidationError(
+                _("Rollover amount cannot be negative."),
+                code="negative_rollover",
+            )
+        return value
+
+    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Perform cross-field validation.
+
+        Args:
+            attrs: Dictionary of validated attributes
+
+        Returns:
+            Validated attributes
+
+        Raises:
+            serializers.ValidationError: If validation fails
+        """
+        logger.debug("Performing cross-field validation for budget")
+
+        # Get values with fallbacks
+        budget_type = attrs.get(
+            "budget_type", getattr(self.instance, "budget_type", None)
+        )
+        category = attrs.get("category", getattr(self.instance, "category", None))
+        start_date = attrs.get("start_date", getattr(self.instance, "start_date", None))
+        end_date = attrs.get("end_date", getattr(self.instance, "end_date", None))
+
+        # Validate dates
+        if start_date and end_date:
+            if end_date <= start_date:
+                raise serializers.ValidationError(
+                    {"end_date": _("End date must be after start date.")}
+                )
+
+        # Validate category for category budgets
+        if budget_type == choices.BudgetType.CATEGORY:
+            if not category:
+                raise serializers.ValidationError(
+                    {"category": _("Category is required for category budgets.")}
+                )
+            # Ensure category is expense type
+            if category.category_type != choices.TransactionType.EXPENSE:
+                raise serializers.ValidationError(
+                    {"category": _("Budget category must be an expense category.")}
+                )
+
+        # Validate no category for overall budgets
+        if budget_type == choices.BudgetType.OVERALL and category:
+            logger.warning("Overall budget should not have a specific category")
+            attrs["category"] = None
+
+        logger.debug("Cross-field validation passed")
+        return attrs
+
+    def create(self, validated_data: Dict[str, Any]) -> Budget:
+        """
+        Create a new budget with business logic.
+
+        Args:
+            validated_data: Validated data for budget creation
+
+        Returns:
+            Created Budget instance
+
+        Raises:
+            serializers.ValidationError: If creation fails
+        """
+        logger.info("Creating new budget")
+
+        try:
+            user = self._get_request_user()
+
+            if not user:
+                raise serializers.ValidationError(
+                    _("User must be authenticated to create a budget."),
+                    code="unauthenticated",
+                )
+
+            # Set user
+            validated_data["user"] = user
+
+            # Create budget within transaction
+            with db_transaction.atomic():
+                budget = Budget.objects.create(**validated_data)
+
+            logger.info(
+                f"Budget created: id={budget.id}, "
+                f"name='{budget.name}', "
+                f"user={user.id}, "
+                f"type={budget.budget_type}, "
+                f"amount={budget.total_budget}"
+            )
+
+            return budget
+
+        except DjangoValidationError as e:
+            logger.error(f"Model validation failed creating budget: {e}")
+            raise serializers.ValidationError(e.message_dict)
+
+        except Exception as e:
+            logger.exception(f"Unexpected error creating budget: {e}")
+            raise serializers.ValidationError(
+                _("An unexpected error occurred while creating the budget."),
+                code="creation_error",
+            )
+
+    def update(self, instance: Budget, validated_data: Dict[str, Any]) -> Budget:
+        """
+        Update an existing budget.
+
+        Args:
+            instance: Existing Budget instance
+            validated_data: Validated data for update
+
+        Returns:
+            Updated Budget instance
+
+        Raises:
+            serializers.ValidationError: If update fails
+        """
+        logger.info(f"Updating budget: id={instance.id}, name='{instance.name}'")
+
+        try:
+            user = self._get_request_user()
+
+            # Check if user owns this budget
+            if instance.user != user:
+                self._log_validation_warning(
+                    f"User {user.id} attempted to update another user's budget {instance.id}"
+                )
+                raise serializers.ValidationError(
+                    _("Cannot update another user's budget."), code="unauthorized"
+                )
+
+            # Update fields
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+
+            # Save with validation
+            instance.save()
+
+            logger.info(
+                f"Budget updated: id={instance.id}, "
+                f"updated fields={list(validated_data.keys())}"
+            )
+
+            return instance
+
+        except DjangoValidationError as e:
+            logger.error(f"Model validation failed updating budget {instance.id}: {e}")
+            raise serializers.ValidationError(e.message_dict)
+
+        except Exception as e:
+            logger.exception(f"Unexpected error updating budget {instance.id}: {e}")
+            raise serializers.ValidationError(
+                _("An unexpected error occurred while updating the budget."),
+                code="update_error",
+            )
+
+
+class BudgetListSerializer(BaseBudgetSerializer):
+    """
+    Lightweight serializer for budget listing.
+
+    Optimized for:
+    - Budget dashboards
+    - List views with minimal data
+    - Quick overview of budgets
+    """
+
+    currency_code = serializers.CharField(source="currency.code", read_only=True)
+    currency_symbol = serializers.CharField(source="currency.symbol", read_only=True)
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    utilization_percentage = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Budget
+        fields = [
+            "id",
+            "name",
+            "budget_type",
+            "category_name",
+            "total_budget",
+            "total_spent",
+            "total_remaining",
+            "currency_code",
+            "currency_symbol",
+            "period_type",
+            "start_date",
+            "end_date",
+            "is_active",
+            "utilization_percentage",
+            "status",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_utilization_percentage(self, obj: Budget) -> float:
+        """Get budget utilization percentage."""
+        return obj.get_utilization_percentage()
+
+    def get_status(self, obj: Budget) -> str:
+        """Get budget status."""
+        if not obj.is_active:
+            return "inactive"
+        if obj.is_over_budget:
+            return "exceeded"
+        if obj.should_notify():
+            return "warning"
+        return "on_track"
+
+
+class BudgetDetailSerializer(BudgetSerializer):
+    """
+    Detailed serializer for budget retrieval.
+
+    Includes:
+    - Complete budget information
+    - Budget categories with allocations
+    - Spending breakdown
+    - Progress indicators
+    - Historical data
+    """
+
+    spending_by_category = serializers.SerializerMethodField()
+    daily_average_spending = serializers.SerializerMethodField()
+    projected_spending = serializers.SerializerMethodField()
+
+    class Meta(BudgetSerializer.Meta):
+        fields = BudgetSerializer.Meta.fields + [
+            "spending_by_category",
+            "daily_average_spending",
+            "projected_spending",
+        ]
+
+    def get_spending_by_category(self, obj: Budget) -> List[Dict[str, Any]]:
+        """Get spending breakdown by category."""
+        from django.db.models import Sum
+
+        try:
+            spending = (
+                Transaction.objects.filter(
+                    user=obj.user,
+                    transaction_type=choices.TransactionType.EXPENSE,
+                    transaction_date__gte=obj.start_date,
+                    transaction_date__lte=obj.end_date,
+                    status=choices.TransactionStatus.COMPLETED,
+                )
+                .values("category__name")
+                .annotate(total=Sum("amount"))
+                .order_by("-total")[:10]
+            )
+
+            return [
+                {
+                    "category": item["category__name"],
+                    "amount": str(item["total"]),
+                }
+                for item in spending
+            ]
+
+        except Exception as e:
+            logger.warning(f"Error getting spending breakdown for budget {obj.id}: {e}")
+            return []
+
+    def get_daily_average_spending(self, obj: Budget) -> str:
+        """Calculate daily average spending."""
+        try:
+            days_elapsed = (timezone.now().date() - obj.start_date).days + 1
+            if days_elapsed > 0:
+                daily_avg = obj.total_spent / Decimal(str(days_elapsed))
+                return str(daily_avg.quantize(Decimal("0.01")))
+            return "0.00"
+        except Exception as e:
+            logger.warning(f"Error calculating daily average for budget {obj.id}: {e}")
+            return "0.00"
+
+    def get_projected_spending(self, obj: Budget) -> Dict[str, Any]:
+        """Calculate projected spending at current rate."""
+        try:
+            days_elapsed = (timezone.now().date() - obj.start_date).days + 1
+            total_days = (obj.end_date - obj.start_date).days + 1
+
+            if days_elapsed > 0 and total_days > 0:
+                daily_avg = obj.total_spent / Decimal(str(days_elapsed))
+                projected = daily_avg * Decimal(str(total_days))
+
+                return {
+                    "projected_total": str(projected.quantize(Decimal("0.01"))),
+                    "projected_vs_budget": str(
+                        (projected - obj.total_budget).quantize(Decimal("0.01"))
+                    ),
+                    "will_exceed": projected > obj.total_budget,
+                }
+
+            return {
+                "projected_total": "0.00",
+                "projected_vs_budget": "0.00",
+                "will_exceed": False,
+            }
+
+        except Exception as e:
+            logger.warning(f"Error calculating projection for budget {obj.id}: {e}")
+            return {
+                "projected_total": "0.00",
+                "projected_vs_budget": "0.00",
+                "will_exceed": False,
+            }
+
+
+class BudgetCreateSerializer(BudgetSerializer):
+    """
+    Specialized serializer for budget creation only.
+
+    Optimized for:
+    - Creation form/API
+    - Minimal validation overhead
+    - Clear error messages for creation-specific issues
+    """
+
+    class Meta(BudgetSerializer.Meta):
+        # Same fields as BudgetSerializer
+        pass
+
+    def validate(self, attrs):
+        """Additional validation specific to creation."""
+        attrs = super().validate(attrs)
+
+        # Ensure rollover_amount defaults to 0 on creation
+        if "rollover_amount" not in attrs:
+            attrs["rollover_amount"] = Decimal("0.00")
+
+        # Ensure notification_threshold has a default
+        if "notification_threshold" not in attrs:
+            attrs["notification_threshold"] = Decimal("80.00")
+
+        return attrs
+
+
+class BudgetUpdateSerializer(BudgetSerializer):
+    """
+    Specialized serializer for budget updates only.
+
+    Optimized for:
+    - Update form/API
+    - Partial updates
+    - Field-specific validation
+    """
+
+    class Meta(BudgetSerializer.Meta):
+        # Same fields as BudgetSerializer
+        pass
+
+    def validate_budget_type(self, value):
+        """Prevent budget type changes after creation."""
+        if self.instance and self.instance.budget_type != value:
+            raise serializers.ValidationError(
+                _("Cannot change budget type after creation."),
+                code="budget_type_change_not_allowed",
+            )
+        return value
+
+    def validate_currency_id(self, value):
+        """Prevent currency changes after creation."""
+        if self.instance and self.instance.currency != value:
+            raise serializers.ValidationError(
+                _("Cannot change budget currency after creation."),
+                code="currency_change_not_allowed",
+            )
+        return value
+
+
+class BudgetRecalculateSerializer(serializers.Serializer):
+    """
+    Serializer for triggering budget recalculation.
+
+    Used to manually recalculate spending and update budget status.
+    """
+
+    force = serializers.BooleanField(
+        default=False,
+        help_text=_("Force recalculation even if recently calculated"),
+    )
+
+    def create(self, validated_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Recalculate budget spending.
+
+        Args:
+            validated_data: Validated recalculation data
+
+        Returns:
+            Recalculation result
+        """
+        budget = self.context["budget"]
+        force = validated_data.get("force", False)
+
+        logger.info(f"Recalculating budget {budget.id}, force={force}")
+
+        try:
+            # Calculate spending
+            spending = budget.calculate_spending()
+
+            return {
+                "budget_id": str(budget.id),
+                "total_spent": str(budget.total_spent),
+                "total_remaining": str(budget.total_remaining),
+                "utilization_percentage": budget.get_utilization_percentage(),
+                "is_over_budget": budget.is_over_budget,
+                "last_recalculated_at": budget.last_recalculated_at,
+            }
+
+        except Exception as e:
+            logger.exception(f"Error recalculating budget {budget.id}: {e}")
+            raise serializers.ValidationError(
+                _("An error occurred while recalculating the budget."),
+                code="recalculation_error",
+            )

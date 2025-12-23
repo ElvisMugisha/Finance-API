@@ -28,12 +28,19 @@ from utils.permissions import IsOwnerOrAdmin
 
 from .filters import AccountFilter, BudgetFilter, FinancialGoalFilter, TransactionFilter
 
-from .models import Account, Transaction
+from .models import Account, Budget, Transaction
 from .serializers import (
     AccountDetailSerializer,
     AccountListSerializer,
     AccountReconcileSerializer,
     AccountSerializer,
+    BaseBudgetSerializer,
+    BudgetCreateSerializer,
+    BudgetDetailSerializer,
+    BudgetListSerializer,
+    BudgetRecalculateSerializer,
+    BudgetSerializer,
+    BudgetUpdateSerializer,
     TransactionCreateSerializer,
     TransactionSerializer,
     TransactionUpdateSerializer,
@@ -127,10 +134,6 @@ class AccountViewSet(
     mixins.UpdateModelMixin,
     mixins.DestroyModelMixin,
 ):
-    filterset_class = AccountFilter
-    search_fields = ["name", "bank_name", "account_number"]
-    ordering_fields = ["name", "current_balance", "created_at"]
-    ordering = ["-created_at"]
     """
     Account ViewSet for comprehensive financial account management.
 
@@ -152,6 +155,10 @@ class AccountViewSet(
     """
 
     queryset = Account.objects.all()
+    filterset_class = AccountFilter
+    search_fields = ["name", "bank_name", "account_number"]
+    ordering_fields = ["name", "current_balance", "created_at"]
+    ordering = ["-created_at"]
     lookup_field = "id"
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
@@ -2108,3 +2115,487 @@ class TransactionViewSet(viewsets.ModelViewSet):
         # Could use Django REST Framework's renderers or external libraries
 
         raise NotImplementedError("Export functionality not implemented")
+
+
+class BudgetViewSet(
+    viewsets.GenericViewSet,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.CreateModelMixin,
+    mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
+):
+    """
+    Budget ViewSet for comprehensive budget management.
+
+    Features:
+    - Full CRUD operations with role-based permissions
+    - Budget recalculation and spending tracking
+    - Advanced filtering and search capabilities
+    - Period advancement and rollover handling
+    - Comprehensive error handling and logging
+
+    Permissions:
+    - Regular users: CRUD only their own budgets
+    - Staff/Admin: CRUD any budget
+
+    Security:
+    - Proper ownership validation
+    - Business logic enforcement
+    - Audit logging for sensitive operations
+    """
+
+    queryset = Budget.objects.all()
+    permission_classes = [IsOwnerOrAdmin]
+    pagination_class = CustomPageNumberPagination
+    filterset_class = BudgetFilter
+    search_fields = ["name", "description"]
+    ordering_fields = [
+        "name",
+        "total_budget",
+        "total_spent",
+        "start_date",
+        "end_date",
+        "created_at",
+    ]
+    ordering = ["-created_at"]
+    lookup_field = "id"
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def get_queryset(self):
+        """
+        Get budgets based on user permissions with optimization.
+
+        Rules:
+        - Superusers/Staff: All budgets with related data
+        - Regular users: Only their own budgets
+        """
+        user = self.request.user
+
+        queryset = (
+            Budget.objects.select_related("currency", "category", "user")
+            .prefetch_related("budget_categories__category")
+            .annotate(category_count=Count("budget_categories", distinct=True))
+        )
+
+        if user.is_staff or user.is_superuser:
+            return queryset
+
+        return queryset.filter(user=user)
+
+    def get_serializer_class(self):
+        """Return appropriate serializer based on action."""
+        if self.action == "list":
+            return BudgetListSerializer
+        elif self.action == "retrieve":
+            return BudgetDetailSerializer
+        elif self.action == "create":
+            return BudgetCreateSerializer
+        elif self.action in ["update", "partial_update"]:
+            return BudgetUpdateSerializer
+        elif self.action == "recalculate":
+            return BudgetRecalculateSerializer
+        return BudgetSerializer
+
+    @extend_schema(
+        summary="List budgets",
+        description=(
+            "List all budgets accessible to the authenticated user. "
+            "Regular users see only their budgets. "
+            "Staff/Admin see all budgets."
+        ),
+        responses={
+            200: BudgetListSerializer(many=True),
+            500: OpenApiResponse(description="Internal Server Error"),
+        },
+    )
+    def list(self, request, *args, **kwargs):
+        """List budgets with advanced filtering and pagination."""
+        try:
+            queryset = self.get_queryset()
+            queryset = self.filter_queryset(queryset)
+
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+
+            serializer = self.get_serializer(queryset, many=True)
+            return Response(serializer.data)
+
+        except Exception as e:
+            logger.exception(f"Error listing budgets: {e}")
+            return Response(
+                {"error": "An error occurred while retrieving budgets."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @extend_schema(
+        summary="Retrieve budget",
+        description="Retrieve detailed information about a specific budget.",
+        responses={
+            200: BudgetDetailSerializer,
+            404: OpenApiResponse(description="Budget not found"),
+            403: OpenApiResponse(description="Permission denied"),
+        },
+    )
+    def retrieve(self, request, *args, **kwargs):
+        """Retrieve budget with detailed information."""
+        try:
+            instance = self.get_object()
+            serializer = self.get_serializer(instance)
+            return Response(serializer.data)
+
+        except Budget.DoesNotExist:
+            logger.warning(f"Budget not found: {kwargs.get('id')}")
+            return Response(
+                {"error": "Budget not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            logger.exception(f"Error retrieving budget: {e}")
+            return Response(
+                {"error": "An error occurred while retrieving the budget."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @extend_schema(
+        summary="Create budget",
+        description=(
+            "Create a new budget. "
+            "Currency, total_budget, start_date, and end_date are required. "
+            "Budget name must be unique per user for active budgets."
+        ),
+        request=BudgetCreateSerializer,
+        responses={
+            201: BudgetSerializer,
+            400: OpenApiResponse(description="Validation error"),
+            403: OpenApiResponse(description="Permission denied"),
+        },
+    )
+    def create(self, request, *args, **kwargs):
+        """Create a new budget."""
+        try:
+            serializer = self.get_serializer(
+                data=request.data, context={"request": request}
+            )
+            serializer.is_valid(raise_exception=True)
+
+            with db_transaction.atomic():
+                budget = serializer.save()
+
+            logger.info(
+                f"Budget created: id={budget.id}, "
+                f"name='{budget.name}', "
+                f"user={request.user.id}, "
+                f"type={budget.budget_type}, "
+                f"amount={budget.total_budget}"
+            )
+
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+        except serializers.ValidationError as e:
+            logger.warning(f"Budget creation validation failed: {e}")
+            return Response(
+                {"error": "Validation failed.", "details": e.detail},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as e:
+            logger.exception(f"Error creating budget: {e}")
+            return Response(
+                {"error": "Failed to create budget. Please check your data."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    @extend_schema(
+        summary="Partial update budget",
+        description="Update specific fields of a budget using PATCH.",
+        request=BudgetUpdateSerializer,
+        responses={
+            200: BudgetSerializer,
+            400: OpenApiResponse(description="Validation error"),
+            403: OpenApiResponse(description="Permission denied"),
+        },
+    )
+    def partial_update(self, request, *args, **kwargs):
+        """Partial update budget (PATCH)."""
+        try:
+            instance = self.get_object()
+            self._check_budget_modification_permission(instance, request.user)
+
+            serializer = self.get_serializer(
+                instance, data=request.data, partial=True, context={"request": request}
+            )
+            serializer.is_valid(raise_exception=True)
+
+            with db_transaction.atomic():
+                updated_instance = serializer.save()
+
+            logger.info(
+                f"Budget partially updated: id={updated_instance.id}, "
+                f"updated fields={list(request.data.keys())}, "
+                f"by user={request.user.id}"
+            )
+
+            return Response(serializer.data)
+
+        except PermissionError as e:
+            logger.warning(f"Permission denied updating budget: {e}")
+            return Response({"error": str(e)}, status=status.HTTP_403_FORBIDDEN)
+        except serializers.ValidationError as e:
+            logger.warning(f"Budget update validation failed: {e}")
+            return Response(
+                {"error": "Validation failed.", "details": e.detail},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as e:
+            logger.exception(f"Error updating budget: {e}")
+            return Response(
+                {"error": "Failed to update budget."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    @extend_schema(
+        summary="Delete budget",
+        description=(
+            "Soft delete a budget (set is_active=False). "
+            "Budgets with active allocations cannot be deleted."
+        ),
+        responses={
+            204: OpenApiResponse(description="No Content"),
+            400: OpenApiResponse(description="Cannot delete budget"),
+            403: OpenApiResponse(description="Permission denied"),
+            404: OpenApiResponse(description="Budget not found"),
+        },
+    )
+    def destroy(self, request, *args, **kwargs):
+        """Soft delete budget with validation."""
+        try:
+            instance = self.get_object()
+            user = request.user
+
+            self._check_budget_modification_permission(instance, user)
+
+            with db_transaction.atomic():
+                instance.is_active = False
+                instance.save(update_fields=["is_active", "updated_at"])
+
+            logger.info(
+                f"Budget soft deleted: id={instance.id}, "
+                f"name='{instance.name}', "
+                f"by user={user.id}"
+            )
+
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        except PermissionError as e:
+            logger.warning(f"Permission denied deleting budget: {e}")
+            return Response({"error": str(e)}, status=status.HTTP_403_FORBIDDEN)
+        except Exception as e:
+            logger.exception(f"Error deleting budget: {e}")
+            return Response(
+                {"error": "Failed to delete budget."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def _check_budget_modification_permission(self, budget, user):
+        """
+        Check if user can modify the budget.
+
+        Args:
+            budget: Budget instance
+            user: User making the request
+
+        Raises:
+            PermissionError: If user cannot modify the budget
+        """
+        if user.is_staff or user.is_superuser:
+            return
+
+        if budget.user != user:
+            raise PermissionError("Cannot modify another user's budget.")
+
+    @extend_schema(
+        summary="Recalculate budget spending",
+        description="Manually recalculate budget spending and update totals.",
+        request=BudgetRecalculateSerializer,
+        responses={
+            200: OpenApiResponse(description="Recalculation result"),
+            403: OpenApiResponse(description="Permission denied"),
+            404: OpenApiResponse(description="Budget not found"),
+        },
+    )
+    @action(detail=True, methods=["post"], url_path="recalculate")
+    def recalculate(self, request, id=None):
+        """Recalculate budget spending."""
+        try:
+            budget = self.get_object()
+            self._check_budget_modification_permission(budget, request.user)
+
+            serializer = self.get_serializer(
+                data=request.data, context={"budget": budget}
+            )
+            serializer.is_valid(raise_exception=True)
+            result = serializer.save()
+
+            logger.info(
+                f"Budget recalculated: id={budget.id}, by user={request.user.id}"
+            )
+
+            return Response(result)
+
+        except PermissionError as e:
+            logger.warning(f"Permission denied recalculating budget: {e}")
+            return Response({"error": str(e)}, status=status.HTTP_403_FORBIDDEN)
+        except Exception as e:
+            logger.exception(f"Error recalculating budget: {e}")
+            return Response(
+                {"error": "Failed to recalculate budget."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @extend_schema(
+        summary="Advance budget period",
+        description="Advance budget to next period with optional rollover.",
+        responses={
+            200: OpenApiResponse(description="Period advanced successfully"),
+            400: OpenApiResponse(description="Cannot advance period"),
+            403: OpenApiResponse(description="Permission denied"),
+            404: OpenApiResponse(description="Budget not found"),
+        },
+    )
+    @action(detail=True, methods=["post"], url_path="advance-period")
+    def advance_period(self, request, id=None):
+        """Advance budget to next period."""
+        try:
+            budget = self.get_object()
+            self._check_budget_modification_permission(budget, request.user)
+
+            if budget.advance_period():
+                logger.info(
+                    f"Budget period advanced: id={budget.id}, "
+                    f"new period: {budget.start_date} to {budget.end_date}, "
+                    f"by user={request.user.id}"
+                )
+
+                serializer = BudgetDetailSerializer(
+                    budget, context={"request": request}
+                )
+                return Response(serializer.data)
+            else:
+                return Response(
+                    {"error": "Failed to advance budget period."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        except PermissionError as e:
+            logger.warning(f"Permission denied advancing budget period: {e}")
+            return Response({"error": str(e)}, status=status.HTTP_403_FORBIDDEN)
+        except Exception as e:
+            logger.exception(f"Error advancing budget period: {e}")
+            return Response(
+                {"error": "Failed to advance budget period."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @extend_schema(
+        summary="Get budget statistics",
+        description="Get comprehensive statistics for a budget.",
+        responses={
+            200: OpenApiResponse(description="Budget statistics"),
+            403: OpenApiResponse(description="Permission denied"),
+            404: OpenApiResponse(description="Budget not found"),
+        },
+    )
+    @action(detail=True, methods=["get"], url_path="statistics")
+    def statistics(self, request, id=None):
+        """Get budget statistics."""
+        try:
+            budget = self.get_object()
+
+            stats = {
+                "budget_id": str(budget.id),
+                "budget_name": budget.name,
+                "total_budget": str(budget.total_budget),
+                "total_spent": str(budget.total_spent),
+                "total_remaining": str(budget.total_remaining),
+                "rollover_amount": str(budget.rollover_amount),
+                "utilization_percentage": budget.get_utilization_percentage(),
+                "is_over_budget": budget.is_over_budget,
+                "days_remaining": budget.days_remaining,
+                "should_notify": budget.should_notify(),
+                "period": {
+                    "type": budget.period_type,
+                    "start_date": budget.start_date,
+                    "end_date": budget.end_date,
+                },
+                "last_recalculated_at": budget.last_recalculated_at,
+            }
+
+            return Response(stats)
+
+        except Exception as e:
+            logger.exception(f"Error getting budget statistics: {e}")
+            return Response(
+                {"error": "Failed to get budget statistics."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @extend_schema(
+        summary="Get budget summary",
+        description="Get summary of all active budgets for the user.",
+        responses={
+            200: OpenApiResponse(description="Budget summary"),
+            500: OpenApiResponse(description="Internal Server Error"),
+        },
+    )
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """Get summary of all active budgets."""
+        try:
+            queryset = self.get_queryset().filter(is_active=True)
+
+            total_budgeted = queryset.aggregate(total=Sum("total_budget"))[
+                "total"
+            ] or Decimal("0.00")
+
+            total_spent = queryset.aggregate(total=Sum("total_spent"))[
+                "total"
+            ] or Decimal("0.00")
+
+            total_remaining = queryset.aggregate(total=Sum("total_remaining"))[
+                "total"
+            ] or Decimal("0.00")
+
+            over_budget_count = queryset.filter(
+                total_spent__gt=models.F("total_budget")
+            ).count()
+
+            warning_count = sum(
+                1
+                for budget in queryset
+                if budget.should_notify() and not budget.is_over_budget
+            )
+
+            summary = {
+                "total_budgets": queryset.count(),
+                "total_budgeted": str(total_budgeted),
+                "total_spent": str(total_spent),
+                "total_remaining": str(total_remaining),
+                "overall_utilization": float(
+                    (total_spent / total_budgeted * 100) if total_budgeted > 0 else 0
+                ),
+                "budgets_over_limit": over_budget_count,
+                "budgets_warning": warning_count,
+                "budgets_on_track": queryset.count()
+                - over_budget_count
+                - warning_count,
+            }
+
+            return Response(summary)
+
+        except Exception as e:
+            logger.exception(f"Error getting budget summary: {e}")
+            return Response(
+                {"error": "Failed to get budget summary."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )

@@ -5,8 +5,8 @@ from django.utils.translation import gettext_lazy as _
 
 
 class LoginStatus(models.TextChoices):
-    SUCCESS = "success", _("Success")
-    FAILURE = "failure", _("Failure")
+    SUCCESS = "Success", _("Success")
+    FAILURE = "Failure", _("Failure")
 
 
 class CodeType(models.TextChoices):
@@ -47,12 +47,12 @@ class TransactionStatus(models.TextChoices):
 
 
 class FrequencyType(models.TextChoices):
-    DAILY = "daily", _("Daily")
-    WEEKLY = "weekly", _("Weekly")
-    BI_WEEKLY = "bi_weekly", _("Bi-Weekly")
-    MONTHLY = "monthly", _("Monthly")
-    QUARTERLY = "quarterly", _("Quarterly")
-    YEARLY = "yearly", _("Yearly")
+    DAILY = "Daily", _("Daily")
+    WEEKLY = "Weekly", _("Weekly")
+    BI_WEEKLY = "Bi-Weekly", _("Bi-Weekly")
+    MONTHLY = "Monthly", _("Monthly")
+    QUARTERLY = "Quarterly", _("Quarterly")
+    YEARLY = "Yearly", _("Yearly")
 
 
 class DayOfWeek(Enum):
@@ -66,52 +66,52 @@ class DayOfWeek(Enum):
 
 
 class BudgetType(models.TextChoices):
-    CATEGORY = "category", _("Category Budget")
-    OVERALL = "overall", _("Overall Budget")
-    GOAL = "goal", _("Goal-based Budget")
+    CATEGORY = "Category", _("Category Budget")
+    OVERALL = "Overall", _("Overall Budget")
+    GOAL = "Goal", _("Goal-based Budget")
 
 
 class PeriodType(models.TextChoices):
-    MONTHLY = "monthly", _("Monthly")
-    QUARTERLY = "quarterly", _("Quarterly")
-    YEARLY = "yearly", _("Yearly")
-    CUSTOM = "custom", _("Custom Period")
+    MONTHLY = "Monthly", _("Monthly")
+    QUARTERLY = "Quarterly", _("Quarterly")
+    YEARLY = "Yearly", _("Yearly")
+    CUSTOM = "Custom", _("Custom Period")
 
 
 class GoalType(models.TextChoices):
-    SAVINGS = "savings", _("Savings Goal")
-    DEBT = "debt", _("Debt Repayment")
-    INVESTMENT = "investment", _("Investment Goal")
-    PURCHASE = "purchase", _("Major Purchase")
-    OTHER = "other", _("Other")
+    SAVINGS = "Savings", _("Savings Goal")
+    DEBT = "Debt", _("Debt Repayment")
+    INVESTMENT = "Investment", _("Investment Goal")
+    PURCHASE = "Purchase", _("Major Purchase")
+    OTHER = "Other", _("Other")
 
 
 class PriorityLevel(models.TextChoices):
-    HIGH = "high", _("High Priority")
-    MEDIUM = "medium", _("Medium Priority")
-    LOW = "low", _("Low Priority")
+    HIGH = "High", _("High Priority")
+    MEDIUM = "Medium", _("Medium Priority")
+    LOW = "Low", _("Low Priority")
 
 
 class ReportType(models.TextChoices):
-    SPENDING_BY_CATEGORY = "spending_by_category", _("Spending by Category")
-    INCOME_VS_EXPENSE = "income_vs_expense", _("Income vs Expense")
-    NET_WORTH = "net_worth", _("Net Worth")
-    BUDGET_VS_ACTUAL = "budget_vs_actual", _("Budget vs Actual")
-    CASH_FLOW = "cash_flow", _("Cash Flow")
-    CUSTOM = "custom", _("Custom Report")
+    SPENDING_BY_CATEGORY = "Spending by Category", _("Spending by Category")
+    INCOME_VS_EXPENSE = "Income vs Expense", _("Income vs Expense")
+    NET_WORTH = "Net Worth", _("Net Worth")
+    BUDGET_VS_ACTUAL = "Budget vs Actual", _("Budget vs Actual")
+    CASH_FLOW = "Cash Flow", _("Cash Flow")
+    CUSTOM = "Custom", _("Custom Report")
 
 
 class ReportStatus(models.TextChoices):
-    PENDING = "pending", _("Pending")
-    PROCESSING = "processing", _("Processing")
-    COMPLETED = "completed", _("Completed")
-    FAILED = "failed", _("Failed")
-    CANCELLED = "cancelled", _("Cancelled")
+    PENDING = "Pending", _("Pending")
+    PROCESSING = "Processing", _("Processing")
+    COMPLETED = "Completed", _("Completed")
+    FAILED = "Failed", _("Failed")
+    CANCELLED = "Cancelled", _("Cancelled")
 
 
 class ReportFormat(models.TextChoices):
-    JSON = "json", _("JSON")
-    CSV = "csv", _("CSV")
-    PDF = "pdf", _("PDF")
-    EXCEL = "excel", _("Excel")
-    HTML = "html", _("HTML")
+    JSON = "JSON", _("JSON")
+    CSV = "CSV", _("CSV")
+    PDF = "PDF", _("PDF")
+    EXCEL = "Excel", _("Excel")
+    HTML = "HTML", _("HTML")

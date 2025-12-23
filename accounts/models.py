@@ -1091,6 +1091,26 @@ class Budget(utils_models.BaseModel):
                 {"total_budget": _("Budget amount must be greater than zero.")}
             )
 
+        # Validate notification threshold
+        if not (Decimal("0") <= self.notification_threshold <= Decimal("100")):
+            logger.error(
+                f"Invalid notification threshold: {self.notification_threshold}"
+            )
+            raise ValidationError(
+                {
+                    "notification_threshold": _(
+                        "Notification threshold must be between 0 and 100."
+                    )
+                }
+            )
+
+        # Validate rollover amount
+        if self.rollover_amount < 0:
+            logger.error(f"Rollover amount cannot be negative: {self.rollover_amount}")
+            raise ValidationError(
+                {"rollover_amount": _("Rollover amount cannot be negative.")}
+            )
+
         # Validate category for category budgets
         if self.budget_type == choices.BudgetType.CATEGORY and not self.category:
             logger.error("Category budget must have a category")
@@ -1245,12 +1265,16 @@ class Budget(utils_models.BaseModel):
         return (self.end_date - today).days
 
 
-class BudgetCategory(models.Model):
+class BudgetCategory(utils_models.BaseModel):
     """
     Junction table for budgets with multiple categories.
 
     Allows for complex budgeting scenarios where a single budget
     covers multiple categories with individual allocations.
+
+    Inherits from BaseModel to include:
+        - created_at: Timestamp tracking
+        - updated_at: Modification tracking
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -1314,10 +1338,28 @@ class BudgetCategory(models.Model):
 
     def clean(self) -> None:
         """Validate allocation."""
+        logger.debug(f"Validating budget category: {self.id}")
+
+        # Validate allocated amount
         if self.allocated_amount <= 0:
+            logger.error(f"Invalid allocated amount: {self.allocated_amount}")
             raise ValidationError(
                 {"allocated_amount": _("Allocated amount must be greater than zero.")}
             )
+
+        # Validate category type matches expense (budgets track spending)
+        if (
+            self.category
+            and self.category.category_type != choices.TransactionType.EXPENSE
+        ):
+            logger.error(
+                f"Budget category must be expense type: {self.category.category_type}"
+            )
+            raise ValidationError(
+                {"category": _("Budget categories must be expense categories.")}
+            )
+
+        logger.debug(f"Budget category validation passed: {self.id}")
 
     def save(self, *args, **kwargs) -> None:
         """Save with automatic calculation."""
