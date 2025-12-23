@@ -1,9 +1,10 @@
 from django.conf import settings
 from django.db import models
 from decimal import Decimal
+from datetime import date, timedelta
 from django.db import transaction as db_transaction
 from django.db.models import Count, Q, Sum, Avg, Min, Max
-from django.db.models.functions import TruncMonth, TruncWeek, TruncDay
+from django.db.models.functions import TruncMonth, TruncWeek, TruncDay, Coalesce
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.core.exceptions import ValidationError
@@ -732,6 +733,187 @@ class AccountViewSet(
             return self._handle_api_error(
                 e,
                 "Failed to check deletion constraints.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @extend_schema(
+        summary="Get account balance history",
+        description="Get historical balance data aggregated by interval (daily, weekly, monthly).",
+        parameters=[
+            OpenApiParameter(
+                "start_date",
+                OpenApiTypes.DATE,
+                description="Start date (YYYY-MM-DD). If omitted with interval, defaults based on interval.",
+            ),
+            OpenApiParameter(
+                "end_date", OpenApiTypes.DATE, description="End date (YYYY-MM-DD)"
+            ),
+            OpenApiParameter(
+                "interval",
+                OpenApiTypes.STR,
+                enum=["daily", "weekly", "monthly"],
+                description="Grouping interval. If 'daily', 'weekly', 'monthly' is passed without dates, defaults to current period.",
+            ),
+        ],
+        responses={200: OpenApiResponse(description="Balance history data")},
+    )
+    @action(detail=True, methods=["get"], url_path="balance-history")
+    def balance_history(self, request, id=None):
+        """Get account balance history with flexible filtering."""
+        try:
+            account = self.get_object()
+
+            # Parse params
+            start_param = request.query_params.get("start_date")
+            end_param = request.query_params.get("end_date")
+            interval = request.query_params.get("interval")  # None by default
+
+            today = timezone.now().date()
+            start_date = None
+            end_date = None
+
+            # 1. Determine Date Range
+            if start_param:
+                start_date = date.fromisoformat(start_param)
+
+            if end_param:
+                end_date = date.fromisoformat(end_param)
+
+            # validation
+            if start_date and end_date and start_date > end_date:
+                return Response(
+                    {"error": "Start date must be before end date"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Contextual Defaults if dates are missing but interval is present
+            if interval and not start_date and not end_date:
+                if interval == "daily":
+                    # "Todays account history"
+                    start_date = today
+                    end_date = today
+                elif interval == "weekly":
+                    # "Current week only" (Assume Monday start)
+                    start_date = today - timedelta(days=today.weekday())
+                    end_date = today  # Up to now
+                elif interval == "monthly":
+                    # "Current month"
+                    start_date = today.replace(day=1)
+                    end_date = today
+
+            # If no interval and no dates -> All History (start_date=None, end_date=None)
+
+            # 2. Calculate Opening Balance
+            # If start_date is set, calculate balance up to that point.
+            # If start_date is None, opening balance is initial_balance.
+
+            initial_balance = (
+                Decimal(str(account.initial_balance))
+                if not isinstance(account.initial_balance, Decimal)
+                else account.initial_balance
+            )
+            running_balance = initial_balance
+
+            query_filters = Q(
+                account=account,
+                status__in=[
+                    choices.TransactionStatus.COMPLETED,
+                    choices.TransactionStatus.RECONCILED,
+                ],
+            )
+
+            if start_date:
+                # Calculate net change prior to start_date
+                pre_start_net = Transaction.objects.filter(
+                    query_filters, transaction_date__lt=start_date
+                ).aggregate(
+                    income=Coalesce(
+                        Sum(
+                            "amount",
+                            filter=Q(transaction_type=choices.TransactionType.INCOME),
+                        ),
+                        Decimal("0.00"),
+                    ),
+                    expense=Coalesce(
+                        Sum(
+                            "amount",
+                            filter=Q(transaction_type=choices.TransactionType.EXPENSE),
+                        ),
+                        Decimal("0.00"),
+                    ),
+                )
+                running_balance += pre_start_net["income"] - pre_start_net["expense"]
+
+            # 3. Query Periods with Activity
+            # Apply date filters to the main query
+            main_filters = query_filters
+            if start_date:
+                main_filters &= Q(transaction_date__gte=start_date)
+            if end_date:
+                main_filters &= Q(transaction_date__lte=end_date)
+
+            # Determine grouping
+            # If interval is not provided, default to Daily for "All History" view
+            # (sorting by date as requested).
+            trunc_map = {"daily": TruncDay, "weekly": TruncWeek, "monthly": TruncMonth}
+            trunc_func = trunc_map.get(interval, TruncDay)
+
+            # Fetch aggregated changes
+            period_changes = (
+                Transaction.objects.filter(main_filters)
+                .annotate(period=trunc_func("transaction_date"))
+                .values("period")
+                .annotate(
+                    income=Coalesce(
+                        Sum(
+                            "amount",
+                            filter=Q(transaction_type=choices.TransactionType.INCOME),
+                        ),
+                        Decimal("0.00"),
+                    ),
+                    expense=Coalesce(
+                        Sum(
+                            "amount",
+                            filter=Q(transaction_type=choices.TransactionType.EXPENSE),
+                        ),
+                        Decimal("0.00"),
+                    ),
+                )
+                .order_by("period")
+            )
+
+            # 4. Build History List
+            # Iterate through RESULTS only (skipping gaps where no activity occurred)
+            history = []
+
+            for item in period_changes:
+                period_date = item["period"]
+                if hasattr(period_date, "date"):
+                    period_date = period_date.date()
+
+                income = item["income"]
+                expense = item["expense"]
+                net_change = income - expense
+
+                # Update running balance
+                running_balance += net_change
+
+                history.append(
+                    {
+                        "date": period_date,
+                        "balance": str(running_balance),
+                        "income": str(income),
+                        "expense": str(expense),
+                        "currency": account.currency.code,
+                    }
+                )
+
+            return Response(history)
+
+        except Exception as e:
+            return self._handle_api_error(
+                e,
+                "Failed to get balance history.",
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 

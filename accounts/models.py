@@ -347,6 +347,8 @@ class Account(utils_models.BaseModel):
             List of balance snapshots
         """
         from .models import Transaction
+        from django.db.models import Sum, Case, When, Value, F
+        from django.db.models.functions import Coalesce
 
         if start_date is None:
             start_date = timezone.now().date() - timedelta(days=30)
@@ -354,13 +356,61 @@ class Account(utils_models.BaseModel):
             end_date = timezone.now().date()
 
         try:
-            # Get daily balances from transactions
+            # 1. Calculate opening balance at start_date (Initial + Net changes before start)
+            pre_history = Transaction.objects.filter(
+                account=self,
+                transaction_date__lt=start_date,
+                status__in=[
+                    choices.TransactionStatus.COMPLETED,
+                    choices.TransactionStatus.RECONCILED,
+                ],
+            ).aggregate(
+                income=Coalesce(
+                    Sum(
+                        Case(
+                            When(
+                                transaction_type=choices.TransactionType.INCOME,
+                                then="amount",
+                            ),
+                            default=Value(0),
+                            output_field=models.DecimalField(),
+                        )
+                    ),
+                    Decimal("0.00"),
+                ),
+                expense=Coalesce(
+                    Sum(
+                        Case(
+                            When(
+                                transaction_type=choices.TransactionType.EXPENSE,
+                                then="amount",
+                            ),
+                            default=Value(0),
+                            output_field=models.DecimalField(),
+                        )
+                    ),
+                    Decimal("0.00"),
+                ),
+            )
+
+            # Use Decimal for initial balance safety
+            initial = (
+                self.initial_balance
+                if isinstance(self.initial_balance, Decimal)
+                else Decimal(str(self.initial_balance))
+            )
+            running_balance = initial + pre_history["income"] - pre_history["expense"]
+
+            # 2. Get daily changes within range
             transactions = (
                 Transaction.objects.filter(
                     account=self,
                     transaction_date__gte=start_date,
                     transaction_date__lte=end_date,
-                    status=choices.TransactionStatus.COMPLETED,
+                    status__in=[
+                        choices.TransactionStatus.COMPLETED,
+                        choices.TransactionStatus.RECONCILED,
+                    ],
                 )
                 .values("transaction_date")
                 .annotate(
@@ -395,20 +445,31 @@ class Account(utils_models.BaseModel):
                 .order_by("day")
             )
 
-            # Build balance history
-            balance = self.initial_balance
-            history = []
+            # 3. Build history filling gaps is NOT strictly required for this method
+            # as it's used for trend calculation, but usually history implies time-series.
+            # Use dictionary for O(1) lookup
+            tx_map = {tx["day"]: tx for tx in transactions}
 
-            for tx in transactions:
-                balance += tx["income"] - tx["expense"]
+            history = []
+            current_date = start_date
+
+            while current_date <= end_date:
+                daily_tx = tx_map.get(
+                    current_date, {"income": Decimal("0"), "expense": Decimal("0")}
+                )
+
+                net_change = daily_tx["income"] - daily_tx["expense"]
+                running_balance += net_change
+
                 history.append(
                     {
-                        "date": tx["day"],
-                        "balance": balance,
-                        "income": tx["income"],
-                        "expense": tx["expense"],
+                        "date": current_date,
+                        "balance": running_balance,
+                        "income": daily_tx["income"],
+                        "expense": daily_tx["expense"],
                     }
                 )
+                current_date += timedelta(days=1)
 
             return history
 
