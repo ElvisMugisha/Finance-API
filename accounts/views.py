@@ -29,7 +29,7 @@ from utils.permissions import IsOwnerOrAdmin
 
 from .filters import AccountFilter, BudgetFilter, FinancialGoalFilter, TransactionFilter
 
-from .models import Account, Budget, Transaction
+from .models import Account, Budget, FinancialGoal, Transaction
 from .serializers import (
     AccountDetailSerializer,
     AccountListSerializer,
@@ -42,11 +42,18 @@ from .serializers import (
     BudgetRecalculateSerializer,
     BudgetSerializer,
     BudgetUpdateSerializer,
+    FinancialGoalContributionSerializer,
+    FinancialGoalCreateSerializer,
+    FinancialGoalDetailSerializer,
+    FinancialGoalListSerializer,
+    FinancialGoalSerializer,
+    FinancialGoalUpdateSerializer,
     TransactionCreateSerializer,
     TransactionSerializer,
     TransactionUpdateSerializer,
     TransactionVerificationSerializer,
     get_account_serializer,
+    get_financial_goal_serializer,
 )
 
 logger = loggings.setup_logging()
@@ -2786,5 +2793,125 @@ class BudgetViewSet(
             logger.exception(f"Error getting budget summary: {e}")
             return Response(
                 {"error": "Failed to get budget summary."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class FinancialGoalViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing Financial Goals.
+
+    Provides:
+    - CRUD for financial goals
+    - Contribution management
+    - Progress tracking and summaries
+    - Automatic currency handling
+    """
+
+    queryset = FinancialGoal.objects.select_related(
+        "user", "currency", "linked_account"
+    )
+    serializer_class = FinancialGoalSerializer
+    permission_classes = [IsOwnerOrAdmin]
+    filterset_class = FinancialGoalFilter
+    ordering_fields = [
+        "name",
+        "target_amount",
+        "current_amount",
+        "progress_percentage",
+        "target_date",
+        "priority",
+        "created_at",
+    ]
+    ordering = ["priority", "target_date"]
+
+    def get_queryset(self):
+        """Filter goals by active user."""
+        return super().get_queryset().filter(user=self.request.user)
+
+    def get_serializer_class(self):
+        """Dynamic serializer selection."""
+        return get_financial_goal_serializer(self.action)
+
+    @extend_schema(
+        summary="Add contribution to goal",
+        request=FinancialGoalContributionSerializer,
+        responses={200: OpenApiResponse(description="Contribution added successfully")},
+    )
+    @action(detail=True, methods=["post"], url_path="contribute")
+    def contribute(self, request, pk=None):
+        """Add a manual contribution to a financial goal."""
+        goal = self.get_object()
+        serializer = self.get_serializer(data=request.data, context={"goal": goal})
+
+        if serializer.is_valid():
+            try:
+                with db_transaction.atomic():
+                    result = serializer.save()
+
+                logger.info(
+                    f"Contribution of {request.data.get('amount')} added to goal {goal.id}"
+                )
+                return Response(result, status=status.HTTP_200_OK)
+            except Exception as e:
+                logger.error(f"Error adding contribution: {e}")
+                return Response(
+                    {"error": _("Failed to process contribution.")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @extend_schema(
+        summary="Get goals summary statistics",
+        responses={200: OpenApiResponse(description="Summary of all financial goals")},
+    )
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """Get an aggregate summary of all financial goals."""
+        try:
+            queryset = self.get_queryset()
+
+            # Aggregate stats
+            stats = queryset.aggregate(
+                total_goals=Count("id"),
+                achieved_goals=Count("id", filter=Q(is_achieved=True)),
+                total_target=Sum("target_amount"),
+                total_saved=Sum("current_amount"),
+                avg_progress=Avg("progress_percentage"),
+            )
+
+            # Get nearby deadlines
+            upcoming = queryset.filter(
+                is_achieved=False,
+                target_date__lte=timezone.now().date() + timedelta(days=90),
+            ).order_by("target_date")[:5]
+
+            summary = {
+                "overview": {
+                    "total_goals": stats["total_goals"] or 0,
+                    "achieved_goals": stats["achieved_goals"] or 0,
+                    "active_goals": (stats["total_goals"] or 0)
+                    - (stats["achieved_goals"] or 0),
+                    "overall_progress": float(stats["avg_progress"] or 0),
+                },
+                "financials": {
+                    "total_target_amount": str(stats["total_target"] or 0),
+                    "total_current_amount": str(stats["total_saved"] or 0),
+                    "total_remaining_amount": str(
+                        (stats["total_target"] or 0) - (stats["total_saved"] or 0)
+                    ),
+                },
+                "upcoming_deadlines": FinancialGoalListSerializer(
+                    upcoming, many=True
+                ).data,
+            }
+
+            return Response(summary)
+
+        except Exception as e:
+            logger.exception(f"Error generating goal summary: {e}")
+            return Response(
+                {"error": _("Failed to generate summary.")},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )

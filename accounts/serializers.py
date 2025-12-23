@@ -17,7 +17,7 @@ from core.serializers import (
 )
 from utils import choices, loggings
 
-from .models import Account, Budget, BudgetCategory, Transaction
+from .models import Account, Budget, BudgetCategory, FinancialGoal, Transaction
 
 logger = loggings.setup_logging()
 
@@ -2106,3 +2106,297 @@ class BudgetRecalculateSerializer(serializers.Serializer):
                 _("An error occurred while recalculating the budget."),
                 code="recalculation_error",
             )
+
+
+class BaseFinancialGoalSerializer(serializers.ModelSerializer):
+    """Base serializer with common financial goal functionality."""
+
+    def _get_request_user(self):
+        """Safely get request user from context."""
+        request = self.context.get("request")
+        return request.user if request and request.user.is_authenticated else None
+
+    def _log_validation_warning(self, message: str, **kwargs) -> None:
+        """Log validation warnings consistently."""
+        user = self._get_request_user()
+        user_id = user.id if user else "anonymous"
+        logger.warning(f"User {user_id}: {message}", **kwargs)
+
+
+class FinancialGoalSerializer(BaseFinancialGoalSerializer):
+    """
+    Primary serializer for Financial Goal CRUD operations.
+
+    Responsibilities:
+    - Handles creation and updates of financial goals
+    - Validates amounts and dates
+    - Manages currency and account relationships
+    - Tracks progress
+    """
+
+    currency_id = serializers.PrimaryKeyRelatedField(
+        queryset=Currency.objects.filter(is_active=True),
+        source="currency",
+        write_only=True,
+        help_text=_("ID of the currency for this goal"),
+    )
+    currency = serializers.SerializerMethodField(read_only=True)
+
+    linked_account_id = serializers.PrimaryKeyRelatedField(
+        queryset=Account.objects.all(),
+        source="linked_account",
+        write_only=True,
+        required=False,
+        allow_null=True,
+        help_text=_("ID of the linked account for automatic contributions"),
+    )
+    linked_account_details = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = FinancialGoal
+        fields = [
+            "id",
+            "name",
+            "description",
+            "goal_type",
+            "target_amount",
+            "current_amount",
+            "currency_id",
+            "currency",
+            "monthly_contribution",
+            "start_date",
+            "target_date",
+            "achieved_date",
+            "priority",
+            "is_achieved",
+            "is_active",
+            "progress_percentage",
+            "months_remaining",
+            "linked_account_id",
+            "linked_account_details",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "current_amount",  # Updated via contributions
+            "progress_percentage",
+            "months_remaining",
+            "is_achieved",
+            "achieved_date",
+            "created_at",
+            "updated_at",
+        ]
+        extra_kwargs = {
+            "name": {
+                "help_text": _("Name of the financial goal"),
+                "max_length": 255,
+                "trim_whitespace": True,
+            },
+            "target_amount": {
+                "help_text": _("Target amount to achieve"),
+                "min_value": Decimal("0.01"),
+            },
+        }
+
+    def get_currency(self, obj: FinancialGoal) -> Dict[str, Any]:
+        """Get currency details."""
+        return CurrencyListSerializer(obj.currency).data
+
+    def get_linked_account_details(
+        self, obj: FinancialGoal
+    ) -> Optional[Dict[str, Any]]:
+        """Get linked account details."""
+        if obj.linked_account:
+            return AccountListSerializer(obj.linked_account).data
+        return None
+
+    def validate_name(self, value: str) -> str:
+        """Validate goal name."""
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError(_("Goal name cannot be empty."))
+
+        user = self._get_request_user()
+        if user and self.instance is None:
+            if FinancialGoal.objects.filter(user=user, name=value).exists():
+                raise serializers.ValidationError(
+                    _("A financial goal with this name already exists.")
+                )
+
+        return value
+
+    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        """Cross-field validation."""
+        start_date = attrs.get(
+            "start_date", getattr(self.instance, "start_date", timezone.now().date())
+        )
+        target_date = attrs.get(
+            "target_date", getattr(self.instance, "target_date", None)
+        )
+
+        if target_date and start_date and target_date <= start_date:
+            raise serializers.ValidationError(
+                {"target_date": _("Target date must be after start date.")}
+            )
+
+        # Validate linked account ownership
+        linked_account = attrs.get("linked_account")
+        user = self._get_request_user()
+        if linked_account and user and linked_account.user != user:
+            raise serializers.ValidationError(
+                {"linked_account": _("Linked account must belong to you.")}
+            )
+
+        return attrs
+
+    def create(self, validated_data: Dict[str, Any]) -> FinancialGoal:
+        """Create new financial goal."""
+        try:
+            user = self._get_request_user()
+            if not user:
+                raise serializers.ValidationError(_("User must be authenticated."))
+
+            validated_data["user"] = user
+
+            with db_transaction.atomic():
+                goal = FinancialGoal.objects.create(**validated_data)
+
+            logger.info(f"Financial goal created: {goal.id} for user {user.id}")
+            return goal
+        except Exception as e:
+            logger.error(f"Error creating financial goal: {e}")
+            raise serializers.ValidationError(_("Failed to create financial goal."))
+
+    def update(
+        self, instance: FinancialGoal, validated_data: Dict[str, Any]
+    ) -> FinancialGoal:
+        """Update financial goal."""
+        try:
+            user = self._get_request_user()
+            if instance.user != user:
+                raise serializers.ValidationError(
+                    _("Cannot update another user's goal.")
+                )
+
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+
+            instance.save()
+            logger.info(f"Financial goal updated: {instance.id}")
+            return instance
+        except Exception as e:
+            logger.error(f"Error updating financial goal: {e}")
+            raise serializers.ValidationError(_("Failed to update financial goal."))
+
+
+class FinancialGoalListSerializer(BaseFinancialGoalSerializer):
+    """Lightweight serializer for listing goals."""
+
+    currency_code = serializers.CharField(source="currency.code", read_only=True)
+
+    class Meta:
+        model = FinancialGoal
+        fields = [
+            "id",
+            "name",
+            "goal_type",
+            "target_amount",
+            "current_amount",
+            "currency_code",
+            "progress_percentage",
+            "target_date",
+            "months_remaining",
+            "is_achieved",
+            "priority",
+        ]
+        read_only_fields = fields
+
+
+class FinancialGoalDetailSerializer(FinancialGoalSerializer):
+    """Detailed serializer with progress summary."""
+
+    progress_summary = serializers.SerializerMethodField()
+
+    class Meta(FinancialGoalSerializer.Meta):
+        fields = FinancialGoalSerializer.Meta.fields + ["progress_summary"]
+
+    def get_progress_summary(self, obj: FinancialGoal) -> Dict[str, Any]:
+        """Get detailed progress summary."""
+        return obj.get_progress_summary()
+
+
+class FinancialGoalCreateSerializer(FinancialGoalSerializer):
+    """Serializer for creation."""
+
+    pass
+
+
+class FinancialGoalUpdateSerializer(FinancialGoalSerializer):
+    """Serializer for updates."""
+
+    class Meta(FinancialGoalSerializer.Meta):
+        read_only_fields = FinancialGoalSerializer.Meta.read_only_fields + ["currency"]
+
+    def validate_currency_id(self, value):
+        if self.instance and self.instance.currency != value:
+            raise serializers.ValidationError(
+                _("Cannot change goal currency after creation.")
+            )
+        return value
+
+
+class FinancialGoalContributionSerializer(serializers.Serializer):
+    """Serializer for adding contributions to a goal."""
+
+    amount = serializers.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        min_value=Decimal("0.01"),
+        help_text=_("Amount to contribute"),
+    )
+    date = serializers.DateField(
+        required=False, default=timezone.now().date, help_text=_("Date of contribution")
+    )
+    notes = serializers.CharField(
+        required=False, allow_blank=True, help_text=_("Optional notes")
+    )
+
+    def create(self, validated_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Process contribution."""
+        goal = self.context["goal"]
+        amount = validated_data["amount"]
+        contribution_date = validated_data.get("date")
+
+        success = goal.add_contribution(amount, contribution_date)
+
+        if not success:
+            raise serializers.ValidationError(_("Failed to add contribution."))
+
+        return {
+            "goal_id": str(goal.id),
+            "new_amount": str(goal.current_amount),
+            "progress": str(goal.progress_percentage),
+            "is_achieved": goal.is_achieved,
+        }
+
+
+def get_financial_goal_serializer(action: str):
+    """
+    Returns the appropriate FinancialGoal serializer based on the view action.
+
+    Args:
+        action (str): The viewset action name.
+
+    Returns:
+        Serializer: The serializer class to use.
+    """
+    serializers_map = {
+        "list": FinancialGoalListSerializer,
+        "retrieve": FinancialGoalDetailSerializer,
+        "create": FinancialGoalCreateSerializer,
+        "update": FinancialGoalUpdateSerializer,
+        "partial_update": FinancialGoalUpdateSerializer,
+        "contribute": FinancialGoalContributionSerializer,
+    }
+    return serializers_map.get(action, FinancialGoalSerializer)

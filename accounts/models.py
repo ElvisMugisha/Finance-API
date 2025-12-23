@@ -1632,7 +1632,7 @@ class FinancialGoal(utils_models.BaseModel):
 
     # Progress tracking
     progress_percentage = models.DecimalField(
-        max_digits=5,
+        max_digits=10,
         decimal_places=2,
         default=Decimal("0.00"),
         help_text=_("Percentage progress toward goal (0-100)"),
@@ -1661,8 +1661,14 @@ class FinancialGoal(utils_models.BaseModel):
             models.Index(fields=["user", "goal_type"]),
             models.Index(fields=["target_date"]),
             models.Index(fields=["priority", "target_date"]),
+            models.Index(fields=["user", "is_achieved"]),
+            models.Index(fields=["linked_account"]),
         ]
         constraints = [
+            models.UniqueConstraint(
+                fields=["user", "name"],
+                name=utils.get_index_name("financial_goals", ["user", "name"]),
+            ),
             models.CheckConstraint(
                 condition=models.Q(target_amount__gt=0),
                 name=utils.get_index_name("financial_goals", ["target_amount"]),
@@ -1676,6 +1682,10 @@ class FinancialGoal(utils_models.BaseModel):
                 name=utils.get_index_name(
                     "financial_goals", ["target_date", "start_date"]
                 ),
+            ),
+            models.CheckConstraint(
+                condition=models.Q(monthly_contribution__gte=0),
+                name=utils.get_index_name("financial_goals", ["monthly_contribution"]),
             ),
         ]
 
@@ -1700,6 +1710,14 @@ class FinancialGoal(utils_models.BaseModel):
                 {"current_amount": _("Current amount cannot be negative.")}
             )
 
+        if self.monthly_contribution < 0:
+            logger.error(
+                f"Monthly contribution cannot be negative: {self.monthly_contribution}"
+            )
+            raise ValidationError(
+                {"monthly_contribution": _("Monthly contribution cannot be negative.")}
+            )
+
         if self.current_amount > self.target_amount:
             logger.warning("Current amount exceeds target amount")
             self.current_amount = self.target_amount
@@ -1720,13 +1738,12 @@ class FinancialGoal(utils_models.BaseModel):
     def save(self, *args, **kwargs) -> None:
         """Save with automatic progress calculation."""
         try:
-            self.full_clean()
-
             # Calculate progress
             if self.target_amount > 0:
-                self.progress_percentage = (
-                    self.current_amount / self.target_amount
-                ) * 100
+                progress = (self.current_amount / self.target_amount) * 100
+                self.progress_percentage = progress.quantize(
+                    Decimal("0.01"), rounding="ROUND_HALF_UP"
+                )
 
             # Check if goal is achieved
             if not self.is_achieved and self.current_amount >= self.target_amount:
@@ -1799,16 +1816,36 @@ class FinancialGoal(utils_models.BaseModel):
                 if self.linked_account:
                     from .models import Transaction
 
+                    # Determine transaction amount in account's currency
+                    txn_amount = amount
+                    exchange_rate = Decimal("1.0")
+                    if self.currency != self.linked_account.currency:
+                        txn_amount = self.currency.convert_amount(
+                            amount, self.linked_account.currency
+                        )
+                        if txn_amount is not None:
+                            exchange_rate = txn_amount / amount
+                        else:
+                            logger.error(
+                                f"Currency conversion failed for contribution: "
+                                f"{self.currency.code} -> {self.linked_account.currency.code}"
+                            )
+                            txn_amount = amount  # Fallback
+
                     Transaction.objects.create(
                         user=self.user,
                         account=self.linked_account,
                         category=Category.objects.get_or_create(
-                            user=self.user, name="Savings", category_type="savings"
+                            user=self.user,
+                            name="Savings",
+                            category_type=choices.TransactionType.EXPENSE,
                         )[0],
                         name=f"Goal Contribution: {self.name}",
                         transaction_type=choices.TransactionType.EXPENSE,
-                        amount=amount,
-                        currency=self.currency.code,
+                        amount=txn_amount,
+                        original_amount=amount,
+                        original_currency=self.currency,
+                        exchange_rate=exchange_rate,
                         description=f"Contribution to {self.name} goal",
                         transaction_date=date or timezone.now().date(),
                         status=choices.TransactionStatus.COMPLETED,
