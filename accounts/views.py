@@ -27,9 +27,15 @@ from utils import choices, loggings, throttlings
 from utils.paginations import CustomPageNumberPagination
 from utils.permissions import IsOwnerOrAdmin
 
-from .filters import AccountFilter, BudgetFilter, FinancialGoalFilter, TransactionFilter
+from .filters import (
+    AccountFilter,
+    BudgetFilter,
+    BudgetCategoryFilter,
+    FinancialGoalFilter,
+    TransactionFilter,
+)
 
-from .models import Account, Budget, FinancialGoal, Transaction
+from .models import Account, Budget, BudgetCategory, FinancialGoal, Transaction
 from .serializers import (
     AccountDetailSerializer,
     AccountListSerializer,
@@ -42,6 +48,7 @@ from .serializers import (
     BudgetRecalculateSerializer,
     BudgetSerializer,
     BudgetUpdateSerializer,
+    BudgetCategorySerializer,
     FinancialGoalContributionSerializer,
     FinancialGoalCreateSerializer,
     FinancialGoalDetailSerializer,
@@ -2793,6 +2800,100 @@ class BudgetViewSet(
             logger.exception(f"Error getting budget summary: {e}")
             return Response(
                 {"error": "Failed to get budget summary."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class BudgetCategoryViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing Budget Category allocations.
+
+    Provides:
+    - CRUD for budget category links
+    - Individual spending tracking for categories within budgets
+    - Advanced filtering by budget or category
+    - Utilization analytics per category
+    """
+
+    queryset = BudgetCategory.objects.all()
+    serializer_class = BudgetCategorySerializer
+    permission_classes = [IsOwnerOrAdmin]
+    filterset_class = BudgetCategoryFilter
+    ordering_fields = [
+        "allocated_amount",
+        "spent_amount",
+        "remaining_amount",
+        "percentage_used",
+        "created_at",
+    ]
+    ordering = ["-created_at"]
+    lookup_field = "id"
+
+    def get_queryset(self):
+        """
+        Filter budget categories by user ownership.
+        Users can only see categories linked to their own budgets.
+        """
+        user = self.request.user
+        queryset = BudgetCategory.objects.select_related(
+            "budget", "category", "budget__user"
+        )
+
+        if user.is_staff or user.is_superuser:
+            return queryset
+
+        return queryset.filter(budget__user=user)
+
+    @extend_schema(
+        summary="Recalculate budget category",
+        description="Manually recalculate spending for this budget category and its parent budget.",
+        responses={200: BudgetCategorySerializer},
+    )
+    @action(detail=True, methods=["post"], url_path="recalculate")
+    def recalculate(self, request, id=None):
+        """
+        Manually recalculate spending for this budget category.
+        Useful if transactions were modified or in case of sync issues.
+        """
+        try:
+            instance = self.get_object()
+            with db_transaction.atomic():
+                instance.calculate_spending()
+                # Also recalculate parent budget
+                instance.budget.calculate_spending()
+
+            logger.info(f"Budget category {instance.id} recalculated")
+            return Response(BudgetCategorySerializer(instance).data)
+
+        except Exception as e:
+            logger.exception(f"Error recalculating budget category {id}: {e}")
+            return Response(
+                {"error": _("Failed to recalculate budget category.")},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @extend_schema(
+        summary="Top utilization categories",
+        description="Get categories with highest utilization percentage across all active budgets.",
+        responses={200: BudgetCategorySerializer(many=True)},
+    )
+    @action(detail=False, methods=["get"], url_path="top-utilization")
+    def top_utilization(self, request):
+        """
+        Get categories with highest utilization percentage across all active budgets.
+        """
+        try:
+            queryset = (
+                self.get_queryset()
+                .filter(budget__is_active=True)
+                .order_by("-percentage_used")[:5]
+            )
+            serializer = self.get_serializer(queryset, many=True)
+            return Response(serializer.data)
+        except Exception as e:
+            logger.exception(f"Error getting top utilization categories: {e}")
+            return Response(
+                {"error": _("Failed to retrieve utilization data.")},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 

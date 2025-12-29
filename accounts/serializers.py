@@ -1407,6 +1407,8 @@ class BudgetCategorySerializer(serializers.ModelSerializer):
     # Calculated fields
     utilization_percentage = serializers.SerializerMethodField()
     is_over_budget = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
+    daily_allowance = serializers.SerializerMethodField()
 
     class Meta:
         model = BudgetCategory
@@ -1422,6 +1424,8 @@ class BudgetCategorySerializer(serializers.ModelSerializer):
             "percentage_used",
             "utilization_percentage",
             "is_over_budget",
+            "status",
+            "daily_allowance",
             "created_at",
             "updated_at",
         ]
@@ -1432,6 +1436,8 @@ class BudgetCategorySerializer(serializers.ModelSerializer):
             "percentage_used",
             "utilization_percentage",
             "is_over_budget",
+            "status",
+            "daily_allowance",
             "created_at",
             "updated_at",
         ]
@@ -1460,6 +1466,32 @@ class BudgetCategorySerializer(serializers.ModelSerializer):
     def get_is_over_budget(self, obj: BudgetCategory) -> bool:
         """Check if category allocation is exceeded."""
         return obj.spent_amount > obj.allocated_amount
+
+    def get_status(self, obj: BudgetCategory) -> str:
+        """Get human-readable status of the category allocation."""
+        utilization = self.get_utilization_percentage(obj)
+        if utilization >= 100:
+            return "exceeded"
+        if utilization >= 90:
+            return "critical"
+        if utilization >= 75:
+            return "near_limit"
+        return "on_track"
+
+    def get_daily_allowance(self, obj: BudgetCategory) -> Optional[str]:
+        """Calculate how much can be spent per day for the rest of the period."""
+        try:
+            days_remaining = obj.budget.days_remaining
+            if days_remaining <= 0:
+                return "0.00"
+
+            allowance = obj.remaining_amount / Decimal(str(days_remaining))
+            return f"{max(allowance, Decimal('0.00')):.2f}"
+        except Exception as e:
+            logger.error(
+                f"Error calculating daily allowance for budget category {obj.id}: {e}"
+            )
+            return None
 
     def validate_allocated_amount(self, value: Decimal) -> Decimal:
         """Validate allocated amount."""

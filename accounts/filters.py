@@ -3,7 +3,14 @@ from django.db import models
 from django.db.models import Q
 from rest_framework.request import Request
 
-from accounts.models import Account, Budget, FinancialGoal, Report, Transaction
+from accounts.models import (
+    Account,
+    Budget,
+    BudgetCategory,
+    FinancialGoal,
+    Report,
+    Transaction,
+)
 from utils import loggings
 
 logger = loggings.setup_logging()
@@ -80,4 +87,17 @@ class FinancialGoalFilter(django_filters.FilterSet):
             "is_active": ["exact"],
             "is_achieved": ["exact"],
             "priority": ["exact"],
+        }
+
+
+class BudgetCategoryFilter(django_filters.FilterSet):
+    """
+    Advanced filtering for budget categories using django-filter.
+    """
+
+    class Meta:
+        model = BudgetCategory
+        fields = {
+            "budget": ["exact"],
+            "category": ["exact"],
         }

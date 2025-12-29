@@ -1283,6 +1283,7 @@ class Budget(utils_models.BaseModel):
     def calculate_spending(self) -> Decimal:
         """
         Calculate total spending for this budget period.
+        Also recalculates all associated budget categories.
 
         Returns:
             Total spending as Decimal
@@ -1290,19 +1291,33 @@ class Budget(utils_models.BaseModel):
         logger.debug(f"Calculating spending for budget: {self.id}")
 
         try:
-            # Build query based on budget type
+            # Recalculate all associated budget categories first
+            for budget_category in self.budget_categories.all():
+                budget_category.calculate_spending()
+
+            # Build query based on budget type for overall total
             query = Q(
                 user=self.user,
                 transaction_type=choices.TransactionType.EXPENSE,
                 transaction_date__gte=self.start_date,
                 transaction_date__lte=self.end_date,
-                status=choices.TransactionStatus.COMPLETED,
+                status__in=[
+                    choices.TransactionStatus.COMPLETED,
+                    choices.TransactionStatus.RECONCILED,
+                ],
             )
 
             if self.category:
+                # For single-category budgets
                 query &= Q(category=self.category)
+            elif self.budget_categories.exists():
+                # For multi-category budgets, total is sum of its categories
+                # (Or we can still track overall spending if desired)
+                # Let's stick to the total of its specific categories if they exist
+                categories = self.budget_categories.values_list("category", flat=True)
+                query &= Q(category__in=categories)
 
-            # Calculate spending
+            # Calculate total spending
             spending = self.user.transactions.filter(query).aggregate(
                 total=Coalesce(Sum("amount"), Decimal("0.00"))
             )["total"]
@@ -1525,7 +1540,10 @@ class BudgetCategory(utils_models.BaseModel):
                 transaction_type=choices.TransactionType.EXPENSE,
                 transaction_date__gte=self.budget.start_date,
                 transaction_date__lte=self.budget.end_date,
-                status=choices.TransactionStatus.COMPLETED,
+                status__in=[
+                    choices.TransactionStatus.COMPLETED,
+                    choices.TransactionStatus.RECONCILED,
+                ],
             ).aggregate(total=Coalesce(Sum("amount"), Decimal("0.00")))["total"]
 
             self.spent_amount = spending
