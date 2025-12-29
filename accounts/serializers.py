@@ -1506,12 +1506,39 @@ class BudgetCategorySerializer(serializers.ModelSerializer):
         """Cross-field validation."""
         logger.debug("Validating budget category")
 
-        # Validate category type (must be expense)
-        category = attrs.get("category")
-        if category and category.category_type != choices.TransactionType.EXPENSE:
+        request = self.context.get("request")
+        user = request.user if request else None
+
+        # Validate budget ownership
+        budget = attrs.get("budget")
+        if (
+            budget
+            and user
+            and budget.user != user
+            and not (user.is_staff or user.is_superuser)
+        ):
             raise serializers.ValidationError(
-                {"category": _("Budget categories must be expense categories.")}
+                {"budget": _("You cannot manage categories for another user's budget.")}
             )
+
+        # Validate category ownership (unless system category)
+        category = attrs.get("category")
+        if category:
+            if (
+                not category.is_system_category
+                and user
+                and category.user != user
+                and not (user.is_staff or user.is_superuser)
+            ):
+                raise serializers.ValidationError(
+                    {"category": _("You cannot use another user's category.")}
+                )
+
+            # Validate category type (must be expense)
+            if category.category_type != choices.TransactionType.EXPENSE:
+                raise serializers.ValidationError(
+                    {"category": _("Budget categories must be expense categories.")}
+                )
 
         return attrs
 

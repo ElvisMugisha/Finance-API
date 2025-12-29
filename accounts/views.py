@@ -2828,6 +2828,7 @@ class BudgetCategoryViewSet(viewsets.ModelViewSet):
     ]
     ordering = ["-created_at"]
     lookup_field = "id"
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
         """
@@ -2925,6 +2926,7 @@ class FinancialGoalViewSet(viewsets.ModelViewSet):
         "created_at",
     ]
     ordering = ["priority", "target_date"]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
         """Filter goals by active user."""

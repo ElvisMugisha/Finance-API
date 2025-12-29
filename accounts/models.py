@@ -1495,6 +1495,11 @@ class BudgetCategory(utils_models.BaseModel):
             ),
         ]
 
+    @property
+    def user(self):
+        """Owner of the budget this category belongs to."""
+        return self.budget.user
+
     def __str__(self) -> str:
         return f"{self.category.name} - {self.allocated_amount} in {self.budget.name}"
 
