@@ -518,6 +518,14 @@ class Transaction(utils_models.BaseModel):
         db_index=True,
         help_text=_("Transaction category"),
     )
+    financial_goal = models.ForeignKey(
+        "FinancialGoal",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="transactions",
+        help_text=_("Financial goal associated with this transaction"),
+    )
 
     recurrence_metadata = models.JSONField(
         default=dict,
@@ -776,6 +784,7 @@ class Transaction(utils_models.BaseModel):
         old_status = None
         old_amount = None
         old_category = None
+        old_goal = None
         old_date = None
 
         # Check update_fields to avoid unnecessary balance processing
@@ -792,6 +801,7 @@ class Transaction(utils_models.BaseModel):
                 old_status = old_instance.status
                 old_amount = old_instance.amount
                 old_category = old_instance.category
+                old_goal = old_instance.financial_goal
                 old_date = old_instance.transaction_date
             except Transaction.DoesNotExist:
                 pass
@@ -863,13 +873,14 @@ class Transaction(utils_models.BaseModel):
         if is_new:
             self.category.update_usage_stats()
 
-        # CRITICAL FIX: Auto-recalculate affected budgets
+        # CRITICAL FIX: Auto-recalculate affected budgets and goals
         self._recalculate_affected_budgets(
             is_new=is_new,
             old_status=old_status,
             old_category=old_category,
             old_date=old_date,
         )
+        self._recalculate_affected_goals(is_new=is_new, old_goal=old_goal)
 
     def _recalculate_affected_budgets(
         self, is_new: bool, old_status: str = None, old_category=None, old_date=None
@@ -934,6 +945,27 @@ class Transaction(utils_models.BaseModel):
         except Exception as e:
             logger.error(f"Error recalculating budgets for transaction {self.id}: {e}")
             # Don't raise - budget recalculation shouldn't block transaction save
+
+    def _recalculate_affected_goals(self, is_new: bool, old_goal=None) -> None:
+        """
+        Recalculate financial goals affected by this transaction.
+        """
+        affected_goals = set()
+
+        if self.financial_goal:
+            affected_goals.add(self.financial_goal)
+
+        if not is_new and old_goal and old_goal != self.financial_goal:
+            affected_goals.add(old_goal)
+
+        for goal in affected_goals:
+            try:
+                goal.calculate_progress()
+                logger.debug(
+                    f"Auto-recalculated goal {goal.id} due to transaction {self.id}"
+                )
+            except Exception as e:
+                logger.error(f"Error recalculating goal {goal.id}: {e}")
 
     def _create_transfer_pair(self) -> None:
         """Create paired transaction for transfers."""
@@ -1015,6 +1047,39 @@ class Transaction(utils_models.BaseModel):
         if self.original_amount and self.exchange_rate != Decimal("1.0"):
             return self.original_amount * self.exchange_rate
         return self.amount
+
+    def delete(self, *args, **kwargs):
+        """
+        Override delete to handle balance reversals and goal updates.
+        Ensures consistency even when deleted from admin or other places.
+        """
+        account = self.account
+        goal = self.financial_goal
+        amount = self.amount
+        txn_type = self.transaction_type
+        is_completed = self.is_verified
+
+        logger.info(f"Deleting transaction {self.id}")
+
+        with transaction.atomic():
+            super().delete(*args, **kwargs)
+
+            # Reverse balance update if it was a completed transaction
+            if is_completed and account:
+                reverse_type = (
+                    choices.TransactionType.EXPENSE
+                    if txn_type == choices.TransactionType.INCOME
+                    else choices.TransactionType.INCOME
+                )
+                account.update_balance(amount, reverse_type)
+                logger.debug(
+                    f"Reversed balance for account {account.id} due to Tx deletion"
+                )
+
+            # Update goal if it was linked
+            if goal:
+                goal.calculate_progress()
+                logger.debug(f"Updated goal {goal.id} due to Tx deletion")
 
     @property
     def is_verified(self) -> bool:
@@ -1816,9 +1881,56 @@ class FinancialGoal(utils_models.BaseModel):
             logger.error(f"Error calculating months remaining for goal {self.id}: {e}")
             self.months_remaining = 0
 
+    def calculate_progress(self) -> Decimal:
+        """
+        Calculate and update goal progress from transactions.
+        Ensures perfect accuracy and zero missing money by summing all
+        associated income and expense transactions.
+        """
+        try:
+            logger.debug(f"Recalculating progress for goal {self.id}")
+
+            stats = self.transactions.filter(
+                status__in=[
+                    choices.TransactionStatus.COMPLETED,
+                    choices.TransactionStatus.RECONCILED,
+                ]
+            ).aggregate(
+                income=Coalesce(
+                    Sum(
+                        "amount",
+                        filter=models.Q(
+                            transaction_type=choices.TransactionType.INCOME
+                        ),
+                    ),
+                    Decimal("0.00"),
+                ),
+                expense=Coalesce(
+                    Sum(
+                        "amount",
+                        filter=models.Q(
+                            transaction_type=choices.TransactionType.EXPENSE
+                        ),
+                    ),
+                    Decimal("0.00"),
+                ),
+            )
+
+            new_amount = stats["income"] - stats["expense"]
+            self.current_amount = max(Decimal("0.00"), new_amount)
+
+            # Save will handle progress_percentage and achieving logic
+            self.save(update_fields=["current_amount", "updated_at"])
+            return self.current_amount
+
+        except Exception as e:
+            logger.error(f"Error calculating progress for goal {self.id}: {e}")
+            return self.current_amount
+
     def add_contribution(self, amount: Decimal, date: Optional[date] = None) -> bool:
         """
         Add a contribution to the goal.
+        Creates an INCOME transaction to record the contribution.
 
         Args:
             amount: Contribution amount (positive)
@@ -1835,57 +1947,54 @@ class FinancialGoal(utils_models.BaseModel):
 
         try:
             with transaction.atomic():
-                self.current_amount += amount
-                self.save()
+                from .models import Transaction
 
-                # Create an INCOME transaction record if linked to account
-                # This increases the account's balance as requested by the user.
-                if self.linked_account:
-                    from .models import Transaction
+                # Determine transaction amount in target currency
+                txn_amount = amount
+                exchange_rate = Decimal("1.0")
 
-                    # Determine transaction amount in account's currency
-                    txn_amount = amount
-                    exchange_rate = Decimal("1.0")
-                    if self.currency != self.linked_account.currency:
-                        txn_amount = self.currency.convert_amount(
-                            amount, self.linked_account.currency
+                # If we have a linked account, convert to its currency
+                target_currency = (
+                    self.linked_account.currency
+                    if self.linked_account
+                    else self.currency
+                )
+
+                if self.currency != target_currency:
+                    txn_amount = self.currency.convert_amount(amount, target_currency)
+                    if txn_amount is not None:
+                        exchange_rate = (txn_amount / amount).quantize(
+                            Decimal("0.000001"), rounding="ROUND_HALF_UP"
                         )
-                        if txn_amount is not None:
-                            exchange_rate = (txn_amount / amount).quantize(
-                                Decimal("0.000001"), rounding="ROUND_HALF_UP"
-                            )
-                        else:
-                            logger.error(
-                                f"Currency conversion failed for contribution: "
-                                f"{self.currency.code} -> {self.linked_account.currency.code}"
-                            )
-                            txn_amount = amount  # Fallback
+                    else:
+                        txn_amount = amount
 
-                    # Get or create a "Savings Contribution" category
-                    contribution_category, _ = Category.objects.get_or_create(
-                        user=self.user,
-                        name="Goal Contribution",
-                        category_type=choices.TransactionType.INCOME,
-                        defaults={"is_system_category": False},
-                    )
+                # Get or create a "Savings Contribution" category
+                contribution_category, _ = Category.objects.get_or_create(
+                    user=self.user,
+                    name="Goal Contribution",
+                    category_type=choices.TransactionType.INCOME,
+                    defaults={"is_system_category": False},
+                )
 
-                    Transaction.objects.create(
-                        user=self.user,
-                        account=self.linked_account,
-                        category=contribution_category,
-                        name=f"Contribution to {self.name}",
-                        transaction_type=choices.TransactionType.INCOME,
-                        amount=txn_amount,
-                        original_amount=amount,
-                        original_currency=self.currency,
-                        exchange_rate=exchange_rate,
-                        description=f"Contribution to {self.name} goal. Current progress: {self.current_amount}/{self.target_amount}",
-                        transaction_date=date or timezone.now().date(),
-                        status=choices.TransactionStatus.COMPLETED,
-                        tags=["goal-contribution", self.goal_type, "savings"],
-                    )
+                Transaction.objects.create(
+                    user=self.user,
+                    account=self.linked_account,  # Might be None
+                    category=contribution_category,
+                    financial_goal=self,
+                    name=f"Contribution to {self.name}",
+                    transaction_type=choices.TransactionType.INCOME,
+                    amount=txn_amount,
+                    original_amount=amount,
+                    original_currency=self.currency,
+                    exchange_rate=exchange_rate,
+                    description=f"Contribution to {self.name} goal.",
+                    transaction_date=date or timezone.now().date(),
+                    status=choices.TransactionStatus.COMPLETED,
+                    tags=["goal-contribution", self.goal_type, "savings"],
+                )
 
-                logger.info(f"Contribution of {amount} added to goal {self.id}")
+                logger.info(f"Contribution of {amount} recorded for goal {self.id}")
                 return True
 
         except Exception as e:

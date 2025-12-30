@@ -1955,18 +1955,8 @@ class TransactionViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
-            # Atomic deletion with balance adjustment
+            # Atomic deletion (Balance and Goal updates now handled in Transaction.delete)
             with db_transaction.atomic():
-                # Adjust balance if transaction was completed
-                if instance.status == TransactionStatus.COMPLETED and instance.account:
-                    # Reverse the transaction amount
-                    reverse_type = (
-                        choices.TransactionType.EXPENSE
-                        if instance.transaction_type == choices.TransactionType.INCOME
-                        else choices.TransactionType.INCOME
-                    )
-                    instance.account.update_balance(instance.amount, reverse_type)
-
                 # Soft delete transfer pair if exists
                 if instance.is_transfer and instance.transfer_reference:
                     try:
