@@ -1741,9 +1741,12 @@ class FinancialGoal(utils_models.BaseModel):
                 {"monthly_contribution": _("Monthly contribution cannot be negative.")}
             )
 
+        # Allow exceeding the target amount
         if self.current_amount > self.target_amount:
-            logger.warning("Current amount exceeds target amount")
-            self.current_amount = self.target_amount
+            logger.info(
+                f"Financial goal '{self.name}' ({self.id}) has exceeded its target: "
+                f"{self.current_amount}/{self.target_amount}"
+            )
 
         # Validate dates
         if self.target_date <= self.start_date:
@@ -1835,7 +1838,8 @@ class FinancialGoal(utils_models.BaseModel):
                 self.current_amount += amount
                 self.save()
 
-                # Create a transaction record if linked to account
+                # Create an INCOME transaction record if linked to account
+                # This increases the account's balance as requested by the user.
                 if self.linked_account:
                     from .models import Transaction
 
@@ -1847,7 +1851,9 @@ class FinancialGoal(utils_models.BaseModel):
                             amount, self.linked_account.currency
                         )
                         if txn_amount is not None:
-                            exchange_rate = txn_amount / amount
+                            exchange_rate = (txn_amount / amount).quantize(
+                                Decimal("0.000001"), rounding="ROUND_HALF_UP"
+                            )
                         else:
                             logger.error(
                                 f"Currency conversion failed for contribution: "
@@ -1855,24 +1861,28 @@ class FinancialGoal(utils_models.BaseModel):
                             )
                             txn_amount = amount  # Fallback
 
+                    # Get or create a "Savings Contribution" category
+                    contribution_category, _ = Category.objects.get_or_create(
+                        user=self.user,
+                        name="Goal Contribution",
+                        category_type=choices.TransactionType.INCOME,
+                        defaults={"is_system_category": False},
+                    )
+
                     Transaction.objects.create(
                         user=self.user,
                         account=self.linked_account,
-                        category=Category.objects.get_or_create(
-                            user=self.user,
-                            name="Savings",
-                            category_type=choices.TransactionType.EXPENSE,
-                        )[0],
-                        name=f"Goal Contribution: {self.name}",
-                        transaction_type=choices.TransactionType.EXPENSE,
+                        category=contribution_category,
+                        name=f"Contribution to {self.name}",
+                        transaction_type=choices.TransactionType.INCOME,
                         amount=txn_amount,
                         original_amount=amount,
                         original_currency=self.currency,
                         exchange_rate=exchange_rate,
-                        description=f"Contribution to {self.name} goal",
+                        description=f"Contribution to {self.name} goal. Current progress: {self.current_amount}/{self.target_amount}",
                         transaction_date=date or timezone.now().date(),
                         status=choices.TransactionStatus.COMPLETED,
-                        tags=["goal-contribution", self.goal_type],
+                        tags=["goal-contribution", self.goal_type, "savings"],
                     )
 
                 logger.info(f"Contribution of {amount} added to goal {self.id}")

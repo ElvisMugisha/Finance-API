@@ -2432,11 +2432,39 @@ class FinancialGoalContributionSerializer(serializers.Serializer):
         if not success:
             raise serializers.ValidationError(_("Failed to add contribution."))
 
+        # Refresh objects to get updated balances
+        goal.refresh_from_db()
+        if goal.linked_account:
+            goal.linked_account.refresh_from_db()
+
+        exceeded_amount = Decimal("0.00")
+        if goal.current_amount > goal.target_amount:
+            exceeded_amount = goal.current_amount - goal.target_amount
+
         return {
             "goal_id": str(goal.id),
-            "new_amount": str(goal.current_amount),
-            "progress": str(goal.progress_percentage),
+            "goal_name": goal.name,
+            "target_amount": str(goal.target_amount),
+            "current_amount": str(goal.current_amount),
+            "progress_percentage": float(goal.progress_percentage),
             "is_achieved": goal.is_achieved,
+            "is_exceeded": goal.current_amount > goal.target_amount,
+            "exceeded_amount": str(exceeded_amount),
+            "currency": goal.currency.code,
+            "linked_account_balance": (
+                str(goal.linked_account.current_balance)
+                if goal.linked_account
+                else None
+            ),
+            "message": (
+                _("Goal exceeded!")
+                if goal.current_amount > goal.target_amount
+                else (
+                    _("Goal achieved!")
+                    if goal.is_achieved
+                    else _("Contribution added successfully.")
+                )
+            ),
         }
 
 
