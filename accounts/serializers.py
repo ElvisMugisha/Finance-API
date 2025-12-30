@@ -1674,8 +1674,11 @@ class BudgetSerializer(BaseBudgetSerializer):
         return obj.get_utilization_percentage()
 
     def get_available_amount(self, obj: Budget) -> str:
-        """Get available budget amount."""
-        return str(obj.total_budget + obj.rollover_amount)
+        """Get available budget amount (0 if over budget)."""
+        available = obj.total_remaining
+        if available < 0:
+            return "0.00"
+        return str(available)
 
     def get_is_over_budget_flag(self, obj: Budget) -> bool:
         """Check if budget is exceeded."""

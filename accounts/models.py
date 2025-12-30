@@ -290,24 +290,32 @@ class Account(utils_models.BaseModel):
 
         try:
             with transaction.atomic():
+                # Lock the account for update to prevent race conditions
+                # Use select_for_update() to lock the row until the transaction finishes
+                account = Account.objects.select_for_update().get(pk=self.pk)
+
                 if transaction_type == choices.TransactionType.INCOME:
-                    self.current_balance += amount
+                    account.current_balance += amount
                 elif transaction_type == choices.TransactionType.EXPENSE:
-                    self.current_balance -= amount
+                    account.current_balance -= amount
                 else:
                     logger.error(
                         f"Invalid transaction type for balance update: {transaction_type}"
                     )
                     return False
 
-                self.balance_updated_at = timezone.now()
-                self.save(
+                account.balance_updated_at = timezone.now()
+                account.save(
                     update_fields=[
                         "current_balance",
                         "balance_updated_at",
                         "updated_at",
                     ]
                 )
+
+                # Update local instance to reflect changes
+                self.current_balance = account.current_balance
+                self.balance_updated_at = account.balance_updated_at
 
                 logger.debug(
                     f"Updated balance for account {self.id}: {self.current_balance}"
@@ -787,12 +795,21 @@ class Transaction(utils_models.BaseModel):
         old_goal = None
         old_date = None
 
+        old_account = None
+        old_type = None
+
         # Check update_fields to avoid unnecessary balance processing
         update_fields = kwargs.get("update_fields")
+
+        # Always check balance if generic save (update_fields is None) or if critical fields are updated
+        # Critical fields: status, amount, account, transaction_type
         should_check_balance = True
         if update_fields is not None:
-            if "status" not in update_fields and "amount" not in update_fields:
+            critical_fields = {"status", "amount", "account", "transaction_type"}
+            if not any(field in update_fields for field in critical_fields):
                 should_check_balance = False
+
+        old_instance = None
 
         if not is_new and should_check_balance:
             try:
@@ -803,61 +820,48 @@ class Transaction(utils_models.BaseModel):
                 old_category = old_instance.category
                 old_goal = old_instance.financial_goal
                 old_date = old_instance.transaction_date
+                old_account = old_instance.account
+                old_type = old_instance.transaction_type
             except Transaction.DoesNotExist:
                 pass
 
         # Save first
         super().save(*args, **kwargs)
 
-        # Handle Balance Updates
+        # Handle Balance Updates using Revert-and-Apply pattern for robustness
+        # This handles Account changes, Type changes, Amount changes, and Status changes uniformly
         if should_check_balance:
-            amount_diff = Decimal("0.00")
             completed_states = [
                 choices.TransactionStatus.COMPLETED,
                 choices.TransactionStatus.RECONCILED,
             ]
 
-            is_completed = self.status in completed_states
-
-            if is_new:
-                if is_completed:
-                    amount_diff = self.amount
-            else:
-                was_completed = old_status in completed_states if old_status else False
-
-                if not was_completed and is_completed:
-                    # Became completed
-                    amount_diff = self.amount
-                elif was_completed and not is_completed:
-                    # Un-completed (e.g. reverted to pending)
-                    amount_diff = -old_amount if old_amount else -self.amount
-                elif was_completed and is_completed:
-                    # Changed amount while staying completed
-                    current_amount = self.amount
-                    previous_amount = (
-                        old_amount if old_amount is not None else self.amount
-                    )
-                    if current_amount != previous_amount:
-                        amount_diff = current_amount - previous_amount
-
-            if amount_diff != 0:
-                logger.debug(
-                    f"Balance update for Tx {self.id}. Diff: {amount_diff}. "
-                    f"Old Status: {old_status}, New Status: {self.status}"
+            # Revert previous effect if it was completed
+            if (
+                not is_new
+                and old_instance
+                and old_account
+                and old_status in completed_states
+            ):
+                # Determined reversal type
+                reversal_type = (
+                    choices.TransactionType.EXPENSE
+                    if old_type == choices.TransactionType.INCOME
+                    else choices.TransactionType.INCOME
                 )
-                # Apply update manually to support negative diffs (reversals)
-                if self.transaction_type == choices.TransactionType.INCOME:
-                    self.account.current_balance += amount_diff
-                elif self.transaction_type == choices.TransactionType.EXPENSE:
-                    self.account.current_balance -= amount_diff
 
-                self.account.balance_updated_at = timezone.now()
-                self.account.save(
-                    update_fields=[
-                        "current_balance",
-                        "balance_updated_at",
-                        "updated_at",
-                    ]
+                # To reverse, we apply the amount with the OPPOSITE type
+                # e.g. To reverse an Income, we 'expense' it (subtract)
+                old_account.update_balance(old_amount, reversal_type)
+                logger.debug(
+                    f"Reversed balance effect for outdated transaction state {self.id}"
+                )
+
+            # Apply new effect if it is completed
+            if self.status in completed_states and self.account:
+                self.account.update_balance(self.amount, self.transaction_type)
+                logger.debug(
+                    f"Applied balance effect for new transaction state {self.id}"
                 )
 
         # Handle transfer logic
@@ -1382,18 +1386,48 @@ class Budget(utils_models.BaseModel):
                 categories = self.budget_categories.values_list("category", flat=True)
                 query &= Q(category__in=categories)
 
-            # Calculate total spending
-            spending = self.user.transactions.filter(query).aggregate(
+            # Calculate total spending with multi-currency support
+            transactions = self.user.transactions.filter(query)
+
+            # Group by account currency to handle conversions efficiently
+            currency_groups = transactions.values("account__currency").annotate(
                 total=Coalesce(Sum("amount"), Decimal("0.00"))
-            )["total"]
+            )
+
+            spending = Decimal("0.00")
+
+            for group in currency_groups:
+                currency_id = group["account__currency"]
+                total_amount = group["total"]
+
+                if not currency_id:
+                    continue
+
+                if currency_id == self.currency.id:
+                    spending += total_amount
+                else:
+                    try:
+                        source_currency = Currency.objects.get(id=currency_id)
+                        converted = source_currency.convert_amount(
+                            total_amount, self.currency
+                        )
+                        if converted is not None:
+                            spending += converted
+                    except Currency.DoesNotExist:
+                        logger.error(
+                            f"Missing currency {currency_id} during budget calc"
+                        )
+                        continue
 
             # Update if changed
             if spending != self.total_spent:
                 logger.info(f"Spending recalculated for budget {self.id}: {spending}")
                 self.total_spent = spending
                 # CRITICAL FIX: Also update total_remaining
+                # Formula: (Budget + Rollover) - Spent
+                # Negative result means Over Budget (Debt)
                 self.total_remaining = (
-                    self.total_budget - self.total_spent + self.rollover_amount
+                    self.total_budget + self.rollover_amount - self.total_spent
                 )
                 self.last_recalculated_at = timezone.now()
                 self.save(
@@ -1443,6 +1477,31 @@ class Budget(utils_models.BaseModel):
 
         try:
             with transaction.atomic():
+                # Archive current period
+                # Create a copy of the budget for history
+                archive_budget = Budget.objects.get(pk=self.pk)
+                archive_budget.pk = None
+                archive_budget.id = uuid.uuid4()
+                archive_budget.is_active = False
+                archive_budget.name = f"{self.name} (Archived {self.end_date})"
+                archive_budget.save()
+
+                # Copy budget categories to archive
+                for cat in self.budget_categories.all():
+                    BudgetCategory.objects.create(
+                        budget=archive_budget,
+                        category=cat.category,
+                        allocated_amount=cat.allocated_amount,
+                        spent_amount=cat.spent_amount,
+                        remaining_amount=cat.remaining_amount,
+                        percentage_used=cat.percentage_used,
+                    )
+
+                logger.info(
+                    f"Archived budget period ending {self.end_date} to {archive_budget.id}"
+                )
+
+                # Advance active budget
                 # Calculate rollover if enabled
                 new_rollover = Decimal("0.00")
                 if self.rollover_unused:
@@ -1471,7 +1530,19 @@ class Budget(utils_models.BaseModel):
                 self.total_remaining = self.total_budget + self.rollover_amount
 
                 self.save()
-                logger.info(f"Budget {self.id} advanced to new period")
+
+                # Reset budget categories for new period
+                for cat in self.budget_categories.all():
+                    cat.spent_amount = Decimal("0.00")
+                    cat.remaining_amount = (
+                        cat.allocated_amount
+                    )  # Reset to full allocation
+                    cat.percentage_used = Decimal("0.00")
+                    cat.save()
+
+                logger.info(
+                    f"Budget {self.id} advanced to new period: {self.start_date} - {self.end_date}"
+                )
                 return True
 
         except Exception as e:
@@ -1591,6 +1662,54 @@ class BudgetCategory(utils_models.BaseModel):
                 {"category": _("Budget categories must be expense categories.")}
             )
 
+        # Validate allocation against budget limit
+        # This enforces "Zero-Based" or "Envelope" budgeting
+        if self.budget:
+            # Calculate total funds available in the budget
+            total_budget_funds = self.budget.total_budget + self.budget.rollover_amount
+
+            # Calculate total ALREADY allocated to other categories
+            query = models.Q(budget=self.budget)
+            if self.pk:  # Exclude self if updating
+                query &= ~models.Q(pk=self.pk)
+
+            other_categories = BudgetCategory.objects.filter(query)
+
+            # Sum allocations
+            total_allocated = other_categories.aggregate(
+                total=Coalesce(Sum("allocated_amount"), Decimal("0.00"))
+            )["total"]
+
+            # Sum OVERSPENDING (spent > allocated)
+            total_overspent = Decimal("0.00")
+            for cat in other_categories:
+                if cat.spent_amount > cat.allocated_amount:
+                    total_overspent += cat.spent_amount - cat.allocated_amount
+
+            # Effective used amount = Allocations + Unplanned Overspending
+            other_allocations = total_allocated + total_overspent
+
+            # Check if new allocation fits
+            potential_total_allocations = other_allocations + self.allocated_amount
+
+            if potential_total_allocations > total_budget_funds:
+                available_to_allocate = max(
+                    total_budget_funds - other_allocations, Decimal("0.00")
+                )
+                logger.error(
+                    f"Allocation overflow for budget {self.budget.id}. "
+                    f"Limit: {total_budget_funds}, Current: {other_allocations}, Requested: {self.allocated_amount}"
+                )
+                raise ValidationError(
+                    {
+                        "allocated_amount": _(
+                            f"Allocation exceeds budget limit. "
+                            f"Total budget funds: {total_budget_funds}. "
+                            f"Available to allocate: {available_to_allocate}."
+                        )
+                    }
+                )
+
         logger.debug(f"Budget category validation passed: {self.id}")
 
     def save(self, *args, **kwargs) -> None:
@@ -1605,7 +1724,7 @@ class BudgetCategory(utils_models.BaseModel):
     def calculate_spending(self) -> Decimal:
         """Calculate spending for this category in budget period."""
         try:
-            spending = self.budget.user.transactions.filter(
+            transactions = self.budget.user.transactions.filter(
                 category=self.category,
                 transaction_type=choices.TransactionType.EXPENSE,
                 transaction_date__gte=self.budget.start_date,
@@ -1614,7 +1733,38 @@ class BudgetCategory(utils_models.BaseModel):
                     choices.TransactionStatus.COMPLETED,
                     choices.TransactionStatus.RECONCILED,
                 ],
-            ).aggregate(total=Coalesce(Sum("amount"), Decimal("0.00")))["total"]
+            )
+
+            # Initialize spending
+            spending = Decimal("0.00")
+            target_currency = self.budget.currency
+
+            # Group by account currency
+            currency_groups = transactions.values("account__currency").annotate(
+                total=Coalesce(Sum("amount"), Decimal("0.00"))
+            )
+
+            for group in currency_groups:
+                currency_id = group["account__currency"]
+                total = group["total"]
+
+                if not currency_id:
+                    continue
+
+                if currency_id == target_currency.id:
+                    spending += total
+                else:
+                    try:
+                        source_currency = Currency.objects.get(id=currency_id)
+                        converted = source_currency.convert_amount(
+                            total, target_currency
+                        )
+                        if converted is not None:
+                            spending += converted
+                    except Currency.DoesNotExist:
+                        continue
+
+            # spending = ... (calculated above)
 
             self.spent_amount = spending
             self.save(
@@ -1890,34 +2040,54 @@ class FinancialGoal(utils_models.BaseModel):
         try:
             logger.debug(f"Recalculating progress for goal {self.id}")
 
-            stats = self.transactions.filter(
+            transactions = self.transactions.filter(
                 status__in=[
                     choices.TransactionStatus.COMPLETED,
                     choices.TransactionStatus.RECONCILED,
                 ]
-            ).aggregate(
-                income=Coalesce(
-                    Sum(
-                        "amount",
-                        filter=models.Q(
-                            transaction_type=choices.TransactionType.INCOME
-                        ),
-                    ),
-                    Decimal("0.00"),
-                ),
-                expense=Coalesce(
-                    Sum(
-                        "amount",
-                        filter=models.Q(
-                            transaction_type=choices.TransactionType.EXPENSE
-                        ),
-                    ),
-                    Decimal("0.00"),
-                ),
             )
 
-            new_amount = stats["income"] - stats["expense"]
-            self.current_amount = max(Decimal("0.00"), new_amount)
+            total_saved = Decimal("0.00")
+
+            # We need to iterate to handle currencies correctly
+            # Optimization: Fetch related fields to avoid N+1
+            for tx in transactions.select_related(
+                "account__currency", "original_currency"
+            ):
+                amount_to_add = Decimal("0.00")
+
+                # Check if we can use original amount (preferred for precision)
+                if tx.original_currency_id == self.currency_id:
+                    amount_to_add = (
+                        tx.original_amount if tx.original_amount else Decimal("0.00")
+                    )
+                elif tx.account and tx.account.currency_id == self.currency_id:
+                    amount_to_add = tx.amount
+                else:
+                    # Conversion needed
+                    source_currency = None
+                    source_amount = Decimal("0.00")
+
+                    if tx.original_currency:
+                        source_currency = tx.original_currency
+                        source_amount = tx.original_amount
+                    elif tx.account:
+                        source_currency = tx.account.currency
+                        source_amount = tx.amount
+
+                    if source_currency:
+                        converted = source_currency.convert_amount(
+                            source_amount, self.currency
+                        )
+                        if converted:
+                            amount_to_add = converted
+
+                if tx.transaction_type == choices.TransactionType.INCOME:
+                    total_saved += amount_to_add
+                elif tx.transaction_type == choices.TransactionType.EXPENSE:
+                    total_saved -= amount_to_add
+
+            self.current_amount = max(Decimal("0.00"), total_saved)
 
             # Save will handle progress_percentage and achieving logic
             self.save(update_fields=["current_amount", "updated_at"])

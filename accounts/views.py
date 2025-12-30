@@ -977,11 +977,9 @@ class AccountViewSet(
             constraints["pending_count"] = pending_count
 
             # Budgets
-            budget_count = Budget.objects.filter(
-                models.Q(linked_account=account) | models.Q(accounts=account)
-            ).count()
-            constraints["linked_budgets"] = budget_count > 0
-            constraints["budget_count"] = budget_count
+            # Budgets are not directly linked to accounts in this version
+            constraints["linked_budgets"] = False
+            constraints["budget_count"] = 0
 
             # Financial goals
             goal_count = FinancialGoal.objects.filter(
@@ -2659,8 +2657,10 @@ class BudgetViewSet(
             200: OpenApiResponse(description="Period advanced successfully"),
             400: OpenApiResponse(description="Cannot advance period"),
             403: OpenApiResponse(description="Permission denied"),
+            403: OpenApiResponse(description="Permission denied"),
             404: OpenApiResponse(description="Budget not found"),
         },
+        request=None,
     )
     @action(detail=True, methods=["post"], url_path="advance-period")
     def advance_period(self, request, id=None):
@@ -2841,10 +2841,68 @@ class BudgetCategoryViewSet(viewsets.ModelViewSet):
 
         return queryset.filter(budget__user=user)
 
+    def create(self, request, *args, **kwargs):
+        """Create budget category with error handling."""
+        try:
+            return super().create(request, *args, **kwargs)
+        except ValidationError as e:
+            return Response(
+                {
+                    "error": "Validation failed",
+                    "details": e.message_dict if hasattr(e, "message_dict") else str(e),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as e:
+            logger.error(f"Error creating budget category: {e}")
+            return Response(
+                {"error": "Failed to create budget category."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    def update(self, request, *args, **kwargs):
+        """Update budget category with error handling."""
+        try:
+            return super().update(request, *args, **kwargs)
+        except ValidationError as e:
+            return Response(
+                {
+                    "error": "Validation failed",
+                    "details": e.message_dict if hasattr(e, "message_dict") else str(e),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as e:
+            logger.error(f"Error updating budget category: {e}")
+            return Response(
+                {"error": "Failed to update budget category."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    def partial_update(self, request, *args, **kwargs):
+        """Partial update budget category with error handling."""
+        try:
+            return super().partial_update(request, *args, **kwargs)
+        except ValidationError as e:
+            return Response(
+                {
+                    "error": "Validation failed",
+                    "details": e.message_dict if hasattr(e, "message_dict") else str(e),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as e:
+            logger.error(f"Error updating budget category: {e}")
+            return Response(
+                {"error": "Failed to update budget category."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
     @extend_schema(
         summary="Recalculate budget category",
         description="Manually recalculate spending for this budget category and its parent budget.",
         responses={200: BudgetCategorySerializer},
+        request=None,
     )
     @action(detail=True, methods=["post"], url_path="recalculate")
     def recalculate(self, request, id=None):
