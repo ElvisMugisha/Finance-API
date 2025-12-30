@@ -1,3 +1,7 @@
+import pandas as pd
+import io
+from django.core.files.base import ContentFile
+from xhtml2pdf import pisa
 from django.conf import settings
 from django.db import models
 from decimal import Decimal
@@ -33,9 +37,10 @@ from .filters import (
     BudgetCategoryFilter,
     FinancialGoalFilter,
     TransactionFilter,
+    ReportFilter,
 )
 
-from .models import Account, Budget, BudgetCategory, FinancialGoal, Transaction
+from .models import Account, Budget, BudgetCategory, FinancialGoal, Report, Transaction
 from .serializers import (
     AccountDetailSerializer,
     AccountListSerializer,
@@ -61,6 +66,7 @@ from .serializers import (
     TransactionVerificationSerializer,
     get_account_serializer,
     get_financial_goal_serializer,
+    get_report_serializer,
 )
 
 logger = loggings.setup_logging()
@@ -3008,3 +3014,515 @@ class FinancialGoalViewSet(viewsets.ModelViewSet):
                 {"error": _("Failed to generate summary.")},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+
+class ReportViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing and generating Financial Reports.
+
+    Features:
+    - On-demand report generation
+    - Support for multiple formats (JSON, CSV, PDF)
+    - Automatic cleanup logic for expired reports
+    - Advanced filtering by type, status, and periods
+    - Download capabilities for file-based reports
+
+    Execution Model:
+    Reports are created in PENDING status. This ViewSet currently
+    triggers synchronous generation, but is architected to easily
+    transition to asynchronous tasks (Celery).
+    """
+
+    queryset = Report.objects.all()
+    permission_classes = [IsOwnerOrAdmin]
+    pagination_class = CustomPageNumberPagination
+    filterset_class = ReportFilter
+    ordering_fields = ["created_at", "report_name", "report_type", "status"]
+    ordering = ["-created_at"]
+    http_method_names = ["get", "post", "delete", "head", "options"]
+
+    def get_queryset(self):
+        """Ensure users only see their own reports."""
+        return super().get_queryset().filter(user=self.request.user)
+
+    def get_serializer_class(self):
+        """Dynamic serializer selection based on action."""
+        return get_report_serializer(self.action)
+
+    def perform_create(self, serializer):
+        """
+        Create a report and trigger its generation.
+        """
+        report = serializer.save()
+
+        # Trigger generation
+        # In a real production app, this would be:
+        # generate_report_task.delay(report.id)
+        self._generate_report_data(report)
+
+    @extend_schema(
+        summary="Regenerate report",
+        request=None,
+        responses={200: OpenApiTypes.OBJECT},
+    )
+    @action(detail=True, methods=["post"], url_path="generate")
+    def regenerate(self, request, pk=None):
+        """Manually trigger regeneration of an existing report."""
+        report = self.get_object()
+
+        if report.status == choices.ReportStatus.PROCESSING:
+            return Response(
+                {"error": _("Report is already being processed.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        report.mark_as_processing()
+        self._generate_report_data(report)
+
+        return Response(
+            {"message": _("Report regeneration started."), "status": report.status}
+        )
+
+    @extend_schema(
+        summary="Cleanup expired reports",
+        request=None,
+        responses={200: OpenApiTypes.OBJECT},
+    )
+    @action(detail=False, methods=["post"], url_path="cleanup")
+    def cleanup(self, request):
+        """Trigger manual cleanup of expired reports."""
+        if not request.user.is_staff:
+            return Response(
+                {"error": _("Admins only.")}, status=status.HTTP_403_FORBIDDEN
+            )
+
+        stats = Report.cleanup_expired_reports()
+        return Response(stats)
+
+    @extend_schema(
+        summary="Download report file",
+        request=None,
+        responses={200: OpenApiTypes.OBJECT},
+    )
+    @action(detail=True, methods=["get"], url_path="download")
+    def download(self, request, pk=None):
+        """Handle report file download with proper headers."""
+        report = self.get_object()
+
+        if report.status != choices.ReportStatus.COMPLETED or not report.file:
+            return Response(
+                {"error": _("Report file is not available for download.")},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # In a real production setup, we would use a Redirect or FileResponse
+        # For now, we return the URL stored in the model
+        return Response({"download_url": report.get_download_url()})
+
+    def _generate_report_data(self, report):
+        """
+        Engine room for report generation.
+        Separates data gathering from the request-response cycle.
+        """
+        import time
+
+        start_time = time.time()
+        report.mark_as_processing()
+
+        try:
+            logger.info(
+                f"Starting generation for report {report.id} ({report.report_type})"
+            )
+
+            # Data Orchestration based on type
+            data = {}
+            if report.report_type == choices.ReportType.SPENDING_BY_CATEGORY:
+                data = self._gather_spending_data(report)
+            elif report.report_type == choices.ReportType.INCOME_VS_EXPENSE:
+                data = self._gather_income_expense_data(report)
+            elif report.report_type == choices.ReportType.NET_WORTH:
+                data = self._gather_net_worth_data(report)
+            elif report.report_type == choices.ReportType.BUDGET_VS_ACTUAL:
+                data = self._gather_budget_participation_data(report)
+            else:
+                # Fallback or generic logic
+                data = {
+                    "message": "Generic report data gathering not fully implemented."
+                }
+
+            duration = time.time() - start_time
+            report.mark_as_completed(data=data, duration=duration)
+
+            # Generate and save file if format is not JSON
+            if report.format != choices.ReportFormat.JSON:
+                self._save_report_file(report, data)
+
+            logger.info(f"Report {report.id} completed in {duration:.2f}s")
+
+        except Exception as e:
+            logger.exception(f"Critical failure during report generation {report.id}")
+            report.mark_as_failed(error=str(e))
+
+    def _gather_spending_data(self, report):
+        """Aggregate spending by category for the period."""
+        transactions = Transaction.objects.filter(
+            user=report.user,
+            transaction_date__range=[report.period_start, report.period_end],
+            transaction_type=choices.TransactionType.EXPENSE,
+            status__in=[
+                choices.TransactionStatus.COMPLETED,
+                choices.TransactionStatus.RECONCILED,
+            ],
+        )
+
+        # Filter by parameters if provided
+        category_ids = report.parameters.get("category_ids")
+        if category_ids:
+            transactions = transactions.filter(category_id__in=category_ids)
+
+        spending = (
+            transactions.values("category__name")
+            .annotate(total=Sum("amount"), count=Count("id"))
+            .order_by("-total")
+        )
+
+        return {
+            "period": f"{report.period_start} to {report.period_end}",
+            "total_spent": str(
+                transactions.aggregate(Sum("amount"))["amount__sum"] or 0
+            ),
+            "breakdown": [
+                {
+                    "category": s["category__name"],
+                    "amount": str(s["total"]),
+                    "count": s["count"],
+                }
+                for s in spending
+            ],
+        }
+
+    def _gather_income_expense_data(self, report):
+        """Detailed income vs expense comparison."""
+        transactions = Transaction.objects.filter(
+            user=report.user,
+            transaction_date__range=[report.period_start, report.period_end],
+            status__in=[
+                choices.TransactionStatus.COMPLETED,
+                choices.TransactionStatus.RECONCILED,
+            ],
+        )
+
+        stats = transactions.aggregate(
+            total_income=Coalesce(
+                Sum(
+                    "amount", filter=Q(transaction_type=choices.TransactionType.INCOME)
+                ),
+                Decimal("0.00"),
+            ),
+            total_expense=Coalesce(
+                Sum(
+                    "amount", filter=Q(transaction_type=choices.TransactionType.EXPENSE)
+                ),
+                Decimal("0.00"),
+            ),
+            income_count=Count(
+                "id", filter=Q(transaction_type=choices.TransactionType.INCOME)
+            ),
+            expense_count=Count(
+                "id", filter=Q(transaction_type=choices.TransactionType.EXPENSE)
+            ),
+        )
+
+        return {
+            "summary": {
+                "income": str(stats["total_income"]),
+                "expense": str(stats["total_expense"]),
+                "net_savings": str(stats["total_income"] - stats["total_expense"]),
+                "savings_rate": (
+                    float(
+                        (stats["total_income"] - stats["total_expense"])
+                        / stats["total_income"]
+                        * 100
+                    )
+                    if stats["total_income"] > 0
+                    else 0
+                ),
+            },
+            "counts": {
+                "income_transactions": stats["income_count"],
+                "expense_transactions": stats["expense_count"],
+            },
+        }
+
+    def _gather_net_worth_data(self, report):
+        """Snapshot of current assets and liabilities."""
+        accounts = Account.objects.filter(user=report.user, is_active=True)
+
+        assets = accounts.filter(
+            account_type__in=[
+                choices.AccountType.CHECKING,
+                choices.AccountType.SAVINGS,
+                choices.AccountType.CASH,
+                choices.AccountType.INVESTMENT,
+            ]
+        )
+
+        liabilities = accounts.filter(
+            account_type__in=[choices.AccountType.CREDIT_CARD, choices.AccountType.LOAN]
+        )
+
+        total_assets = (
+            assets.aggregate(Sum("current_balance"))["current_balance__sum"] or 0
+        )
+        total_liabilities = (
+            liabilities.aggregate(Sum("current_balance"))["current_balance__sum"] or 0
+        )
+
+        return {
+            "snapshot_date": str(report.period_end),
+            "net_worth": str(
+                Decimal(total_assets - total_liabilities).quantize(Decimal("0.01"))
+            ),
+            "assets": {
+                "total": str(Decimal(total_assets).quantize(Decimal("0.01"))),
+                "items": [
+                    {"name": a.name, "balance": str(a.current_balance)} for a in assets
+                ],
+            },
+            "liabilities": {
+                "total": str(Decimal(total_liabilities).quantize(Decimal("0.01"))),
+                "items": [
+                    {"name": a.name, "balance": str(a.current_balance)}
+                    for a in liabilities
+                ],
+            },
+        }
+
+    def _gather_budget_participation_data(self, report):
+        """Comparison of budget targets vs actual spending."""
+        # This would link to the Budget model
+        budgets = Budget.objects.filter(
+            user=report.user,
+            start_date__lte=report.period_end,
+            end_date__gte=report.period_start,
+        )
+
+        # Filter by specific budget if provided in parameters
+        budget_id = report.parameters.get("budget_id")
+        if budget_id:
+            budgets = budgets.filter(id=budget_id)
+
+        report_data = []
+        for budget in budgets:
+            report_data.append(
+                {
+                    "budget_name": budget.name,
+                    "limit": str(budget.total_budget),
+                    "spent": str(budget.total_spent),
+                    "remaining": str(budget.total_remaining),
+                    "utilization": float(budget.get_utilization_percentage()),
+                }
+            )
+
+        return {"active_budgets_count": len(report_data), "budgets": report_data}
+
+    def _save_report_file(self, report, data):
+        """
+        Convert report data to requested file format and save.
+        Utilizes pandas for robust data formatting.
+        """
+        try:
+            # Flatten data for tabular representation
+            flat_records = []
+
+            if report.report_type == choices.ReportType.SPENDING_BY_CATEGORY:
+                flat_records = data.get("breakdown", [])
+            elif report.report_type == choices.ReportType.INCOME_VS_EXPENSE:
+                # Convert nested dict to list of rows
+                flat_records = [
+                    {"Metric": "Total Income", "Value": data["summary"]["income"]},
+                    {"Metric": "Total Expense", "Value": data["summary"]["expense"]},
+                    {"Metric": "Net Savings", "Value": data["summary"]["net_savings"]},
+                    {
+                        "Metric": "Savings Rate",
+                        "Value": f"{data['summary']['savings_rate']}%",
+                    },
+                    {
+                        "Metric": "Income Count",
+                        "Value": data["counts"]["income_transactions"],
+                    },
+                    {
+                        "Metric": "Expense Count",
+                        "Value": data["counts"]["expense_transactions"],
+                    },
+                ]
+            elif report.report_type == choices.ReportType.NET_WORTH:
+                assets = [
+                    {"Type": "Asset", "Name": item["name"], "Balance": item["balance"]}
+                    for item in data["assets"]["items"]
+                ]
+                liabilities = [
+                    {
+                        "Type": "Liability",
+                        "Name": item["name"],
+                        "Balance": item["balance"],
+                    }
+                    for item in data["liabilities"]["items"]
+                ]
+                flat_records = assets + liabilities
+                flat_records.append(
+                    {
+                        "Type": "SUMMARY",
+                        "Name": "Net Worth",
+                        "Balance": data["net_worth"],
+                    }
+                )
+            elif report.report_type == choices.ReportType.BUDGET_VS_ACTUAL:
+                flat_records = data.get("budgets", [])
+
+            if not flat_records:
+                logger.warning(f"No records to export for report {report.id}")
+                return
+
+            df = pd.DataFrame(flat_records)
+            filename = f"{report.report_name.replace(' ', '_')}_{report.id}"
+
+            content = None
+            extension = ""
+
+            if report.format == choices.ReportFormat.EXCEL:
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                    df.to_excel(writer, index=False, sheet_name="Report")
+                content = output.getvalue()
+                extension = "xlsx"
+            elif report.format == choices.ReportFormat.CSV:
+                content = df.to_csv(index=False).encode("utf-8")
+                extension = "csv"
+            elif report.format == choices.ReportFormat.HTML:
+                content = df.to_html(index=False, classes="table table-striped").encode(
+                    "utf-8"
+                )
+                extension = "html"
+            elif report.format == choices.ReportFormat.PDF:
+                # Premium PDF rendering
+                html_string = self._render_report_to_html(report, data)
+                output = io.BytesIO()
+                pisa_status = pisa.CreatePDF(
+                    io.BytesIO(html_string.encode("UTF-8")), dest=output
+                )
+                if pisa_status.err:
+                    logger.error(f"PDF generation error for report {report.id}")
+                    return
+                content = output.getvalue()
+                extension = "pdf"
+            else:
+                logger.error(f"Unsupported file format for generation: {report.format}")
+                return
+
+            if content:
+                file_name = f"{filename}.{extension}"
+                report.file.save(file_name, ContentFile(content), save=True)
+                logger.info(f"File {file_name} saved for report {report.id}")
+
+        except Exception as e:
+            logger.exception(f"Failed to generate file for report {report.id}: {e}")
+
+    def _render_report_to_html(self, report, data):
+        """
+        Render a professional HTML template for PDF generation.
+        Includes premium styling and clean layout.
+        """
+        title = report.report_name
+        report_type = report.get_report_type_display()
+        period = f"{report.period_start} to {report.period_end}"
+        generated_at = report.created_at.strftime("%Y-%m-%d %H:%M")
+        user_name = report.user.get_full_name() or report.user.email
+
+        # Basic premium CSS
+        css = """
+            @page { size: A4; margin: 2cm; }
+            body { font-family: 'Helvetica', 'Arial', sans-serif; color: #333; line-height: 1.6; }
+            .header { text-align: center; margin-bottom: 30px; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+            .header h1 { color: #2c3e50; margin-bottom: 5px; }
+            .meta { font-size: 0.9em; color: #7f8c8d; margin-bottom: 20px; }
+            .section { margin-bottom: 30px; }
+            .section-title { font-size: 1.2em; color: #2980b9; font-weight: bold; margin-bottom: 10px; border-left: 5px solid #2980b9; padding-left: 10px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th { background-color: #f2f2f2; color: #2c3e50; text-align: left; padding: 10px; border: 1px solid #ddd; }
+            td { padding: 8px; border: 1px solid #ddd; }
+            .total-row { font-weight: bold; background-color: #ecf0f1; }
+            .summary-box { background-color: #f9f9f9; padding: 15px; border-radius: 5px; border: 1px solid #eee; }
+            .footer { position: fixed; bottom: 0; width: 100%; text-align: center; font-size: 0.7em; color: #bdc3c7; }
+        """
+
+        # Build dynamic rows based on report type
+        rows_html = ""
+        summary_html = ""
+
+        if report.report_type == choices.ReportType.SPENDING_BY_CATEGORY:
+            rows_html = "<table><thead><tr><th>Category</th><th>Amount</th><th>Transactions</th></tr></thead><tbody>"
+            for s in data.get("breakdown", []):
+                rows_html += f"<tr><td>{s['category']}</td><td>{s['amount']}</td><td>{s['count']}</td></tr>"
+            rows_html += "</tbody></table>"
+            summary_html = f"<div class='summary-box'><strong>Total Spending:</strong> {data.get('total_spent')}</div>"
+
+        elif report.report_type == choices.ReportType.INCOME_VS_EXPENSE:
+            summary = data.get("summary", {})
+            summary_html = f"""
+                <div class='summary-box'>
+                    <p><strong>Total Income:</strong> {summary.get('income')}</p>
+                    <p><strong>Total Expense:</strong> {summary.get('expense')}</p>
+                    <p><strong>Net Savings:</strong> {summary.get('net_savings')}</p>
+                    <p><strong>Savings Rate:</strong> {summary.get('savings_rate')}%</p>
+                </div>
+            """
+
+        elif report.report_type == choices.ReportType.NET_WORTH:
+            rows_html = "<table><thead><tr><th>Type</th><th>Account/Item</th><th>Balance</th></tr></thead><tbody>"
+            for item in data.get("assets", {}).get("items", []):
+                rows_html += f"<tr><td>Asset</td><td>{item['name']}</td><td>{item['balance']}</td></tr>"
+            for item in data.get("liabilities", {}).get("items", []):
+                rows_html += f"<tr><td>Liability</td><td>{item['name']}</td><td>{item['balance']}</td></tr>"
+            rows_html += f"<tr class='total-row'><td colspan='2'>NET WORTH</td><td>{data.get('net_worth')}</td></tr>"
+            rows_html += "</tbody></table>"
+
+        elif report.report_type == choices.ReportType.BUDGET_VS_ACTUAL:
+            rows_html = "<table><thead><tr><th>Budget Name</th><th>Limit</th><th>Spent</th><th>Remaining</th><th>Utilization</th></tr></thead><tbody>"
+            for b in data.get("budgets", []):
+                rows_html += f"<tr><td>{b['budget_name']}</td><td>{b['limit']}</td><td>{b['spent']}</td><td>{b['remaining']}</td><td>{b['utilization']}%</td></tr>"
+            rows_html += "</tbody></table>"
+
+        html = f"""
+            <html>
+            <head><style>{css}</style></head>
+            <body>
+                <div class="header">
+                    <h1>{title}</h1>
+                    <div class="meta">
+                        Type: {report_type} | User: {user_name} | Date: {generated_at}
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-title">Report Period</div>
+                    <p>{period}</p>
+                </div>
+
+                <div class="section">
+                    <div class="section-title">Details & Analysis</div>
+                    {rows_html}
+                </div>
+
+                <div class="section">
+                    <div class="section-title">Financial Summary</div>
+                    {summary_html}
+                </div>
+
+                <div class="footer">
+                    Generated by Finance API | &copy; {date.today().year} Elvis Mugisha
+                </div>
+            </body>
+            </html>
+        """
+        return html

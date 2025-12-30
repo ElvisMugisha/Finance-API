@@ -101,3 +101,22 @@ class BudgetCategoryFilter(django_filters.FilterSet):
             "budget": ["exact"],
             "category": ["exact"],
         }
+
+
+class ReportFilter(django_filters.FilterSet):
+    """
+    Advanced filtering for reports using django-filter.
+    """
+
+    start_date = django_filters.DateFilter(field_name="created_at", lookup_expr="gte")
+    end_date = django_filters.DateFilter(field_name="created_at", lookup_expr="lte")
+    period_start = django_filters.DateFilter(lookup_expr="gte")
+    period_end = django_filters.DateFilter(lookup_expr="lte")
+
+    class Meta:
+        model = Report
+        fields = {
+            "report_type": ["exact"],
+            "status": ["exact"],
+            "format": ["exact"],
+        }

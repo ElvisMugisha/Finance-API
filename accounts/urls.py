@@ -11,6 +11,7 @@ router.register(
 router.register(
     r"financial-goals", views.FinancialGoalViewSet, basename="financial-goal"
 )
+router.register(r"reports", views.ReportViewSet, basename="report")
 router.register(r"", views.AccountViewSet, basename="account")
 
 

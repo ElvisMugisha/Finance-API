@@ -253,6 +253,12 @@ SPECTACULAR_SETTINGS = {
         "persistAuthorization": True,
         "displayOperationId": True,
     },
+    "ENUM_NAME_OVERRIDES": {
+        "LoginStatusEnum": "utils.choices.LoginStatus",
+        "TransactionStatusEnum": "utils.choices.TransactionStatus",
+        "ReportStatusEnum": "utils.choices.ReportStatus",
+        "TransactionTypeEnum": "utils.choices.TransactionType",
+    },
 }
 
 # Cache

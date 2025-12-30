@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
@@ -17,7 +17,7 @@ from core.serializers import (
 )
 from utils import choices, loggings
 
-from .models import Account, Budget, BudgetCategory, FinancialGoal, Transaction
+from .models import Account, Budget, BudgetCategory, FinancialGoal, Report, Transaction
 
 logger = loggings.setup_logging()
 
@@ -2487,3 +2487,222 @@ def get_financial_goal_serializer(action: str):
         "contribute": FinancialGoalContributionSerializer,
     }
     return serializers_map.get(action, FinancialGoalSerializer)
+
+
+class ReportSerializer(serializers.ModelSerializer):
+    """
+    Base serializer for the Report model.
+
+    Provides common fields and read-only status handling for financial reports.
+    """
+
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    report_type_display = serializers.CharField(
+        source="get_report_type_display", read_only=True
+    )
+    format_display = serializers.CharField(source="get_format_display", read_only=True)
+
+    class Meta:
+        model = Report
+        fields = [
+            "id",
+            "report_name",
+            "report_type",
+            "report_type_display",
+            "period_start",
+            "period_end",
+            "format",
+            "format_display",
+            "status",
+            "status_display",
+            "created_at",
+            "generated_at",
+            "expires_at",
+        ]
+        read_only_fields = [
+            "id",
+            "status",
+            "created_at",
+            "generated_at",
+            "expires_at",
+            "status_display",
+            "report_type_display",
+            "format_display",
+        ]
+
+
+class ReportListSerializer(ReportSerializer):
+    """
+    Optimized serializer for listing reports.
+
+    Excludes heavy data fields to ensure performance when listing many reports.
+    """
+
+    class Meta(ReportSerializer.Meta):
+        pass
+
+
+class ReportDetailSerializer(ReportSerializer):
+    """
+    Comprehensive serializer for detailed report view.
+
+    Includes the actual generated data, metadata, and download links.
+    """
+
+    download_url = serializers.SerializerMethodField()
+
+    class Meta(ReportSerializer.Meta):
+        fields = ReportSerializer.Meta.fields + [
+            "data",
+            "parameters",
+            "error_message",
+            "generation_duration",
+            "file_size",
+            "checksum",
+            "download_url",
+        ]
+
+    @extend_schema_field(serializers.URLField())
+    def get_download_url(self, obj: Report) -> Optional[str]:
+        """Get the absolute download URL for the report file."""
+        return obj.get_download_url()
+
+
+class ReportCreateSerializer(serializers.ModelSerializer):
+    """
+    Serializer for initiating report generation.
+
+    Handles validation of report parameters and ensures period consistency.
+    """
+
+    class Meta:
+        model = Report
+        fields = [
+            "report_name",
+            "report_type",
+            "period_start",
+            "period_end",
+            "format",
+            "parameters",
+        ]
+
+    def validate(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Perform cross-field validation for report generation.
+
+        Checks:
+        1. Period end must be strictly after period start.
+        2. Period cannot span more than 5 years (performance safety).
+        3. End date cannot be more than 1 day in the future.
+        4. Validate report-specific parameters.
+        """
+        user = self.context["request"].user
+        period_start = data.get("period_start")
+        period_end = data.get("period_end")
+        report_type = data.get("report_type")
+        parameters = data.get("parameters", {})
+
+        # Date Range Validation
+        if period_end <= period_start:
+            raise serializers.ValidationError(
+                {"period_end": _("Period end must be after period start.")}
+            )
+
+        # Safety Period Check (e.g., max 5 years)
+        if (period_end - period_start).days > 365 * 5:
+            raise serializers.ValidationError(
+                {"period_start": _("Report period cannot exceed 5 years.")}
+            )
+
+        # Future Date Check
+        today = timezone.now().date()
+        if period_end > today + timedelta(days=1):
+            raise serializers.ValidationError(
+                {"period_end": _("Cannot generate reports for future dates.")}
+            )
+
+        # Parameter Validation and Property Checks
+        self._validate_report_parameters(user, report_type, parameters)
+
+        return data
+
+    def _validate_report_parameters(
+        self, user, report_type: str, parameters: Dict[str, Any]
+    ) -> None:
+        """
+        Validate parameters based on the requested report type.
+        Ensures user owns any IDs passed in parameters.
+        """
+        if not isinstance(parameters, dict):
+            raise serializers.ValidationError(
+                {"parameters": _("Parameters must be a JSON object.")}
+            )
+
+        # Check account ownership if provided
+        account_id = parameters.get("account_id")
+        if account_id:
+            if not Account.objects.filter(id=account_id, user=user).exists():
+                raise serializers.ValidationError(
+                    {"parameters": _("Invalid account_id provided.")}
+                )
+
+        # Check category ownership if provided (for category-specific reports)
+        category_id = parameters.get("category_id")
+        if category_id:
+            if not Category.objects.filter(
+                models.Q(id=category_id)
+                & (models.Q(user=user) | models.Q(is_system_category=True))
+            ).exists():
+                raise serializers.ValidationError(
+                    {"parameters": _("Invalid category_id provided.")}
+                )
+
+        # Report-specific logic
+        if report_type == choices.ReportType.SPENDING_BY_CATEGORY:
+            # Maybe allow filtering by multiple categories
+            category_ids = parameters.get("category_ids", [])
+            if category_ids:
+                provided_count = len(category_ids)
+                actual_count = Category.objects.filter(
+                    models.Q(id__in=category_ids)
+                    & (models.Q(user=user) | models.Q(is_system_category=True))
+                ).count()
+                if provided_count != actual_count:
+                    raise serializers.ValidationError(
+                        {"parameters": _("One or more category IDs are invalid.")}
+                    )
+
+        elif report_type == choices.ReportType.BUDGET_VS_ACTUAL:
+            budget_id = parameters.get("budget_id")
+            if budget_id:
+                if not Budget.objects.filter(id=budget_id, user=user).exists():
+                    raise serializers.ValidationError(
+                        {"parameters": _("Invalid budget_id provided.")}
+                    )
+
+    def create(self, validated_data: Dict[str, Any]) -> Report:
+        """Create a report instance for the current user."""
+        request = self.context.get("request")
+        if not request or not request.user.is_authenticated:
+            raise serializers.ValidationError(_("Authentication required."))
+
+        validated_data["user"] = request.user
+        return super().create(validated_data)
+
+
+def get_report_serializer(action: str):
+    """
+    Factory function to retrieve the appropriate Report serializer.
+
+    Args:
+        action (str): The ViewSet action name.
+
+    Returns:
+        Type[Serializer]: The serializer class.
+    """
+    serializers_map = {
+        "list": ReportListSerializer,
+        "retrieve": ReportDetailSerializer,
+        "create": ReportCreateSerializer,
+    }
+    return serializers_map.get(action, ReportSerializer)
