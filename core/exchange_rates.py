@@ -1,9 +1,9 @@
-import requests
 from decimal import Decimal, InvalidOperation
 
-from django.utils.timezone import now
-from django.core.cache import cache
+import requests
 from django.conf import settings
+from django.core.cache import cache
+from django.utils.timezone import now
 
 from core.models import Currency
 from utils import loggings
@@ -35,7 +35,10 @@ def fetch_from_currency_layer():
         logger.warning("CurrencyLayer API key is not configured.")
         raise ValueError("CURRENCY_LAYER_API_KEY is missing in settings.")
 
-    url = f"http://api.currencylayer.com/live?access_key={settings.CURRENCY_LAYER_API_KEY}&source={settings.BASE_CURRENCY}&format=1"
+    url = (
+        f"http://api.currencylayer.com/live?access_key={settings.CURRENCY_LAYER_API_KEY}"
+        f"&source={settings.BASE_CURRENCY}&format=1"
+    )
     logger.info("Fetching rates from CurrencyLayer...")
     response = requests.get(url, timeout=10)
     response.raise_for_status()

@@ -1,13 +1,11 @@
-from datetime import timedelta
 from typing import Any, Dict, Optional
 
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
-from rest_framework import serializers, status
+from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
-from rest_framework.response import Response
 
 from utils import choices, loggings
 from utils.throttlings import (

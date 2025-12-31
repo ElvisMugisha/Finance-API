@@ -1,10 +1,7 @@
-﻿import csv
-import os
+﻿import os
 from typing import Dict, List
 
 import pandas as pd
-from django.conf import settings
-from django.http import HttpResponse
 
 from utils import loggings
 

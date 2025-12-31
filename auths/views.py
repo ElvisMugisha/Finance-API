@@ -6,10 +6,8 @@ from django.conf import settings
 from django.contrib.auth import logout as django_logout
 from django.db import models, transaction
 from django.utils import timezone
-from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import generics, serializers, status
-from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -436,7 +434,7 @@ class LoginView(APIView):
                 status=status.HTTP_200_OK,
             )
 
-        except Exception as e:
+        except Exception:
             # Unexpected Error Handling
             logger.exception(
                 "Unexpected error during login",
@@ -680,7 +678,7 @@ class PasswordChangeView(APIView):
                 status=status.HTTP_200_OK,
             )
 
-        except Exception as exc:
+        except Exception:
             logger.exception(
                 "Unexpected error during password change",
                 extra={"user_id": user.id},
@@ -1044,7 +1042,7 @@ class UserListView(generics.ListAPIView):
                     settings.MEDIA_URL + f"exports/users_export_{timestamp}.xlsx"
                 )
                 logger.info(
-                    f"Excel export completed",
+                    "Excel export completed",
                     extra={
                         "requested_by": request.user.id,
                         "record_count": len(flattened_data),
@@ -1155,7 +1153,7 @@ class UserProfileManageView(generics.GenericAPIView):
             )
             raise
 
-        except Exception as exc:
+        except Exception:
             logger.exception(
                 "Unexpected error during profile upsert",
                 extra={"user_id": user.id},

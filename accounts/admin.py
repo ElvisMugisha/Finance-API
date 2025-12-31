@@ -1,12 +1,13 @@
 from django.contrib import admin
 from django.utils.translation import gettext_lazy as _
+
 from .models import (
     Account,
-    Transaction,
     Budget,
     FinancialGoal,
-    Report,
     RecurringTransaction,
+    Report,
+    Transaction,
 )
 
 

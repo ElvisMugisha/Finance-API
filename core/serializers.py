@@ -1,12 +1,11 @@
-from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Union
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import models
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
-from drf_spectacular.utils import extend_schema_field
-from rest_framework import exceptions, serializers
+from rest_framework import serializers
 
 from utils import loggings
 
@@ -772,7 +771,7 @@ class CategoryCreateUpdateSerializer(BaseCategorySerializer):
                 {
                     "name": _(
                         f"A category with name '{name}' and type '{category_type}' "
-                        f"already exists."
+                        "already exists."
                     )
                 }
             )
@@ -817,6 +816,8 @@ class CategoryCreateUpdateSerializer(BaseCategorySerializer):
 
         # Security: protect system categories from regular users
         if instance.is_system_category and not is_staff:
+            from rest_framework.exceptions import PermissionDenied
+
             raise PermissionDenied(_("System categories are read-only."))
 
         # Security: protect critical fields from regular users

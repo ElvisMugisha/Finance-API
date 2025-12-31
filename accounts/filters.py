@@ -1,7 +1,4 @@
 import django_filters
-from django.db import models
-from django.db.models import Q
-from rest_framework.request import Request
 
 from accounts.models import (
     Account,

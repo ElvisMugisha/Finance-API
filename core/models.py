@@ -12,6 +12,7 @@ from django.utils.translation import gettext_lazy as _
 
 from utils import choices, loggings, utils
 from utils.models import BaseModel
+
 from .managers import CategoryManager, CurrencyManager
 
 # Initialize logger

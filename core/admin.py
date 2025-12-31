@@ -1,12 +1,13 @@
+from django.conf import settings
 from django.contrib import admin, messages
+from django.core.cache import cache
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
-from django.conf import settings
-from django.core.cache import cache
 
-from .models import Category, Currency
-from . import exchange_rates
 from utils import loggings
+
+from . import exchange_rates
+from .models import Category, Currency
 
 logger = loggings.setup_logging()
 

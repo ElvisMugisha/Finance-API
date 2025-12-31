@@ -1,17 +1,18 @@
-import pandas as pd
 import io
-from django.core.files.base import ContentFile
-from xhtml2pdf import pisa
-from django.conf import settings
-from django.db import models
-from decimal import Decimal
 from datetime import date, timedelta
+from decimal import Decimal
+from typing import Any, Dict, List
+
+import pandas as pd
+from django.conf import settings
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.core.files.base import ContentFile
+from django.db import models
 from django.db import transaction as db_transaction
-from django.db.models import Count, Q, Sum, Avg, Min, Max
-from django.db.models.functions import TruncMonth, TruncWeek, TruncDay, Coalesce
+from django.db.models import Avg, Count, Max, Min, Q, Sum
+from django.db.models.functions import Coalesce, TruncDay, TruncMonth, TruncWeek
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
-from django.core.exceptions import ValidationError
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
     OpenApiParameter,
@@ -20,12 +21,10 @@ from drf_spectacular.utils import (
     inline_serializer,
 )
 from rest_framework import mixins, serializers, status, viewsets
-from rest_framework.exceptions import (
-    PermissionDenied,
-    ValidationError as DRFValidationError,
-)
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.response import Response
+from xhtml2pdf import pisa
 
 from utils import choices, loggings, throttlings
 from utils.paginations import CustomPageNumberPagination
@@ -33,51 +32,47 @@ from utils.permissions import IsOwnerOrAdmin
 
 from .filters import (
     AccountFilter,
-    BudgetFilter,
     BudgetCategoryFilter,
+    BudgetFilter,
     FinancialGoalFilter,
-    TransactionFilter,
     ReportFilter,
+    TransactionFilter,
 )
-
 from .models import (
     Account,
     Budget,
     BudgetCategory,
     FinancialGoal,
+    RecurringTransaction,
     Report,
     Transaction,
-    RecurringTransaction,
 )
 from .serializers import (
     AccountDetailSerializer,
     AccountListSerializer,
     AccountReconcileSerializer,
     AccountSerializer,
-    BaseBudgetSerializer,
+    AnalyticsDashboardSerializer,
+    AnalyticsForecastSerializer,
+    BudgetCategorySerializer,
     BudgetCreateSerializer,
     BudgetDetailSerializer,
     BudgetListSerializer,
     BudgetRecalculateSerializer,
     BudgetSerializer,
     BudgetUpdateSerializer,
-    BudgetCategorySerializer,
     FinancialGoalContributionSerializer,
-    FinancialGoalCreateSerializer,
-    FinancialGoalDetailSerializer,
     FinancialGoalListSerializer,
     FinancialGoalSerializer,
-    FinancialGoalUpdateSerializer,
+    RecurringTransactionSerializer,
     TransactionCreateSerializer,
+    TransactionReconciliationSerializer,
     TransactionSerializer,
     TransactionUpdateSerializer,
     TransactionVerificationSerializer,
     get_account_serializer,
     get_financial_goal_serializer,
     get_report_serializer,
-    RecurringTransactionSerializer,
-    AnalyticsDashboardSerializer,
-    AnalyticsForecastSerializer,
 )
 from .services import AnalyticsService
 
@@ -598,8 +593,6 @@ class AccountViewSet(
         Returns:
             Detailed error message with specific reason
         """
-        from .models import Budget, FinancialGoal, Transaction
-
         # 1. Check for completed transactions
         if account.transaction_count > 0:
             return (
@@ -768,198 +761,8 @@ class AccountViewSet(
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-    @extend_schema(
-        summary="Get account balance history",
-        description="Get historical balance data aggregated by interval (daily, weekly, monthly).",
-        parameters=[
-            OpenApiParameter(
-                "start_date",
-                OpenApiTypes.DATE,
-                description="Start date (YYYY-MM-DD), defaults to 30 days ago",
-            ),
-            OpenApiParameter(
-                "end_date",
-                OpenApiTypes.DATE,
-                description="End date (YYYY-MM-DD), defaults to today",
-            ),
-            OpenApiParameter(
-                "interval",
-                OpenApiTypes.STR,
-                enum=["daily", "weekly", "monthly"],
-                default="daily",
-            ),
-        ],
-        responses={200: OpenApiResponse(description="Balance history data")},
-    )
-    @action(detail=True, methods=["get"], url_path="balance-history")
-    def balance_history(self, request, id=None):
-        """Get account balance history."""
-        try:
-            account = self.get_object()
-
-            # Parse params
-            end_date = request.query_params.get("end_date")
-            start_date = request.query_params.get("start_date")
-            interval = request.query_params.get("interval", "daily")
-
-            today = timezone.now().date()
-
-            if end_date:
-                end_date_obj = date.fromisoformat(end_date)
-            else:
-                end_date_obj = today
-
-            if start_date:
-                start_date_obj = date.fromisoformat(start_date)
-            else:
-                start_date_obj = end_date_obj - timedelta(days=30)
-
-            # Align dates to interval
-            if interval == "monthly":
-                start_date_obj = start_date_obj.replace(day=1)
-            elif interval == "weekly":
-                start_date_obj = start_date_obj - timedelta(
-                    days=start_date_obj.weekday()
-                )
-
-            if start_date_obj > end_date_obj:
-                return Response(
-                    {"error": "Start date must be before end date"},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            # Calculation Logic:
-            # 1. Calculate Opening Balance at start_date_obj
-            pre_start_net = Transaction.objects.filter(
-                account=account,
-                transaction_date__lt=start_date_obj,
-                status__in=[
-                    choices.TransactionStatus.COMPLETED,
-                    choices.TransactionStatus.RECONCILED,
-                ],
-            ).aggregate(
-                income=Coalesce(
-                    Sum(
-                        "amount",
-                        filter=Q(transaction_type=choices.TransactionType.INCOME),
-                    ),
-                    Decimal("0.00"),
-                ),
-                expense=Coalesce(
-                    Sum(
-                        "amount",
-                        filter=Q(transaction_type=choices.TransactionType.EXPENSE),
-                    ),
-                    Decimal("0.00"),
-                ),
-            )
-
-            formatted_initial = (
-                Decimal(str(account.initial_balance))
-                if not isinstance(account.initial_balance, Decimal)
-                else account.initial_balance
-            )
-            opening_balance = (
-                formatted_initial + pre_start_net["income"] - pre_start_net["expense"]
-            )
-
-            # 2. Group transactions in range
-            trunc_func = {
-                "daily": TruncDay,
-                "weekly": TruncWeek,
-                "monthly": TruncMonth,
-            }.get(interval, TruncDay)
-
-            period_changes = (
-                Transaction.objects.filter(
-                    account=account,
-                    transaction_date__gte=start_date_obj,
-                    transaction_date__lte=end_date_obj,
-                    status__in=[
-                        choices.TransactionStatus.COMPLETED,
-                        choices.TransactionStatus.RECONCILED,
-                    ],
-                )
-                .annotate(period=trunc_func("transaction_date"))
-                .values("period")
-                .annotate(
-                    income=Coalesce(
-                        Sum(
-                            "amount",
-                            filter=Q(transaction_type=choices.TransactionType.INCOME),
-                        ),
-                        Decimal("0.00"),
-                    ),
-                    expense=Coalesce(
-                        Sum(
-                            "amount",
-                            filter=Q(transaction_type=choices.TransactionType.EXPENSE),
-                        ),
-                        Decimal("0.00"),
-                    ),
-                )
-                .order_by("period")
-            )
-
-            changes_map = {
-                (
-                    item["period"].date()
-                    if hasattr(item["period"], "date")
-                    else item["period"]
-                ): item
-                for item in period_changes
-            }
-
-            # 3. Generate history
-            history = []
-            current_date = start_date_obj
-            running_balance = opening_balance
-
-            # Helper for next date
-            def get_next_date(d, interval):
-                if interval == "monthly":
-                    # Add month safely
-                    next_month = d.replace(day=28) + timedelta(days=4)
-                    return next_month.replace(day=1)
-                elif interval == "weekly":
-                    return d + timedelta(weeks=1)
-                return d + timedelta(days=1)
-
-            while current_date <= end_date_obj:
-                impact = changes_map.get(
-                    current_date, {"income": Decimal("0"), "expense": Decimal("0")}
-                )
-
-                # IMPORTANT: Income adds to balance, Expense subtracts
-                net_change = impact["income"] - impact["expense"]
-                closing_balance = running_balance + net_change
-
-                history.append(
-                    {
-                        "date": current_date,
-                        "balance": str(closing_balance),
-                        "income": str(impact["income"]),
-                        "expense": str(impact["expense"]),
-                        "currency": account.currency.code,
-                    }
-                )
-
-                running_balance = closing_balance
-                current_date = get_next_date(current_date, interval)
-
-            return Response(history)
-
-        except Exception as e:
-            return self._handle_api_error(
-                e,
-                "Failed to get balance history.",
-                status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
     def _get_deletion_constraints(self, account: Account) -> Dict[str, Any]:
         """Get detailed information about deletion constraints."""
-        from .models import Budget, FinancialGoal, Transaction
-
         constraints = {
             "has_transactions": account.transaction_count > 0,
             "transaction_count": account.transaction_count,
@@ -1959,7 +1762,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
 
             # Check permissions for deletion
             if (
-                instance.status == TransactionStatus.RECONCILED
+                instance.status == choices.TransactionStatus.RECONCILED
                 and not request.user.is_staff
             ):
                 return Response(

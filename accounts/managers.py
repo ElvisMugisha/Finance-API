@@ -1,9 +1,9 @@
 import uuid
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from django.db import models
-from django.db.models import Case, Sum, Value, When, Q
+from django.db.models import Case, Q, Sum, Value, When
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 

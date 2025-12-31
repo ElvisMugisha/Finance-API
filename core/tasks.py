@@ -1,4 +1,5 @@
 from celery import shared_task
+
 from core.exchange_rates import update_exchange_rates
 from utils import loggings
 

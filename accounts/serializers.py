@@ -3,15 +3,15 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import models, transaction as db_transaction
+from django.db import models
+from django.db import transaction as db_transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import extend_schema_field
-from rest_framework import exceptions, serializers
+from rest_framework import serializers
 
 from core.models import Category, Currency
 from core.serializers import (
-    CurrencySerializer,
     CategoryListSerializer,
     CurrencyListSerializer,
 )
@@ -22,9 +22,9 @@ from .models import (
     Budget,
     BudgetCategory,
     FinancialGoal,
+    RecurringTransaction,
     Report,
     Transaction,
-    RecurringTransaction,
 )
 
 logger = loggings.setup_logging()
@@ -786,10 +786,8 @@ class AccountReconcileSerializer(serializers.Serializer):
             Reconciliation result
         """
         account = self.context["account"]
-        user = self._get_request_user()
 
         reconciled_balance = validated_data["reconciled_balance"]
-        reconciliation_date = validated_data.get("reconciliation_date")
         notes = validated_data.get("notes", "")
 
         logger.info(
@@ -1281,9 +1279,6 @@ class TransactionSerializer(serializers.ModelSerializer):
         """
         try:
             with db_transaction.atomic():
-                # Track status change for balance update
-                old_status = instance.status
-                old_amount = instance.amount
 
                 # Update fields
                 for attr, value in validated_data.items():
@@ -1388,6 +1383,21 @@ class TransactionVerificationSerializer(serializers.ModelSerializer):
         # Account balance is updated automatically by Transaction.save() logic
         # when status changes to COMPLETED.
 
+        return instance
+
+
+class TransactionReconciliationSerializer(serializers.ModelSerializer):
+    """Serializer for reconciling transactions."""
+
+    class Meta:
+        model = Transaction
+        fields = ["status"]
+        read_only_fields = ["status"]
+
+    def update(self, instance, validated_data):
+        """Mark transaction as reconciled."""
+        instance.status = choices.TransactionStatus.RECONCILED
+        instance.save()
         return instance
 
 
@@ -2189,7 +2199,7 @@ class BudgetRecalculateSerializer(serializers.Serializer):
 
         try:
             # Calculate spending
-            spending = budget.calculate_spending()
+            budget.calculate_spending()
 
             return {
                 "budget_id": str(budget.id),

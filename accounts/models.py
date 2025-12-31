@@ -2,17 +2,21 @@ import hashlib
 import json
 import uuid
 from datetime import date, timedelta
-from decimal import Decimal
-from typing import Any, Dict, Optional
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import DatabaseError, models, transaction
-from django.db.models import Case, Count, Q, Sum, Value, When
+from django.db import models, transaction
+from django.db.models import Q, Sum
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+
+from core.models import Category, Currency
+from utils import choices, loggings
+from utils import models as utils_models
+from utils import utils
 
 from .managers import (
     AccountManager,
@@ -21,10 +25,6 @@ from .managers import (
     ReportManager,
     TransactionManager,
 )
-from core.models import Category, Currency
-from utils import choices, loggings
-from utils import models as utils_models
-from utils import utils
 
 # Initialize logger
 logger = loggings.setup_logging()
@@ -354,9 +354,10 @@ class Account(utils_models.BaseModel):
         Returns:
             List of balance snapshots
         """
-        from .models import Transaction
-        from django.db.models import Sum, Case, When, Value, F
+        from django.db.models import Case, Sum, Value, When
         from django.db.models.functions import Coalesce
+
+        from .models import Transaction
 
         if start_date is None:
             start_date = timezone.now().date() - timedelta(days=30)
