@@ -1131,8 +1131,8 @@ class TransactionSerializer(serializers.ModelSerializer):
                     }
                 )
 
-        # Validate currency conversion consistency
-        self._validate_currency_conversion(data, instance)
+        # Handle currency conversion automatically
+        self._handle_currency_conversion(data, instance)
 
         # Validate transfer consistency if needed
         if data.get("is_transfer", getattr(instance, "is_transfer", False)):
@@ -1163,46 +1163,77 @@ class TransactionSerializer(serializers.ModelSerializer):
                 {"transfer_account": _("Transfer account is required for transfers.")}
             )
 
-    def _validate_currency_conversion(
+    def _handle_currency_conversion(
         self, data: Dict[str, Any], instance: Optional[Transaction]
     ) -> None:
         """
-        Validate currency conversion field consistency.
+        Support automatic currency conversion:
+        If original_amount and original_currency are provided, calculate
+        amount and exchange_rate automatically if they are missing or mismatched.
         """
-        exchange_rate = data.get(
-            "exchange_rate", getattr(instance, "exchange_rate", Decimal("1.0"))
+        account = data.get("account", getattr(instance, "account", None))
+        if not account:
+            return  # Cannot convert without target account currency
+
+        original_amount = data.get(
+            "original_amount", getattr(instance, "original_amount", None)
         )
+        original_currency = data.get(
+            "original_currency", getattr(instance, "original_currency", None)
+        )
+        exchange_rate = data.get("exchange_rate")
+        amount = data.get("amount")
 
-        if exchange_rate != Decimal("1.0"):
-            original_amount = data.get(
-                "original_amount", getattr(instance, "original_amount", None)
-            )
-            original_currency = data.get(
-                "original_currency", getattr(instance, "original_currency", None)
-            )
-
-            if not original_amount or not original_currency:
-                logger.warning(
-                    "Currency conversion fields missing for exchange_rate != 1.0",
-                    extra={"exchange_rate": exchange_rate},
-                )
+        # Case 1: Original currency is provided and differs from account currency
+        if original_currency and original_currency.id != account.currency.id:
+            if original_amount is None:
                 raise serializers.ValidationError(
                     {
                         "original_amount": _(
-                            "Both original_amount and original_currency are required "
-                            "when exchange_rate is not 1.0."
-                        ),
-                        "original_currency": _(
-                            "Both original_amount and original_currency are required "
-                            "when exchange_rate is not 1.0."
-                        ),
+                            "Original amount required for cross-currency."
+                        )
                     }
                 )
 
-            if original_amount <= 0:
-                raise serializers.ValidationError(
-                    {"original_amount": _("Original amount must be positive.")}
+            # Perform automatic conversion if amount or rate is missing
+            if amount is None or exchange_rate is None:
+                logger.info(
+                    f"Auto-converting {original_amount} {original_currency.code} "
+                    f"to {account.currency.code}"
                 )
+                converted_amount = original_currency.convert_amount(
+                    original_amount, account.currency
+                )
+
+                if converted_amount is not None:
+                    if amount is None:
+                        data["amount"] = converted_amount
+                    if exchange_rate is None:
+                        # Implied rate: Target / Original
+                        data["exchange_rate"] = (
+                            converted_amount / original_amount
+                        ).quantize(Decimal("0.0000000001"), rounding="ROUND_HALF_UP")
+                else:
+                    raise serializers.ValidationError(
+                        {
+                            "original_currency": _(
+                                "Exchange rate not available for conversion."
+                            )
+                        }
+                    )
+
+        # Case 2: No original currency, or same as account
+        elif original_currency and original_currency.id == account.currency.id:
+            # Sync original to amount if original is provided for clarity
+            if original_amount is not None and amount is None:
+                data["amount"] = original_amount
+            data["exchange_rate"] = Decimal("1.0")
+
+        # Case 3: Only amount is provided, original values should match it
+        elif amount is not None and original_amount is None:
+            data["original_amount"] = amount
+            data["original_currency"] = account.currency
+            data["exchange_rate"] = Decimal("1.0")
 
     def create(self, validated_data: Dict[str, Any]) -> Transaction:
         """
@@ -2744,6 +2775,7 @@ class RecurringTransactionSerializer(serializers.ModelSerializer):
             "id",
             "name",
             "amount",
+            "currency",
             "transaction_type",
             "frequency",
             "period_display",

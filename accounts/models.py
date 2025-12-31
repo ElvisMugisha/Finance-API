@@ -516,6 +516,13 @@ class RecurringTransaction(utils_models.BaseModel):
         max_length=10,
         choices=choices.TransactionType.choices,
     )
+    currency = models.ForeignKey(
+        Currency,
+        on_delete=models.PROTECT,
+        related_name="recurring_transactions",
+        default=1,
+        help_text=_("Original currency for this recurring transaction"),
+    )
 
     frequency = models.CharField(
         max_length=20,
@@ -619,12 +626,36 @@ class RecurringTransaction(utils_models.BaseModel):
         from .models import Transaction
 
         with transaction.atomic():
+            # Currency logic: Determine amount in account currency
+            txn_amount = self.amount
+            exchange_rate = Decimal("1.0")
+
+            if self.currency.id != self.account.currency.id:
+                # Need conversion
+                converted = self.currency.convert_amount(
+                    self.amount, self.account.currency
+                )
+                if converted is not None:
+                    txn_amount = converted
+                    # Calculate implied exchange rate for record keeping
+                    exchange_rate = (txn_amount / self.amount).quantize(
+                        Decimal("0.0000000001"), rounding="ROUND_HALF_UP"
+                    )
+                else:
+                    logger.warning(
+                        f"Currency conversion failed for RecurringTransaction {self.id}. "
+                        "Using original amount in account currency (might be incorrect)."
+                    )
+
             tx = Transaction.objects.create(
                 user=self.user,
                 account=self.account,
                 category=self.category,
                 name=self.name,
-                amount=self.amount,
+                amount=txn_amount,
+                original_amount=self.amount,
+                original_currency=self.currency,
+                exchange_rate=exchange_rate,
                 transaction_type=self.transaction_type,
                 transaction_date=self.next_due_date,  # Use due date for consistency
                 status=(
@@ -1232,23 +1263,10 @@ class Transaction(utils_models.BaseModel):
                 # Same currency, no conversion needed
                 return self.amount
 
-            # Convert through base currency
-            base_currency = Currency.get_base_currency()
-            if not base_currency:
-                print("DEBUG: No base currency configured")
-                return None
-
-            # Convert source amount to base currency
-            if self.account.currency.is_base_currency:
-                amount_in_base = self.amount
-            else:
-                amount_in_base = self.amount / self.account.currency.exchange_rate
-
-            # Convert from base to destination currency
-            if self.transfer_account.currency.is_base_currency:
-                return amount_in_base
-            else:
-                return amount_in_base * self.transfer_account.currency.exchange_rate
+            # Convert from source account currency to target account currency
+            return self.account.currency.convert_amount(
+                self.amount, self.transfer_account.currency
+            )
 
         except Exception as e:
             logger.error(f"Error calculating transfer amount: {e}")
