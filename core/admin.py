@@ -1,29 +1,38 @@
-from django.contrib import admin
+from django.contrib import admin, messages
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from django.conf import settings
+from django.core.cache import cache
 
 from .models import Category, Currency
+from . import exchange_rates
+from utils import loggings
+
+logger = loggings.setup_logging()
 
 
 @admin.register(Currency)
 class CurrencyAdmin(admin.ModelAdmin):
     """
     Admin interface for Currency model.
-    Organized with fieldsets and audit trail protection.
+    Includes custom actions for real-time exchange rate updates.
     """
 
     list_display = (
         "code",
         "name",
         "symbol",
-        "exchange_rate",
+        "safe_exchange_rate",
+        "exchange_source",
+        "exchange_updated_at",
         "is_active",
         "is_base_currency",
-        "exchange_updated_at",
     )
     list_display_links = ("code", "name")
     list_filter = ("is_active", "is_base_currency", "exchange_source")
     search_fields = ("code", "name", "symbol")
     ordering = ("code",)
+    actions = ["update_exchange_rates_action", "force_refresh_exchange_rates"]
 
     readonly_fields = (
         "id",
@@ -44,15 +53,14 @@ class CurrencyAdmin(admin.ModelAdmin):
                     "symbol",
                     "decimal_places",
                     "is_active",
+                    "is_base_currency",
                 )
             },
         ),
         (
             _("Exchange Logic"),
             {
-                "classes": ("collapse",),
                 "fields": (
-                    "is_base_currency",
                     "exchange_rate",
                     "exchange_source",
                     "exchange_updated_at",
@@ -72,6 +80,11 @@ class CurrencyAdmin(admin.ModelAdmin):
         ),
     )
 
+    @admin.display(description=_("Exchange Rate"))
+    def safe_exchange_rate(self, obj):
+        """Display exchange rate or dash if null."""
+        return obj.exchange_rate if obj.exchange_rate else "—"
+
     @admin.display(description=_("Recent History"))
     def historical_rates_display(self, obj):
         """Format historical rates for display in admin."""
@@ -86,12 +99,72 @@ class CurrencyAdmin(admin.ModelAdmin):
             )
         return "\n".join(lines)
 
+    @admin.action(description=_("Update Exchange Rates from API"))
+    def update_exchange_rates_action(self, request, queryset):
+        """
+        Manually trigger exchange rate update from configured APIs.
+        """
+        try:
+            logger.info(f"Admin '{request.user}' triggered exchange rate update.")
+            result = exchange_rates.update_exchange_rates()
+
+            updated = ", ".join(result["updated"])
+            skipped = ", ".join(result["skipped"])
+            errors = "; ".join(result["errors"])
+
+            if result["updated"]:
+                self.message_user(
+                    request,
+                    f"Successfully updated: {updated}",
+                    level=messages.SUCCESS,
+                )
+
+            if result["skipped"]:
+                self.message_user(
+                    request,
+                    f"Skipped (base or not found): {skipped}",
+                    level=messages.WARNING,
+                )
+
+            if result["errors"]:
+                self.message_user(
+                    request,
+                    f"Errors occurred: {errors}",
+                    level=messages.ERROR,
+                )
+
+        except Exception as e:
+            logger.exception("Admin-triggered exchange update failed.")
+            self.message_user(
+                request,
+                f"Exchange rate update failed: {str(e)}",
+                level=messages.ERROR,
+            )
+
+    @admin.action(description=_("Force Refresh (Clear Cache)"))
+    def force_refresh_exchange_rates(self, request, queryset):
+        """
+        Clear exchange rate cache and fetch fresh data.
+        """
+        try:
+            cache_key = f"exchange_rates_response_{settings.BASE_CURRENCY}"
+            cache.delete(cache_key)
+            logger.info("Cleared exchange rate cache per admin request.")
+
+            # Re-run update
+            return self.update_exchange_rates_action(request, queryset)
+        except Exception as e:
+            self.message_user(
+                request,
+                f"Error refreshing cache: {str(e)}",
+                level=messages.ERROR,
+            )
+
     def save_model(self, request, obj, form, change):
-        """Log admin intervention on save."""
-        if change:
-            # If rate changed manually in admin, log it
-            if "exchange_rate" in form.changed_data:
-                obj.exchange_source = f"Admin: {request.user.email}"
+        """Log manual admin changes to source."""
+        if change and "exchange_rate" in form.changed_data:
+            obj.exchange_source = f"Admin: {request.user.email}"
+            obj.exchange_updated_at = timezone.now()
         super().save_model(request, obj, form, change)
 
 

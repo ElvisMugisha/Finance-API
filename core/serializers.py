@@ -385,8 +385,11 @@ class CurrencyListSerializer(serializers.ModelSerializer):
             "code",
             "name",
             "symbol",
+            "exchange_rate",
+            "exchange_source",
             "is_active",
             "is_base_currency",
+            "exchange_updated_at",
         ]
         read_only_fields = fields
 

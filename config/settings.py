@@ -263,6 +263,13 @@ SPECTACULAR_SETTINGS = {
 
 # Cache
 CACHE_TIMEOUT = 60 * 15
+CACHE_TTL = 60 * 60 * 24  # 24 hours for exchange rates
+
+# Currency Settings
+BASE_CURRENCY = config("BASE_CURRENCY", default="USD")
+OXR_API_KEY = config("OXR_API_KEY", default="")
+CURRENCY_LAYER_API_KEY = config("CURRENCY_LAYER_API_KEY", default="")
+
 
 # File Upload
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB
