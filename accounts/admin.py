@@ -1,6 +1,13 @@
 from django.contrib import admin
 from django.utils.translation import gettext_lazy as _
-from .models import Account, Transaction, Budget, FinancialGoal, Report
+from .models import (
+    Account,
+    Transaction,
+    Budget,
+    FinancialGoal,
+    Report,
+    RecurringTransaction,
+)
 
 
 @admin.register(Account)
@@ -192,6 +199,27 @@ class ReportAdmin(admin.ModelAdmin):
     search_fields = ("report_name", "user__email")
     autocomplete_fields = ["user"]
     readonly_fields = ("generated_at", "created_at", "updated_at")
+
+    def user_email(self, obj):
+        return obj.user.email
+
+    user_email.short_description = _("User")
+
+
+@admin.register(RecurringTransaction)
+class RecurringTransactionAdmin(admin.ModelAdmin):
+    list_display = (
+        "name",
+        "user_email",
+        "amount",
+        "frequency",
+        "next_due_date",
+        "is_active",
+        "auto_create",
+    )
+    list_filter = ("frequency", "transaction_type", "is_active", "auto_create")
+    search_fields = ("name", "user__email")
+    autocomplete_fields = ["user", "account", "category"]
 
     def user_email(self, obj):
         return obj.user.email

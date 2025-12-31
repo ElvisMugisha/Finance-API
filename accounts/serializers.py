@@ -17,7 +17,15 @@ from core.serializers import (
 )
 from utils import choices, loggings
 
-from .models import Account, Budget, BudgetCategory, FinancialGoal, Report, Transaction
+from .models import (
+    Account,
+    Budget,
+    BudgetCategory,
+    FinancialGoal,
+    Report,
+    Transaction,
+    RecurringTransaction,
+)
 
 logger = loggings.setup_logging()
 
@@ -934,6 +942,13 @@ class TransactionSerializer(serializers.ModelSerializer):
         help_text=_("Account to transfer to (for transfer transactions only)"),
     )
 
+    recurring_transaction = serializers.PrimaryKeyRelatedField(
+        queryset=RecurringTransaction.objects.all(),
+        required=False,
+        allow_null=True,
+        help_text=_("Linked recurring transaction"),
+    )
+
     class Meta:
         model = Transaction
         fields = [
@@ -953,6 +968,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             "tags",
             "attachments",
             "is_recurring",
+            "recurring_transaction",
             "is_transfer",
             "transfer_account",
             "transaction_date",
@@ -2709,3 +2725,75 @@ def get_report_serializer(action: str):
         "create": ReportCreateSerializer,
     }
     return serializers_map.get(action, ReportSerializer)
+
+
+class RecurringTransactionSerializer(serializers.ModelSerializer):
+    """
+    Serializer for Recurring Transactions.
+    """
+
+    period_display = serializers.CharField(
+        source="get_frequency_display", read_only=True
+    )
+    account_name = serializers.CharField(source="account.name", read_only=True)
+    category_name = serializers.CharField(source="category.name", read_only=True)
+
+    class Meta:
+        model = RecurringTransaction
+        fields = [
+            "id",
+            "name",
+            "amount",
+            "transaction_type",
+            "frequency",
+            "period_display",
+            "start_date",
+            "end_date",
+            "next_due_date",
+            "last_generated_date",
+            "is_active",
+            "auto_create",
+            "description",
+            "account",
+            "account_name",
+            "category",
+            "category_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["last_generated_date", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        # Validate next_due_date vs start_date
+        start_date = attrs.get(
+            "start_date", self.instance.start_date if self.instance else date.today()
+        )
+        next_due = attrs.get("next_due_date")
+
+        if next_due and next_due < start_date:
+            raise serializers.ValidationError(
+                {"next_due_date": "Next due date cannot be before start date."}
+            )
+
+        return attrs
+
+
+class AnalyticsDashboardSerializer(serializers.Serializer):
+    """
+    Serializer/Schema for the Analytics Dashboard response.
+    """
+
+    net_worth = serializers.DictField()
+    monthly_cash_flow = serializers.DictField()
+    upcoming_bills = serializers.ListField()
+    budget_health = serializers.DictField()
+
+
+class AnalyticsForecastSerializer(serializers.Serializer):
+    """
+    Schema for Forecast data points.
+    """
+
+    date = serializers.DateField()
+    projected_balance = serializers.DecimalField(max_digits=18, decimal_places=2)
+    projected_income = serializers.DecimalField(max_digits=18, decimal_places=2)

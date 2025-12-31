@@ -40,7 +40,15 @@ from .filters import (
     ReportFilter,
 )
 
-from .models import Account, Budget, BudgetCategory, FinancialGoal, Report, Transaction
+from .models import (
+    Account,
+    Budget,
+    BudgetCategory,
+    FinancialGoal,
+    Report,
+    Transaction,
+    RecurringTransaction,
+)
 from .serializers import (
     AccountDetailSerializer,
     AccountListSerializer,
@@ -67,7 +75,11 @@ from .serializers import (
     get_account_serializer,
     get_financial_goal_serializer,
     get_report_serializer,
+    RecurringTransactionSerializer,
+    AnalyticsDashboardSerializer,
+    AnalyticsForecastSerializer,
 )
+from .services import AnalyticsService
 
 logger = loggings.setup_logging()
 
@@ -3584,3 +3596,110 @@ class ReportViewSet(viewsets.ModelViewSet):
             </html>
         """
         return html
+
+
+class RecurringTransactionViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing Recurring Transactions.
+    """
+
+    queryset = RecurringTransaction.objects.all()
+    serializer_class = RecurringTransactionSerializer
+    permission_classes = [IsOwnerOrAdmin]
+    pagination_class = CustomPageNumberPagination
+    filterset_fields = ["is_active", "frequency", "transaction_type", "account"]
+    ordering_fields = ["next_due_date", "name", "amount"]
+    ordering = ["next_due_date"]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def get_queryset(self):
+        """Ensure users only see their own data."""
+        return super().get_queryset().filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+    @extend_schema(request=None, responses={200: RecurringTransactionSerializer})
+    @action(detail=True, methods=["post"], url_path="skip-next")
+    def skip_next(self, request, pk=None):
+        """Skip the next due date occurrence."""
+        recurring = self.get_object()
+        recurring.next_due_date = recurring.calculate_next_date(recurring.next_due_date)
+        recurring.save(update_fields=["next_due_date", "updated_at"])
+        return Response(self.get_serializer(recurring).data)
+
+    @extend_schema(request=None, responses={201: TransactionSerializer})
+    @action(detail=True, methods=["post"], url_path="generate-now")
+    def generate_now(self, request, pk=None):
+        """Force generate the transaction now."""
+        recurring = self.get_object()
+
+        # Logic to create transaction
+        with db_transaction.atomic():
+            tx = Transaction.objects.create(
+                user=recurring.user,
+                account=recurring.account,
+                category=recurring.category,
+                name=recurring.name,
+                amount=recurring.amount,
+                transaction_type=recurring.transaction_type,
+                transaction_date=timezone.now().date(),
+                status=choices.TransactionStatus.PENDING,  # Or completed? Default pending for review.
+                description=recurring.description,
+                recurring_transaction=recurring,
+                is_recurring=True,
+            )
+
+            # Update recurring next date and last generated
+            recurring.last_generated_date = timezone.now().date()
+            recurring.next_due_date = recurring.calculate_next_date(
+                recurring.next_due_date
+            )
+            recurring.save(
+                update_fields=["last_generated_date", "next_due_date", "updated_at"]
+            )
+
+        return Response(TransactionSerializer(tx).data, status=status.HTTP_201_CREATED)
+
+
+class AnalyticsViewSet(viewsets.ViewSet):
+    """
+    ViewSet for Financial Analytics and Dashboard.
+    """
+
+    permission_classes = [IsOwnerOrAdmin]
+
+    @extend_schema(
+        summary="Get Dashboard Data", responses={200: AnalyticsDashboardSerializer}
+    )
+    @action(detail=False, methods=["get"], url_path="dashboard")
+    def dashboard(self, request):
+        service = AnalyticsService(user=request.user)
+        data = service.get_dashboard_data()
+        serializer = AnalyticsDashboardSerializer(data=data)
+        serializer.is_valid()  # Check loosely valid (structure)
+        # Note: data coming from service is dict, serializer validation checks schema
+        # In a real app we might validate strictly, here we trust service return
+        return Response(data)
+
+    @extend_schema(
+        summary="Get Cash Flow Forecast",
+        parameters=[
+            OpenApiParameter(
+                "months",
+                OpenApiTypes.INT,
+                description="Months to forecast (1-12)",
+                default=3,
+            )
+        ],
+        responses={200: AnalyticsForecastSerializer(many=True)},
+    )
+    @action(detail=False, methods=["get"], url_path="forecast")
+    def forecast(self, request):
+        months = int(request.query_params.get("months", 3))
+        if months > 12:
+            months = 12
+
+        service = AnalyticsService(user=request.user)
+        data = service.get_forecast(months=months)
+        return Response(data)

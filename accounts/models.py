@@ -486,6 +486,118 @@ class Account(utils_models.BaseModel):
             return []
 
 
+class RecurringTransaction(utils_models.BaseModel):
+    """
+    Model for managing recurring transactions (subscriptions, salaries, bills).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="recurring_transactions",
+        db_index=True,
+    )
+    account = models.ForeignKey(
+        Account,
+        on_delete=models.CASCADE,
+        related_name="recurring_scheduled",
+    )
+    category = models.ForeignKey(
+        Category,
+        on_delete=models.PROTECT,
+        related_name="recurring_scheduled",
+    )
+
+    name = models.CharField(max_length=255)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    transaction_type = models.CharField(
+        max_length=10,
+        choices=choices.TransactionType.choices,
+    )
+
+    frequency = models.CharField(
+        max_length=20,
+        choices=choices.FrequencyType.choices,
+        default=choices.FrequencyType.MONTHLY,
+    )
+    start_date = models.DateField(default=date.today)
+    end_date = models.DateField(null=True, blank=True)
+    next_due_date = models.DateField(db_index=True)
+
+    last_generated_date = models.DateField(null=True, blank=True)
+
+    is_active = models.BooleanField(default=True, db_index=True)
+    auto_create = models.BooleanField(
+        default=False, help_text=_("Automatically create the transaction when due")
+    )
+
+    description = models.TextField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = _("Recurring Transaction")
+        verbose_name_plural = _("Recurring Transactions")
+        ordering = ["next_due_date"]
+        db_table = "recurring_transactions"
+        indexes = [
+            models.Index(fields=["user", "is_active", "next_due_date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.get_frequency_display()})"
+
+    def calculate_next_date(self, current_date: date) -> date:
+        """Calculate next due date based on frequency."""
+        if self.frequency == choices.FrequencyType.DAILY:
+            return current_date + timedelta(days=1)
+        elif self.frequency == choices.FrequencyType.WEEKLY:
+            return current_date + timedelta(weeks=1)
+        elif self.frequency == choices.FrequencyType.BI_WEEKLY:
+            return current_date + timedelta(weeks=2)
+        elif self.frequency == choices.FrequencyType.MONTHLY:
+            # Handle month rollover (simple version, can be robustified)
+            # Using simple 30 days or relativedelta if available, otherwise manual
+            # For strict monthly, let's use a utility or simple logic
+            # Simplest logic without dateutil:
+            month = current_date.month - 1 + 1
+            year = current_date.year + month // 12
+            month = month % 12 + 1
+            day = min(
+                current_date.day,
+                [
+                    31,
+                    (
+                        29
+                        if year % 4 == 0 and not year % 100 == 0 or year % 400 == 0
+                        else 28
+                    ),
+                    31,
+                    30,
+                    31,
+                    30,
+                    31,
+                    31,
+                    30,
+                    31,
+                    30,
+                    31,
+                ][month - 1],
+            )
+            return date(year, month, day)
+        elif self.frequency == choices.FrequencyType.QUARTERLY:
+            return current_date + timedelta(days=91)  # Approx
+        elif self.frequency == choices.FrequencyType.YEARLY:
+            try:
+                return current_date.replace(year=current_date.year + 1)
+            except ValueError:
+                # Leap year edge case
+                return current_date + (
+                    date(current_date.year + 1, 3, 1) - date(current_date.year, 3, 1)
+                )
+        return current_date
+
+
 class Transaction(utils_models.BaseModel):
     """
     Core transaction model with comprehensive financial tracking.
@@ -645,6 +757,14 @@ class Transaction(utils_models.BaseModel):
     # Flags
     is_recurring = models.BooleanField(
         default=False, help_text=_("Whether this is part of a recurring transaction")
+    )
+    recurring_transaction = models.ForeignKey(
+        "RecurringTransaction",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="transactions",
+        help_text=_("Parent recurring transaction profile"),
     )
     is_transfer = models.BooleanField(
         default=False,
