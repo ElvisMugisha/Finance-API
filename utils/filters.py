@@ -1,6 +1,5 @@
 import django_filters
 from django.contrib.auth import get_user_model
-from django.db import models
 from django.db.models import Q
 from rest_framework.request import Request
 
@@ -10,106 +9,85 @@ logger = loggings.setup_logging()
 User = get_user_model()
 
 
-class UserFilter:
+class UserFilter(django_filters.FilterSet):
     """
-    Encapsulates advanced user filtering logic for API endpoints.
-
-    Supports:
-    - Filtering by active status, staff, superuser, verified, premium
-    - Searching by email, username, or full name
-    - Ordering if needed
-    - Safe for production: logs errors without exposing sensitive info
+    Advanced filtering for users using django-filter.
     """
 
-    def __init__(self, request: Request, queryset=None):
-        self.request = request
-        self.queryset = queryset if queryset is not None else User.objects.all()
-        self.user = request.user
+    search = django_filters.CharFilter(method="filter_search")
+    ordering = django_filters.OrderingFilter(
+        fields=(
+            ("created_at", "created_at"),
+            ("last_login", "last_login"),
+            ("email", "email"),
+            ("first_name", "first_name"),
+            ("last_name", "last_name"),
+        )
+    )
 
-    def apply(self):
-        """
-        Apply all filters, search, and ordering to the queryset.
-        Returns a filtered queryset.
-        """
-        try:
-            self._apply_basic_filters()
-            self._apply_search()
-            self._apply_ordering()
-            return self.queryset
+    class Meta:
+        model = User
+        fields = {
+            "is_active": ["exact"],
+            "is_staff": ["exact"],
+            "is_superuser": ["exact"],
+            "is_verified": ["exact"],
+            "is_premium": ["exact"],
+        }
 
-        except Exception as e:
-            logger.exception(f"UserFilter.apply failed: {str(e)}")
-            return self.queryset.none()  # Safe fallback
+    def filter_search(self, queryset, name, value):
+        return queryset.filter(
+            Q(username__icontains=value)
+            | Q(email__icontains=value)
+            | Q(first_name__icontains=value)
+            | Q(middle_name__icontains=value)
+            | Q(last_name__icontains=value)
+        )
 
-    def _apply_basic_filters(self):
-        """Filter by standard query params like is_active, is_staff, etc."""
-        for field in [
-            "is_active",
-            "is_staff",
-            "is_superuser",
-            "is_verified",
-            "is_premium",
-        ]:
-            value = self.request.query_params.get(field)
-            if value is not None:
-                if value.lower() in ["true", "1"]:
-                    self.queryset = self.queryset.filter(**{field: True})
-                elif value.lower() in ["false", "0"]:
-                    self.queryset = self.queryset.filter(**{field: False})
-                logger.debug(f"Applied filter {field}={value}")
 
-    def _apply_search(self):
-        """Apply search across email, username, first/middle/last name."""
-        search_query = self.request.query_params.get("search")
-        if search_query:
-            self.queryset = self.queryset.filter(
-                Q(username__icontains=search_query)
-                | Q(email__icontains=search_query)
-                | Q(first_name__icontains=search_query)
-                | Q(middle_name__icontains=search_query)
-                | Q(last_name__icontains=search_query)
-            )
-            logger.debug(f"Applied search filter: {search_query}")
+class CurrencyFilter(django_filters.FilterSet):
+    """
+    Advanced filtering for currencies using django-filter.
+    """
 
-    def _apply_ordering(self):
-        """Apply ordering from query params, default by -created_at."""
-        ordering = self.request.query_params.get("ordering")
-        allowed_fields = [
-            "created_at",
-            "last_login",
-            "email",
-            "first_name",
-            "last_name",
-        ]
+    search = django_filters.CharFilter(method="filter_search")
+    ordering = django_filters.OrderingFilter(
+        fields=(
+            ("code", "code"),
+            ("name", "name"),
+            ("exchange_rate", "exchange_rate"),
+            ("updated_at", "updated_at"),
+        )
+    )
 
-        if ordering:
-            orders = []
-            for field in ordering.split(","):
-                field_name = field.lstrip("-")
-                if field_name in allowed_fields:
-                    orders.append(field)
-            if orders:
-                self.queryset = self.queryset.order_by(*orders)
-                logger.debug(f"Applied ordering: {orders}")
-        else:
-            self.queryset = self.queryset.order_by("-created_at")
+    class Meta:
+        from core.models import Currency
+
+        model = Currency
+        fields = {
+            "is_active": ["exact"],
+            "is_base_currency": ["exact"],
+        }
+
+    def filter_search(self, queryset, name, value):
+        return queryset.filter(
+            Q(code__icontains=value)
+            | Q(name__icontains=value)
+            | Q(symbol__icontains=value)
+        )
 
 
 class CategoryFilter:
     """
     Encapsulates category filtering logic.
-
-    Implements:
-    - Search by name
-    - Filter by category type
-    - Filter by parent
-    - User-specific filtering
+    Keeping this as is for now because it has complex custom logic for system/mine views,
+    but standardizing the method name.
     """
 
     def __init__(
         self,
         request: Request,
-        queryset: models.QuerySet,
+        queryset,
         is_system=False,
         is_mine=False,
     ):
@@ -119,26 +97,22 @@ class CategoryFilter:
         self.is_system = is_system
         self.is_mine = is_mine
 
-    def apply_filters(self) -> models.QuerySet:
-        """Apply all filters to the queryset."""
-        # Apply basic filters that work for all endpoints
+    def apply(self):
+        """Standardized apply method."""
         self._apply_search()
         self._apply_category_type_filter()
         self._apply_parent_filter()
 
-        # Apply endpoint-specific filters
         if self.is_system:
             self._apply_system_filters()
         elif self.is_mine:
             self._apply_mine_filters()
         else:
-            # For list view, apply user-specific filters
             if self.user.is_staff or self.user.is_superuser:
                 self._apply_staff_filters()
             else:
                 self._apply_regular_user_filters()
 
-        # Apply active filter if not overridden
         if not self.request.query_params.get("include_inactive"):
             self.queryset = self.queryset.filter(is_active=True)
 
@@ -146,7 +120,6 @@ class CategoryFilter:
         return self.queryset
 
     def _apply_ordering(self):
-        """Apply ordering from query params."""
         ordering = self.request.query_params.get("ordering")
         allowed_fields = ["name", "transaction_count", "created_at", "updated_at"]
 
@@ -158,132 +131,40 @@ class CategoryFilter:
                     orders.append(field)
             if orders:
                 self.queryset = self.queryset.order_by(*orders)
-                logger.debug(f"Applied category ordering: {orders}")
                 return
 
-        # Default ordering
         self.queryset = self.queryset.order_by("name")
 
     def _apply_search(self) -> None:
-        """Apply search by name."""
         search_query = self.request.query_params.get("search")
         if search_query:
             self.queryset = self.queryset.filter(name__icontains=search_query)
-            logger.debug(f"Applied search filter: {search_query}")
 
     def _apply_category_type_filter(self) -> None:
-        """Filter by category type."""
         category_type = self.request.query_params.get("category_type")
         if category_type:
             self.queryset = self.queryset.filter(category_type=category_type)
-            logger.debug(f"Applied category_type filter: {category_type}")
 
     def _apply_parent_filter(self) -> None:
-        """Filter by parent category."""
         parent_id = self.request.query_params.get("parent_id")
         if parent_id:
             try:
                 self.queryset = self.queryset.filter(parent_id=parent_id)
-                logger.debug(f"Applied parent filter: {parent_id}")
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Invalid parent_id: {parent_id}, error: {e}")
+            except (ValueError, TypeError):
+                pass
 
     def _apply_system_filters(self) -> None:
-        """Apply filters for system categories endpoint."""
-        # System endpoint only shows system categories
         self.queryset = self.queryset.filter(is_system_category=True)
-        logger.debug("Applied system category filter")
 
     def _apply_mine_filters(self) -> None:
-        """Apply filters for my categories endpoint."""
-        # Mine endpoint only shows current user's categories
         self.queryset = self.queryset.filter(user=self.user)
-        logger.debug(f"Applied my categories filter for user {self.user.id}")
 
     def _apply_staff_filters(self) -> None:
-        """Apply filters for staff/admin users."""
-        # Staff can see all categories
         include_inactive = self.request.query_params.get("include_inactive")
-
-        if include_inactive and include_inactive.lower() == "true":
-            # Include all categories for staff/admin
-            logger.debug("Staff/admin viewing all categories (including inactive)")
-        else:
-            # Default: show only active categories
+        if not (include_inactive and include_inactive.lower() == "true"):
             self.queryset = self.queryset.filter(is_active=True)
-            logger.debug("Staff/admin viewing active categories only")
 
     def _apply_regular_user_filters(self) -> None:
-        """Apply filters for regular users."""
-        # Regular users see their categories + system categories
         self.queryset = self.queryset.filter(
-            models.Q(user=self.user) | models.Q(is_system_category=True)
+            Q(user=self.user) | Q(is_system_category=True)
         )
-        logger.debug(f"Regular user {self.user.id} viewing filtered categories")
-
-
-class CurrencyFilter:
-    """
-    Encapsulates currency filtering logic, mirroring UserFilter.
-
-    Supports:
-    - Filtering by active status and base currency status
-    - Searching by code, name, or symbol
-    - Ordering
-    """
-
-    def __init__(self, request: Request, queryset=None):
-        from core.models import Currency  # Lazy import to avoid circular dependency
-
-        self.request = request
-        self.queryset = queryset if queryset is not None else Currency.objects.all()
-
-    def apply(self):
-        """
-        Apply all filters, search, and ordering to the queryset.
-        """
-        try:
-            self._apply_basic_filters()
-            self._apply_search()
-            self._apply_ordering()
-            return self.queryset
-
-        except Exception as e:
-            logger.exception(f"CurrencyFilter.apply failed: {str(e)}")
-            return self.queryset.none()
-
-    def _apply_basic_filters(self):
-        """Filter by boolean fields."""
-        for field in ["is_active", "is_base_currency"]:
-            value = self.request.query_params.get(field)
-            if value is not None:
-                if value.lower() in ["true", "1"]:
-                    self.queryset = self.queryset.filter(**{field: True})
-                elif value.lower() in ["false", "0"]:
-                    self.queryset = self.queryset.filter(**{field: False})
-                logger.debug(f"Applied currency filter {field}={value}")
-
-    def _apply_search(self):
-        """Apply search across code, name, and symbol."""
-        search_query = self.request.query_params.get("search")
-        if search_query:
-            self.queryset = self.queryset.filter(
-                Q(code__icontains=search_query)
-                | Q(name__icontains=search_query)
-                | Q(symbol__icontains=search_query)
-            )
-            logger.debug(f"Applied currency search: {search_query}")
-
-    def _apply_ordering(self):
-        """Apply ordering."""
-        ordering = self.request.query_params.get("ordering")
-        allowed_fields = ["code", "name", "exchange_rate", "updated_at"]
-
-        if ordering:
-            orders = []
-            for field in ordering.split(","):
-                field_name = field.lstrip("-")
-                if field_name in allowed_fields:
-                    orders.append(field)
-            if orders:
-                self.queryset = self.queryset.order_by(*orders)

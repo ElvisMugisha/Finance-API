@@ -2022,12 +2022,8 @@ class BudgetDetailSerializer(BudgetSerializer):
     def get_spending_by_category(self, obj: Budget) -> List[Dict[str, Any]]:
         """
         Get spending breakdown by category for this budget.
-
-        For CATEGORY budgets: Only shows spending for that specific category
-        For OVERALL budgets: Shows all expense categories
+        Now correctly handles multi-currency conversions.
         """
-        from django.db.models import Sum
-
         try:
             # Base query for transactions within budget period
             query = models.Q(
@@ -2042,20 +2038,16 @@ class BudgetDetailSerializer(BudgetSerializer):
             if obj.category:
                 query &= models.Q(category=obj.category)
 
-            spending = (
-                Transaction.objects.filter(query)
-                .values("category__name")
-                .annotate(total=Sum("amount"))
-                .order_by("-total")[:10]
-            )
+            # CRITICAL FIX: Use the robust aggregator to handle multi-currency
+            spending = Transaction.objects.aggregate_by_category_to_currency(
+                Transaction.objects.filter(query), obj.currency
+            )[:10]
 
-            return [
-                {
-                    "category": item["category__name"],
-                    "amount": str(item["total"]),
-                }
-                for item in spending
-            ]
+            # Format Decimal to string for JSON serialization
+            for item in spending:
+                item["amount"] = str(item["amount"].quantize(Decimal("0.01")))
+
+            return spending
 
         except Exception as e:
             logger.warning(f"Error getting spending breakdown for budget {obj.id}: {e}")

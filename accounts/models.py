@@ -1080,8 +1080,23 @@ class Transaction(utils_models.BaseModel):
             self._create_transfer_pair()
 
         # Update category usage stats
-        if is_new:
-            self.category.update_usage_stats()
+        # Trigger if new, or if category/status/date changed
+        relevant_fields_changed = (
+            is_new
+            or old_category != self.category
+            or old_status != self.status
+            or old_date != self.transaction_date
+        )
+
+        if relevant_fields_changed:
+            try:
+                self.category.update_usage_stats()
+                if old_category and old_category != self.category:
+                    old_category.update_usage_stats()
+            except Exception as e:
+                logger.error(
+                    f"Failed to update category stats for transaction {self.id}: {e}"
+                )
 
         # CRITICAL FIX: Auto-recalculate affected budgets and goals
         self._recalculate_affected_budgets(
@@ -1614,37 +1629,12 @@ class Budget(utils_models.BaseModel):
                 query &= Q(category__in=categories)
 
             # Calculate total spending with multi-currency support
-            transactions = self.user.transactions.filter(query)
+            transactions_qs = self.user.transactions.filter(query)
 
-            # Group by account currency to handle conversions efficiently
-            currency_groups = transactions.values("account__currency").annotate(
-                total=Coalesce(Sum("amount"), Decimal("0.00"))
+            # USE THE NEW ROBUST AGGREGATOR
+            spending = Transaction.objects.aggregate_to_currency(
+                transactions_qs, self.currency
             )
-
-            spending = Decimal("0.00")
-
-            for group in currency_groups:
-                currency_id = group["account__currency"]
-                total_amount = group["total"]
-
-                if not currency_id:
-                    continue
-
-                if currency_id == self.currency.id:
-                    spending += total_amount
-                else:
-                    try:
-                        source_currency = Currency.objects.get(id=currency_id)
-                        converted = source_currency.convert_amount(
-                            total_amount, self.currency
-                        )
-                        if converted is not None:
-                            spending += converted
-                    except Currency.DoesNotExist:
-                        logger.error(
-                            f"Missing currency {currency_id} during budget calc"
-                        )
-                        continue
 
             # Update if changed
             if spending != self.total_spent:
@@ -1962,34 +1952,10 @@ class BudgetCategory(utils_models.BaseModel):
                 ],
             )
 
-            # Initialize spending
-            spending = Decimal("0.00")
-            target_currency = self.budget.currency
-
-            # Group by account currency
-            currency_groups = transactions.values("account__currency").annotate(
-                total=Coalesce(Sum("amount"), Decimal("0.00"))
+            # USE THE NEW ROBUST AGGREGATOR
+            spending = Transaction.objects.aggregate_to_currency(
+                transactions, self.budget.currency
             )
-
-            for group in currency_groups:
-                currency_id = group["account__currency"]
-                total = group["total"]
-
-                if not currency_id:
-                    continue
-
-                if currency_id == target_currency.id:
-                    spending += total
-                else:
-                    try:
-                        source_currency = Currency.objects.get(id=currency_id)
-                        converted = source_currency.convert_amount(
-                            total, target_currency
-                        )
-                        if converted is not None:
-                            spending += converted
-                    except Currency.DoesNotExist:
-                        continue
 
             # spending = ... (calculated above)
 

@@ -63,7 +63,7 @@ class BaseCurrencyViewSet(viewsets.GenericViewSet):
             queryset = queryset.filter(is_active=True)
 
         # Apply advanced filtering using CurrencyFilter
-        return CurrencyFilter(self.request, queryset).apply()
+        return CurrencyFilter(self.request.query_params, queryset=queryset).qs
 
     def get_serializer_class(self):
         """Return appropriate serializer based on action."""
@@ -518,7 +518,7 @@ class CategoryViewSet(
             filter_instance = CategoryFilter(
                 request, queryset, is_system=is_system, is_mine=is_mine
             )
-            filtered_queryset = filter_instance.apply_filters()
+            filtered_queryset = filter_instance.apply()
 
             page = self.paginate_queryset(filtered_queryset)
             if page is not None:

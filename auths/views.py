@@ -1018,9 +1018,11 @@ class UserListView(generics.ListAPIView):
         logger.info("User list requested", extra={"requested_by": request.user.id})
 
         try:
-            # Apply filters/search/ordering
-            user_filter = filters.UserFilter(request, queryset=self.queryset)
-            filtered_queryset = user_filter.apply()
+            # Apply filters/search/ordering via django-filter
+            user_filter = filters.UserFilter(
+                request.query_params, queryset=self.queryset
+            )
+            filtered_queryset = user_filter.qs
 
             # Handle Excel export: save file locally
             excel_url = None
