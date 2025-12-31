@@ -535,6 +535,12 @@ class RecurringTransaction(utils_models.BaseModel):
 
     description = models.TextField(null=True, blank=True)
 
+    # Statistics
+    total_generated_count = models.PositiveIntegerField(default=0)
+    total_generated_amount = models.DecimalField(
+        max_digits=18, decimal_places=2, default=Decimal("0.00")
+    )
+
     class Meta:
         verbose_name = _("Recurring Transaction")
         verbose_name_plural = _("Recurring Transactions")
@@ -596,6 +602,55 @@ class RecurringTransaction(utils_models.BaseModel):
                     date(current_date.year + 1, 3, 1) - date(current_date.year, 3, 1)
                 )
         return current_date
+
+    def process_due(self, execution_date: date = None, force: bool = False):
+        """
+        Check if transaction is due and create it.
+        Returns the created Transaction or None.
+        """
+        if not self.is_active:
+            return None
+
+        today = execution_date or date.today()
+        if not force and self.next_due_date > today:
+            return None
+
+        # Create transaction
+        from .models import Transaction
+
+        with transaction.atomic():
+            tx = Transaction.objects.create(
+                user=self.user,
+                account=self.account,
+                category=self.category,
+                name=self.name,
+                amount=self.amount,
+                transaction_type=self.transaction_type,
+                transaction_date=self.next_due_date,  # Use due date for consistency
+                status=(
+                    choices.TransactionStatus.COMPLETED
+                    if self.auto_create
+                    else choices.TransactionStatus.PENDING
+                ),
+                description=self.description,
+                recurring_transaction=self,
+                is_recurring=True,
+            )
+
+            self.last_generated_date = self.next_due_date
+            self.next_due_date = self.calculate_next_date(self.next_due_date)
+            self.total_generated_count += 1
+            self.total_generated_amount += self.amount
+            self.save(
+                update_fields=[
+                    "last_generated_date",
+                    "next_due_date",
+                    "total_generated_count",
+                    "total_generated_amount",
+                    "updated_at",
+                ]
+            )
+            return tx
 
 
 class Transaction(utils_models.BaseModel):
@@ -1005,6 +1060,40 @@ class Transaction(utils_models.BaseModel):
             old_date=old_date,
         )
         self._recalculate_affected_goals(is_new=is_new, old_goal=old_goal)
+
+        # Handle recurring transaction bumping
+        if is_new:
+            self._handle_recurring_update()
+
+    def _handle_recurring_update(self) -> None:
+        """
+        Update the parent recurring transaction if this transaction fulfills it.
+        """
+        if self.recurring_transaction and self.status in [
+            choices.TransactionStatus.COMPLETED,
+            choices.TransactionStatus.RECONCILED,
+        ]:
+            recurring = self.recurring_transaction
+            # If this transaction is on or after the next due date, we advance the schedule
+            if self.transaction_date >= recurring.next_due_date:
+                logger.info(
+                    f"Transaction {self.id} fulfilling recurring {recurring.id}. Bumping schedule."
+                )
+                recurring.last_generated_date = self.transaction_date
+                recurring.next_due_date = recurring.calculate_next_date(
+                    recurring.next_due_date
+                )
+                recurring.total_generated_count += 1
+                recurring.total_generated_amount += self.amount
+                recurring.save(
+                    update_fields=[
+                        "last_generated_date",
+                        "next_due_date",
+                        "total_generated_count",
+                        "total_generated_amount",
+                        "updated_at",
+                    ]
+                )
 
     def _recalculate_affected_budgets(
         self, is_new: bool, old_status: str = None, old_category=None, old_date=None

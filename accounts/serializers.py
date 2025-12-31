@@ -2785,6 +2785,7 @@ class AnalyticsDashboardSerializer(serializers.Serializer):
 
     net_worth = serializers.DictField()
     monthly_cash_flow = serializers.DictField()
+    safe_to_spend = serializers.DictField()
     upcoming_bills = serializers.ListField()
     budget_health = serializers.DictField()
 
@@ -2796,4 +2797,3 @@ class AnalyticsForecastSerializer(serializers.Serializer):
 
     date = serializers.DateField()
     projected_balance = serializers.DecimalField(max_digits=18, decimal_places=2)
-    projected_income = serializers.DecimalField(max_digits=18, decimal_places=2)

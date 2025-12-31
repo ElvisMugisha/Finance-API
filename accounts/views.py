@@ -3633,33 +3633,16 @@ class RecurringTransactionViewSet(viewsets.ModelViewSet):
     def generate_now(self, request, pk=None):
         """Force generate the transaction now."""
         recurring = self.get_object()
+        tx = recurring.process_due(force=True)
 
-        # Logic to create transaction
-        with db_transaction.atomic():
-            tx = Transaction.objects.create(
-                user=recurring.user,
-                account=recurring.account,
-                category=recurring.category,
-                name=recurring.name,
-                amount=recurring.amount,
-                transaction_type=recurring.transaction_type,
-                transaction_date=timezone.now().date(),
-                status=choices.TransactionStatus.PENDING,  # Or completed? Default pending for review.
-                description=recurring.description,
-                recurring_transaction=recurring,
-                is_recurring=True,
+        if tx:
+            return Response(
+                TransactionSerializer(tx).data, status=status.HTTP_201_CREATED
             )
-
-            # Update recurring next date and last generated
-            recurring.last_generated_date = timezone.now().date()
-            recurring.next_due_date = recurring.calculate_next_date(
-                recurring.next_due_date
-            )
-            recurring.save(
-                update_fields=["last_generated_date", "next_due_date", "updated_at"]
-            )
-
-        return Response(TransactionSerializer(tx).data, status=status.HTTP_201_CREATED)
+        return Response(
+            {"detail": "Failed to generate transaction."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
 
 class AnalyticsViewSet(viewsets.ViewSet):
